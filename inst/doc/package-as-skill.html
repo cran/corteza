@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang xml:lang>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Package as Skill</title>
+  <style>
+html {
+color: #1a1a1a;
+background-color: #fdfdfd;
+}
+body {
+margin: 0 auto;
+max-width: 36em;
+padding-left: 50px;
+padding-right: 50px;
+padding-top: 50px;
+padding-bottom: 50px;
+hyphens: auto;
+overflow-wrap: break-word;
+text-rendering: optimizeLegibility;
+font-kerning: normal;
+}
+@media (max-width: 600px) {
+body {
+font-size: 0.9em;
+padding: 12px;
+}
+h1 {
+font-size: 1.8em;
+}
+}
+@media print {
+html {
+background-color: white;
+}
+body {
+background-color: transparent;
+color: black;
+font-size: 12pt;
+}
+p, h2, h3 {
+orphans: 3;
+widows: 3;
+}
+h2, h3, h4 {
+page-break-after: avoid;
+}
+}
+p {
+margin: 1em 0;
+}
+a {
+color: #1a1a1a;
+}
+a:visited {
+color: #1a1a1a;
+}
+img {
+max-width: 100%;
+}
+h1, h2, h3, h4, h5, h6 {
+margin-top: 1.4em;
+}
+h5, h6 {
+font-size: 1em;
+font-style: italic;
+}
+h6 {
+font-weight: normal;
+}
+ol, ul {
+padding-left: 1.7em;
+margin-top: 1em;
+}
+li > ol, li > ul {
+margin-top: 0;
+}
+blockquote {
+margin: 1em 0 1em 1.7em;
+padding-left: 1em;
+border-left: 2px solid #e6e6e6;
+color: #606060;
+}
+code {
+font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+font-size: 85%;
+margin: 0;
+hyphens: manual;
+}
+pre {
+margin: 1em 0;
+overflow: auto;
+}
+pre code {
+padding: 0;
+overflow: visible;
+overflow-wrap: normal;
+}
+.sourceCode {
+background-color: transparent;
+overflow: visible;
+}
+hr {
+background-color: #1a1a1a;
+border: none;
+height: 1px;
+margin: 1em 0;
+}
+table {
+margin: 1em 0;
+border-collapse: collapse;
+width: 100%;
+overflow-x: auto;
+display: block;
+font-variant-numeric: lining-nums tabular-nums;
+}
+table caption {
+margin-bottom: 0.75em;
+}
+tbody {
+margin-top: 0.5em;
+border-top: 1px solid #1a1a1a;
+border-bottom: 1px solid #1a1a1a;
+}
+th {
+border-top: 1px solid #1a1a1a;
+padding: 0.25em 0.5em 0.25em 0.5em;
+}
+td {
+padding: 0.125em 0.5em 0.25em 0.5em;
+}
+header {
+margin-bottom: 4em;
+text-align: center;
+}
+#TOC li {
+list-style: none;
+}
+#TOC ul {
+padding-left: 1.3em;
+}
+#TOC > ul {
+padding-left: 0;
+}
+#TOC a:not(:hover) {
+text-decoration: none;
+}
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Package as Skill</h1>
+</header>
+<!--
+%\VignetteEngine{simplermarkdown::mdweave_to_html}
+%\VignetteIndexEntry{Package as Skill}
+-->
+<h1 id="package-as-skill">Package as Skill</h1>
+<p>An R package that documents its functions properly is already what
+MCP is trying to wire together: tools (functions), descriptions
+(<code>.Rd</code> files), and an invocation mechanism
+(<code>library()</code>). corteza walks the <code>.Rd</code> tree at
+session start and turns the exports into JSON-Schema tool definitions —
+same shape the Anthropic / OpenAI / Moonshot APIs expect. No server, no
+schema by hand, no protocol.</p>
+<p>This vignette walks the setup with <a href="https://cran.r-project.org/package=fortunes">fortunes</a>, quotes
+from the R-help archives. It returns a structured S3 object, and the
+demo is more fun than configuring a JSON parser.</p>
+<h2 id="setup">Setup</h2>
+<p>Two steps. Total wiring: one config line.</p>
+<h3 id="install-the-package">1. Install the package</h3>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">install.packages</span>(<span class="st">&quot;fortunes&quot;</span>)</span></code></pre></div>
+<h3 id="register-it-as-a-skill">2. Register it as a skill</h3>
+<p>Add a <code>skill_packages</code> entry to corteza’s config. Either
+project-local at <code>&lt;cwd&gt;/.corteza/config.json</code> or global
+at <code>tools::R_user_dir(&quot;corteza&quot;, &quot;config&quot;)/config.json</code>:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;skill_packages&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;fortunes&quot;</span><span class="ot">]</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>That’s it. The string form registers every export. For larger
+packages, the object form picks specific functions:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;skill_packages&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;package&quot;</span><span class="fu">:</span> <span class="st">&quot;fortunes&quot;</span><span class="fu">,</span> <span class="dt">&quot;functions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;fortune&quot;</span><span class="ot">]</span><span class="fu">}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<h2 id="use">Use</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">chat</span>()</span></code></pre></div>
+<p>The startup banner shows the tool count climbing —
+<code>corteza::chat()</code> reports <code>30 tools</code> instead of
+<code>29</code>. Then ask the agent to use it:</p>
+<pre><code>&gt; Find a fortune by Brian Ripley about types or coercion.</code></pre>
+<p>You’ll see the progress hint fire as the agent invokes the tool:</p>
+<pre><code>  [fortunes::fortune] author=Brian Ripley (8 lines)</code></pre>
+<p>The <code>fortune</code> object comes back with <code>quote</code>,
+<code>author</code>, <code>context</code>, <code>source</code>, and
+<code>date</code> fields, and the agent paraphrases or quotes from
+there. Try variations:</p>
+<ul>
+<li>“Pick a random fortune and tell me which R personality you’d most
+love to argue with about it.”</li>
+<li>“Use <code>fortune(showMatches = TRUE)</code> to find anything about
+NULL, then summarize the consensus.”</li>
+<li>“Show me three fortunes about S4 classes and rank them by
+snark.”</li>
+</ul>
+<h2 id="what-makes-a-package-a-good-fit">What makes a package a good
+fit</h2>
+<p>The R community has 20,000 CRAN packages but not all of them work
+cleanly as agent skills. The shape that fits:</p>
+<ul>
+<li><strong>Returns structured data</strong> (data.frames, lists, S3
+objects). The LLM consumes the result programmatically.</li>
+<li><strong>No printing to stderr</strong> on the happy path. Anything
+that <code>cat()</code>s status updates or paints with
+<code>crayon::</code> pollutes the tool result.</li>
+<li><strong>No <code>oops()</code> or <code>stop()</code> for non-error
+cases</strong>. If the function calls <code>stop()</code> because you’re
+not in the right directory, it’s designed for a human at the console,
+not a tool harness.</li>
+<li><strong><code>.Rd</code> parameters that match
+<code>formals()</code></strong>. CRAN already enforces this with
+<code>R CMD check</code>, so any current CRAN package qualifies.</li>
+</ul>
+<p>Counter-example: <a href="https://cran.r-project.org/package=gitr">gitr</a> wraps
+<code>system2(&quot;git&quot;, ...)</code> cleanly enough but <code>cat()</code>s
+colored output and calls <code>oops()</code> when not in a git repo.
+Wrapping it as a skill needed <code>utils::capture.output()</code> and
+grew the code instead of shrinking it. Built for humans, not for
+plumbing.</p>
+<p>The test: would you call this function from another function and
+trust the return value? If yes, it’s a candidate.</p>
+<h2 id="why-no-mcp-server">Why no MCP server</h2>
+<p>A live MCP server ships every tool’s JSON schema into the system
+prompt at connect time. Twenty tools at ~400 tokens each is 8,000 tokens
+of startup overhead before the agent has done anything. The CLI /
+package-as-skill path pays roughly zero startup tax (corteza already has
+<code>bash</code>, <code>run_r</code>, <code>read_file</code> baked in),
+and lazy lookup via <code>saber::pkg_help()</code> costs ~200 tokens for
+a tool the agent actually needs.</p>
+<p>Same tool surface, different cost curve. corteza’s MCP server
+(<code>corteza::serve()</code>) still exists for clients that need it
+(Claude Code, Codex, etc), but it’s no longer the only path — the same
+skill registry feeds both.</p>
+<h2 id="where-to-go-next">Where to go next</h2>
+<ul>
+<li>The derivation pipeline is summarized in the package vignette and
+package source; the earlier external blog post is no longer linked
+because its URL no longer resolves reliably.</li>
+<li>Discover what’s in a package the same way the agent does:
+<code>Rscript --vanilla -e &#39;saber::pkg_exports(&quot;fortunes&quot;)&#39;</code> and
+<code>Rscript --vanilla -e &#39;saber::pkg_help(&quot;fortune&quot;, &quot;fortunes&quot;)&#39;</code>.</li>
+<li>For your own functions, drop an <code>.R</code> file in
+<code>&lt;project&gt;/.corteza/skills/</code> calling
+<code>register_skill_from_fn(&quot;name&quot;, my_fn)</code>. Loaded on every
+session start, no installation required.</li>
+</ul>
+</body>
+</html>
