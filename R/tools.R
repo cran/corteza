@@ -9,7 +9,7 @@
                             web = c("web_search", "fetch_url"),
                             git = c("git_status", "git_diff", "git_log"),
                             r = c("r_help", "installed_packages"),
-                            subagent = c("spawn_subagent", "query_subagent",
+                            subagent = c("spawn_subagent", "query_subagent", "collect_subagent",
         "list_subagents", "kill_subagent")
 )
 
@@ -97,9 +97,9 @@ get_tools <- function(filter = NULL) {
 #' Ensure skills are registered.
 #'
 #' Registers built-in skills if not already registered. Exported with
-#' `@keywords internal` so the CLI (which runs in its own R process,
-#' separate from the callr worker) can register skills in its own
-#' namespace before calling `schema_from_registry()`.
+#' `@keywords internal` so a subagent's `callr::r_session` child can
+#' register skills in its own namespace (via `worker_init()`) before
+#' dispatching tools.
 #'
 #' @return Invisible character vector of skill names.
 #' @keywords internal
@@ -120,13 +120,21 @@ ensure_skills <- function() {
 #' @return List of tool definitions for llm.api::agent()
 #' @noRd
 skills_as_api_tools <- function(filter = NULL) {
+    # Drop tools whose `available()` predicate returns FALSE so chat()
+    # and the CLI advertise the same set. Without this, chat() saw
+    # tools the CLI (via schema_from_registry) had already filtered
+    # out — e.g. git_* when not in a repo — and the /status tool count
+    # disagreed between surfaces. Predicates default to TRUE on
+    # error so a broken check doesn't hide a tool.
     mcp_tools <- get_tools(filter)
+    mcp_tools <- Filter(function(t) {
+        entry <- get_skill(t$name)
+        if (is.null(entry$available)) return(TRUE)
+        isTRUE(tryCatch(entry$available(), error = function(e) TRUE))
+    }, mcp_tools)
     lapply(mcp_tools, function(t) {
-        list(
-             name = sanitize_tool_name(t$name),
-             description = t$description,
-             input_schema = t$inputSchema
-        )
+        list(name = sanitize_tool_name(t$name), description = t$description,
+             input_schema = t$inputSchema)
     })
 }
 
@@ -135,23 +143,23 @@ skills_as_api_tools <- function(filter = NULL) {
 #' Anthropic/OpenAI require tool names to match [a-zA-Z0-9_-].
 #' Converts "::" to "__" for the API.
 #'
-#' @param name Internal tool name (e.g. "base::readLines")
-#' @return API-safe name (e.g. "base__readLines")
+#' @param name Internal tool name (e.g. "base::read.csv")
+#' @return API-safe name (e.g. "base__read_dot_csv")
 #' @noRd
 sanitize_tool_name <- function(name) {
     name <- gsub("::", "__", name, fixed = TRUE)
-    gsub(".", "-", name, fixed = TRUE)
+    gsub(".", "_dot_", name, fixed = TRUE)
 }
 
 #' Restore internal tool name from API-safe name
 #'
-#' Reverses sanitize_tool_name. Dot becomes "-", "::" becomes "__".
+#' Reverses sanitize_tool_name. "_dot_" becomes ".", "__" becomes "::".
 #'
-#' @param name API-safe name (e.g. "base__list-files")
-#' @return Internal name (e.g. "base::list.files")
+#' @param name API-safe name (e.g. "base__read_dot_csv")
+#' @return Internal name (e.g. "base::read.csv")
 #' @noRd
 unsanitize_tool_name <- function(name) {
     name <- gsub("__", "::", name, fixed = TRUE)
-    gsub("-", ".", name, fixed = TRUE)
+    gsub("_dot_", ".", name, fixed = TRUE)
 }
 

@@ -40,10 +40,8 @@ default_local_model <- function() {
     if (isTRUE(.local_model_cache$initialized)) {
         return(.local_model_cache$value)
     }
-    candidates <- getOption(
-                            "corteza.local_models",
-                            c("gpt-oss:120b", "gpt-oss:20b")
-    )
+    candidates <- getOption("corteza.local_models",
+                            c("gpt-oss:120b", "gpt-oss:20b"))
     available <- tryCatch(
                           llm.api::list_ollama_models()$name,
                           error = function(e) character()
@@ -80,6 +78,11 @@ default_local_model <- function() {
 #'   denies (safe fallback).
 #' @param max_turns Maximum LLM turns per call.
 #' @param verbose Print tool call progress.
+#' @param plan_mode Logical. When TRUE, the session is in plan mode:
+#'   the LLM is told to research and propose without acting, the policy
+#'   engine denies write/exec tool calls (except \code{exit_plan_mode}),
+#'   and \code{exit_plan_mode} is added to the tool list. A successful
+#'   \code{exit_plan_mode} call flips this back to FALSE.
 #'
 #' @return An environment holding the session state.
 #' @examples
@@ -94,7 +97,7 @@ new_session <- function(channel = c("cli", "console", "matrix"),
                         history = NULL, model_map = NULL,
                         provider = "anthropic", tools_filter = NULL,
                         system = NULL, approval_cb = NULL, max_turns = 10L,
-                        verbose = FALSE) {
+                        verbose = FALSE, plan_mode = FALSE) {
     channel <- match.arg(channel)
     if (is.null(model_map)) {
         model_map <- getOption(
@@ -119,6 +122,7 @@ new_session <- function(channel = c("cli", "console", "matrix"),
     s$recent_classes <- character()
     s$on_tool <- list()
     s$turn_number <- 0L
+    s$plan_mode <- isTRUE(plan_mode)
     s
 }
 
@@ -165,9 +169,25 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 }
 
 .make_tool_handler <- function(session, tool_executor = NULL) {
+    # Either session$dry_run (set by inst/bin/corteza per REPL
+    # iteration) or session$config$dry_run (chat()'s /dryrun toggle)
+    # counts. We read at call time so toggles between turns take
+    # effect immediately.
+    session_dry_run <- function() {
+        isTRUE(session$dry_run) || isTRUE(session$config$dry_run)
+    }
     if (is.null(tool_executor)) {
         ensure_skills()
-        tool_executor <- function(name, args) call_skill(name, as.list(args))
+        # Default in-process executor: thread dry_run through to
+        # call_skill / skill_run so the short-circuit below is safe
+        # for chat() and embedded sessions that don't supply a
+        # custom executor. Without this, the CLI's custom executor
+        # honored dry-run via opts$dry_run but every other surface
+        # would silently execute the tool during a "preview".
+        tool_executor <- function(name, args) {
+            call_skill(name, as.list(args), ctx = list(session = session),
+                       dry_run = session_dry_run())
+        }
     }
     function(name, args) {
         internal_name <- unsanitize_tool_name(name)
@@ -175,13 +195,59 @@ new_session <- function(channel = c("cli", "console", "matrix"),
                      tool = internal_name,
                      args = as.list(args),
                      channel = session$channel,
-                     context = list(recent_classes = session$recent_classes)
+                     context = list(recent_classes = session$recent_classes,
+                                    plan_mode = isTRUE(session$plan_mode))
         )
+
+        # Task-tracker intercept. task_create / task_update mutate
+        # session metadata (the task list) rather than doing real
+        # work. They run in-process here so the mutation lands on the
+        # live `session` environment, not a detached copy. Bypass
+        # dry-run, policy, approval, and the normal observer chain;
+        # fire a `task_event` for displays that want it.
+        task_result <- task_tool_intercept(session, internal_name,
+            as.list(args))
+        if (!is.null(task_result)) {
+            .fire_observers(session, list(
+                    call = call,
+                    outcome = "task",
+                    result = task_result,
+                    success = TRUE,
+                    elapsed_ms = 0,
+                    turn_number = session$turn_number %||% 0L
+                ))
+            return(task_result)
+        }
+
+        # Dry-run mode: short-circuit before policy/approval. A dry
+        # run is a "show me what would happen" preview; prompting the
+        # user to approve a *preview* would be incoherent, and a
+        # config-driven "deny" on the tool would silently swallow the
+        # preview the user is trying to see. The tool_executor must
+        # already be dry-run-safe (either the CLI's custom executor
+        # that checks opts$dry_run, or the default executor above
+        # which passes dry_run = TRUE down to skill_run).
+        if (session_dry_run()) {
+            raw <- tryCatch(
+                            tool_executor(internal_name, as.list(args)),
+                            error = function(e) err(paste("Tool error:",
+                        conditionMessage(e)))
+            )
+            return(admit_tool_result(.flatten_mcp_result(raw),
+                                     tool = internal_name))
+        }
+
         # Resolve once up front so policy() and the sticky classifier
         # below see the same paths/urls.
         call$paths <- resolve_paths(call)
         call$urls <- resolve_urls(call)
-        decision <- policy(call)
+        # Pass session$config so the /permissions contract (configured
+        # approval_mode + dangerous_tools + per-tool permissions) is
+        # enforced regardless of how the data class falls out. Without
+        # this, a CLAUDE.md edit could classify as `random` and skip
+        # the prompt in chat() even though `replace_in_file` is in the
+        # default dangerous_tools list.
+        decision <- policy(call, config = session$config)
 
         # Sticky: record the class regardless of the decision outcome.
         # Even a denied tool call means the LLM is trying to touch that
@@ -193,7 +259,7 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 
         start <- Sys.time()
 
-        outcome_text <- function(kind, text, success) {
+        outcome_text <- function(kind, text, success, diff = NULL) {
             event <- list(
                           call = call,
                           decision = decision,
@@ -203,7 +269,8 @@ new_session <- function(channel = c("cli", "console", "matrix"),
                           elapsed_ms = as.numeric(
                     difftime(Sys.time(), start, units = "secs")
                 ) * 1000,
-                          turn_number = session$turn_number
+                          turn_number = session$turn_number,
+                          diff = diff
             )
             .fire_observers(session, event)
             text
@@ -231,21 +298,26 @@ new_session <- function(channel = c("cli", "console", "matrix"),
         }
 
         .fire_observers(session, list(
-            call = call,
-            decision = decision,
-            outcome = "start",
-            result = NULL,
-            success = NA,
-            elapsed_ms = 0,
-            turn_number = session$turn_number
-        ))
+                                      call = call,
+                                      decision = decision,
+                                      outcome = "start",
+                                      result = NULL,
+                                      success = NA,
+                                      elapsed_ms = 0,
+                                      turn_number = session$turn_number
+            ))
 
         raw <- tryCatch(
                         tool_executor(internal_name, as.list(args)),
                         error = function(e) err(paste("Tool error:", conditionMessage(e)))
         )
         success <- !isTRUE(raw$isError)
-        outcome_text("ran", .flatten_mcp_result(raw), success)
+        if (identical(internal_name, "exit_plan_mode") && isTRUE(success)) {
+            session$plan_mode <- FALSE
+        }
+        outcome_text("ran",
+                     admit_tool_result(.flatten_mcp_result(raw), tool = internal_name),
+                     success, diff = raw$diff)
     }
 }
 
@@ -254,16 +326,15 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 # cloud (or local) default. A future PR can switch mid-turn.
 #
 # When the session's cloud model is unset AND no corteza.model option
-# is set, we fill in a provider-specific default that's newer than
-# llm.api's built-in defaults. (llm.api 0.1.1's moonshot default is
-# 'kimi-k2', which Moonshot has renamed to 'kimi-k2.6'.) The override
-# only fires when the caller hasn't picked a model themselves.
+# is set, fall back to the provider default from llm.api's canonical
+# table (via default_provider_model()), so corteza tracks llm.api
+# rather than carrying its own model picks.
 .resolve_model <- function(session) {
     explicit <- session$model_map$cloud %||% getOption("corteza.model", NULL)
-    if (!is.null(explicit) && nzchar(explicit)) return(explicit)
-    switch(session$provider %||% "anthropic",
-           moonshot = "kimi-k2.6",
-           NULL)
+    if (!is.null(explicit) && nzchar(explicit)) {
+        return(explicit)
+    }
+    default_provider_model(session$provider %||% "anthropic")
 }
 
 # ---- Public entry point ----
@@ -277,6 +348,14 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 #' @param conn An open MCP connection (from \code{llm.api::mcp_connect}).
 #' @return A function with signature \code{function(name, args)} that
 #'   returns an MCP-format result list.
+#' @examples
+#' \dontrun{
+#' # Needs an open MCP connection to a running corteza::serve().
+#' conn <- llm.api::mcp_connect("tcp://localhost:7850")
+#' executor <- mcp_tool_executor(conn)
+#' s <- new_session(provider = "anthropic")
+#' turn("Hello", s, tool_executor = executor)
+#' }
 #' @export
 mcp_tool_executor <- function(conn) {
     force(conn)
@@ -308,6 +387,14 @@ mcp_tool_executor <- function(conn) {
 #' @param observer A function of one argument (the event list).
 #'
 #' @return The session, invisibly.
+#' @examples
+#' s <- new_session(provider = "anthropic")
+#' add_observer(s, function(event) {
+#'     # An observer is just a function of one argument; record the
+#'     # outcome for inspection.
+#'     message(event$outcome)
+#' })
+#' length(s$on_tool)
 #' @export
 add_observer <- function(session, observer) {
     stopifnot(is.environment(session), is.function(observer))
@@ -323,13 +410,19 @@ add_observer <- function(session, observer) {
 #' \code{tool_hint()}.
 #'
 #' @return A function to pass to \code{\link{add_observer}}.
+#' @examples
+#' obs <- observer_progress()
+#' s <- new_session(provider = "anthropic")
+#' add_observer(s, obs)
 #' @export
 observer_progress <- function() {
     function(event) {
         # Observer's purpose is to print tool-call traces; gate behind
         # the corteza.verbose option so non-interactive scripts are
         # silent by default.
-        if (!.corteza_verbose()) return(invisible())
+        if (!.corteza_verbose()) {
+            return(invisible())
+        }
 
         if (identical(event$outcome, "start")) {
             summary <- cli_event_summary(event, width = 84L)
@@ -356,6 +449,14 @@ observer_progress <- function() {
             return(invisible())
         }
 
+        # File-edit tools attach a diff payload to their result. When
+        # present, render the colored hunks in place of the usual
+        # one-line "N lines" summary so the user can see what changed.
+        if (!is.null(event$diff)) {
+            render_tool_diff(event$diff)
+            return(invisible())
+        }
+
         summary <- cli_event_summary(event, width = 84L)
         detail <- if (length(summary$detail_lines) > 0L) {
             summary$detail_lines[1]
@@ -375,12 +476,13 @@ observer_progress <- function() {
 #' tool call the LLM makes is routed through \code{\link{policy}} before
 #' being dispatched.
 #'
-#' Tool dispatch is pluggable via \code{tool_executor}. The default is an
-#' in-process dispatcher that calls the local skill registry — suitable
-#' for \code{chat()} and matrix adapters running in the same R process as
-#' their skills. Pass \code{\link{mcp_tool_executor}} (or any
-#' \code{function(name, args) -> MCP-format result}) to run tools in a
-#' separate process, which is how the CLI talks to \code{serve()}.
+#' Tool dispatch is pluggable via \code{tool_executor}, but the CLI and
+#' \code{chat()} both leave it NULL: tools run in-process through the
+#' default \code{call_skill} dispatcher against the local skill registry.
+#' \code{serve()} is a separate MCP server for external clients only; it
+#' is not part of the CLI's tool path. Pass an explicit
+#' \code{function(name, args) -> list} executor only when dispatching
+#' tools somewhere other than the in-process registry.
 #'
 #' @param prompt Character. User prompt.
 #' @param session A session environment created by \code{\link{new_session}}.
@@ -393,6 +495,14 @@ observer_progress <- function() {
 #'
 #' @return A list with \code{reply} (character) and \code{session} (the
 #'   updated session environment; also mutated in place).
+#' @examples
+#' \dontrun{
+#' # Requires ANTHROPIC_API_KEY (or the configured provider's key) and
+#' # a network connection to the LLM.
+#' s <- new_session(provider = "anthropic")
+#' out <- turn("Say hello", s)
+#' out$reply
+#' }
 #' @export
 turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     stopifnot(is.environment(session))
@@ -401,19 +511,43 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
         ensure_skills()
         tools <- skills_as_api_tools(session$tools_filter)
     }
+    tools <- .plan_mode_filter_tools(tools, isTRUE(session$plan_mode))
+    tools <- .task_filter_tools(tools, session$channel)
+    system <- .plan_mode_compose_system(session$system,
+                                        isTRUE(session$plan_mode))
+    system <- task_compose_system(system, session$tasks %||% list(),
+                                  channel = session$channel)
     tool_handler <- .make_tool_handler(session, tool_executor = tool_executor)
 
-    response <- llm.api::agent(
-                               prompt = prompt,
-                               tools = tools,
-                               tool_handler = tool_handler,
-                               system = session$system,
-                               model = .resolve_model(session),
-                               provider = session$provider,
-                               max_turns = session$max_turns,
-                               verbose = session$verbose,
-                               history = session$history
+    # Pass a history_callback to llm.api so session$history mirrors
+    # intermediate state continuously: after each assistant message
+    # and after each tool_result lands, the callback overwrites
+    # session$history with the in-progress snapshot. session is an
+    # environment (see new_session()), so the mutation is visible to
+    # the caller (chat() / CLI) even if llm.api::agent() throws an
+    # interrupt mid-flight. Without this, an interrupt would lose
+    # every tool call completed in the current batch.
+    #
+    # history_callback arrived in llm.api 0.1.4 (now the Imports
+    # minimum). The formals() check below is cheap defense for the
+    # rare case of running against an older build.
+    agent_args <- list(
+                       prompt = prompt,
+                       tools = tools,
+                       tool_handler = tool_handler,
+                       system = system,
+                       model = .resolve_model(session),
+                       provider = session$provider,
+                       max_turns = session$max_turns,
+                       verbose = session$verbose,
+                       history = session$history
     )
+    if ("history_callback" %in% names(formals(llm.api::agent))) {
+        agent_args$history_callback <- function(history) {
+            session$history <- history
+        }
+    }
+    response <- do.call(llm.api::agent, agent_args)
 
     if (!is.null(response$history)) {
         session$history <- response$history
@@ -426,3 +560,4 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
          raw = response
     )
 }
+

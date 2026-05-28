@@ -19,9 +19,47 @@ on.exit({
     }
 }, add = TRUE)
 
-# Test session_id generates UUID format
+# session_id() now generates docker-style adjective_surname names
+# (e.g. "boring_wozniak") instead of UUIDs. The format is two
+# lowercase tokens joined by an underscore.
 id <- corteza:::session_id()
-expect_true(grepl("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", id))
+expect_true(grepl("^[a-z]+_[a-z]+$", id))
+
+# session_id() takes an agent_id so collision-checking targets the
+# right store (codex 2026-05-20). Previously the function ignored
+# agent_id and always checked the main agent's transcript dir, so
+# a non-main agent could mint a name that already existed in its
+# own store and silently reuse the transcript.
+expect_true("agent_id" %in% names(formals(corteza:::session_id)))
+# Generating against a never-used agent succeeds and returns the
+# docker-style format.
+nonce_agent <- paste0("test_agent_", as.integer(Sys.time()))
+nonce_id <- corteza:::session_id(agent_id = nonce_agent)
+expect_true(grepl("^[a-z]+_[a-z]+$", nonce_id))
+
+# Deterministic collision probe (codex 2026-05-20): plant a
+# transcript in agent A's sessions dir and confirm
+# .session_name_exists() reports it occupied for A but free for B.
+# Guards the regression where session_id() hardcoded the default
+# agent, so a non-main agent could mint a name already taken in its
+# own store. Random sampling makes session_id() itself awkward to
+# probe deterministically; the helper it calls is the real load
+# bearer.
+probe_stamp <- paste0(as.integer(Sys.time()), "_", sample(100:999, 1))
+agent_probe_a <- paste0("probe_a_", probe_stamp)
+agent_probe_b <- paste0("probe_b_", probe_stamp)
+dir.create(corteza:::sessions_dir(agent_probe_a),
+           recursive = TRUE, showWarnings = FALSE)
+writeLines("{}",
+           file.path(corteza:::sessions_dir(agent_probe_a),
+                     "occupied_name.jsonl"))
+expect_true(corteza:::.session_name_exists("occupied_name",
+                                           agent_id = agent_probe_a))
+expect_false(corteza:::.session_name_exists("occupied_name",
+                                            agent_id = agent_probe_b))
+# Inline cleanup -- top-level on.exit fires too early in tinytest.
+unlink(dirname(corteza:::sessions_dir(agent_probe_a)), recursive = TRUE)
+unlink(dirname(corteza:::sessions_dir(agent_probe_b)), recursive = TRUE)
 
 # Test session_new creates proper structure
 cwd <- getwd()
@@ -111,6 +149,32 @@ expect_equal(latest$sessionId, session$sessionId)
 empty_agent <- paste0("empty_", sample(10000:99999, 1))
 empty_sessions <- corteza:::session_list(empty_agent)
 expect_equal(length(empty_sessions), 0)
+
+# Regression: session_list() must filter out internal subagent
+# entries. The flat JSON store is shared with subagent metadata
+# (keys formatted "agent:main:subagent:<id>" per R/subagent.R), but
+# only user-created sessions ("corteza:<id>") are meaningful in the
+# --list / /sessions surface.
+local({
+    store <- corteza:::store_load(test_agent_id)
+    store[["agent:main:subagent:fake_planner"]] <- list(
+        sessionId = "fake-planner-id",
+        provider  = "ollama",
+        model     = "x",
+        updatedAt = as.numeric(Sys.time())
+    )
+    corteza:::store_save(store, test_agent_id)
+    on.exit({
+        st <- corteza:::store_load(test_agent_id)
+        st[["agent:main:subagent:fake_planner"]] <- NULL
+        corteza:::store_save(st, test_agent_id)
+    }, add = TRUE)
+
+    listed <- corteza:::session_list(test_agent_id)
+    keys <- vapply(listed, function(s) s$sessionKey, character(1))
+    expect_true(all(startsWith(keys, "corteza:")))
+    expect_false("agent:main:subagent:fake_planner" %in% keys)
+})
 
 # Test session_latest with no sessions
 no_latest <- corteza:::session_latest(empty_agent)

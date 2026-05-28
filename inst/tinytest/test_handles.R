@@ -61,13 +61,22 @@ expect_true(grepl("stored as \\.h_\\d+", text))
 expect_true(grepl("'data.frame'", text, fixed = TRUE))
 expect_equal(length(corteza:::list_handles()), 1L)
 
-# Invisible assignments don't trigger a handle.
+# Invisible assignments persist in globalenv. run_r evaluates in
+# globalenv (PR <fix> 2026-05-20) so `<-` matches the tool's
+# docstring; the earlier child-env behavior silently dropped
+# assignments. The handle stash should still be empty since `NULL`
+# produced no visible large result. Cleanup is inline (on.exit at
+# tinytest top-level fires immediately after the expression that
+# registered it, so it would nuke the variable before the
+# assertion below could see it).
 corteza:::clear_handles()
+suppressWarnings(rm("x_internal_assign", envir = globalenv()))
 res <- corteza:::call_tool("run_r",
                            list(code = "x_internal_assign <- 1:1000; NULL"))
 expect_false(isTRUE(res$isError))
-# Assignment happens in eval_env, so globalenv doesn't get polluted.
-expect_false("x_internal_assign" %in% ls(globalenv()))
+expect_true("x_internal_assign" %in% ls(globalenv()))
+expect_equal(length(corteza:::list_handles()), 0L)
+suppressWarnings(rm("x_internal_assign", envir = globalenv()))
 
 # --- Handle visible in subsequent run_r --------------------------------
 
@@ -77,6 +86,31 @@ res <- corteza:::call_tool("run_r",
                            list(code = sprintf("nrow(%s)", h$handle)))
 expect_false(isTRUE(res$isError))
 expect_true(grepl("^\\[1\\] 10", res$content[[1]]$text))
+
+# Regression (codex 2026-05-20): handle_eval_env() used to skip
+# reassignment when the .h_NNN symbol already existed in globalenv,
+# so re-binding a handle in the store left the old globalenv copy
+# stale. Force a rebind and verify the globalenv binding reflects
+# the new value.
+corteza:::clear_handles()
+h1 <- corteza:::with_handle(data.frame(x = 1:10, y = 11:20))
+# Replace the same handle id with a smaller frame.
+assign(h1$handle, data.frame(x = 1:5), envir = corteza:::.handle_store)
+res <- corteza:::call_tool("run_r",
+                           list(code = sprintf("nrow(%s)", h1$handle)))
+expect_false(isTRUE(res$isError))
+expect_true(grepl("^\\[1\\] 5", res$content[[1]]$text))
+
+# Stale handles are removed from globalenv when they drop out of
+# the store. After clear_handles(), the previously copied .h_NNN
+# symbol must not linger -- clear_handles() itself sweeps the
+# managed bindings out of globalenv.
+corteza:::clear_handles()
+h2 <- corteza:::with_handle(data.frame(x = 1:3))
+corteza:::call_tool("run_r", list(code = sprintf("nrow(%s)", h2$handle)))
+expect_true(exists(h2$handle, envir = globalenv(), inherits = FALSE))
+corteza:::clear_handles()
+expect_false(exists(h2$handle, envir = globalenv(), inherits = FALSE))
 
 # --- read_handle ops ---------------------------------------------------
 

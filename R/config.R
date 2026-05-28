@@ -69,6 +69,9 @@ load_config <- function(cwd = getwd()) {
     if (is.null(config$provider)) {
         config$provider <- "anthropic"
     }
+    if (is.null(config$port)) {
+        config$port <- 7850L
+    }
     # Context warning thresholds (percentage)
     # Hidden until warn_pct, then yellow -> orange -> red
     if (is.null(config$context_warn_pct)) {
@@ -99,14 +102,7 @@ load_config <- function(cwd = getwd()) {
         config$approval_mode <- "ask" # "ask", "allow", "deny"
     }
     if (is.null(config$dangerous_tools)) {
-        config$dangerous_tools <- c(
-                                    "bash",
-                                    "run_r",
-                                    "run_r_script",
-                                    "write_file",
-                                    "replace_in_file",
-                                    "base::writeLines"
-        )
+        config$dangerous_tools <- default_dangerous_tools()
     }
     # Per-tool permissions (overrides dangerous_tools)
     # config$permissions = list(bash = "deny", read_file = "allow")
@@ -118,14 +114,7 @@ load_config <- function(cwd = getwd()) {
     # config$allowed_paths - if set, only these paths are accessible
     # config$denied_paths - these paths are always blocked
     if (is.null(config$denied_paths)) {
-        config$denied_paths <- c(
-                                 "~/.ssh",
-                                 "~/.gnupg",
-                                 "~/.aws",
-                                 "~/.config/gcloud",
-                                 "~/.kube",
-                                 "~/.docker"
-        )
+        config$denied_paths <- default_denied_paths()
     }
     # Note: allowed_paths is NULL by default (no restriction)
 
@@ -137,11 +126,8 @@ load_config <- function(cwd = getwd()) {
     # Default skill packages (R packages registered as tools)
     if (is.null(config$skill_packages)) {
         config$skill_packages <- list(
-                                      list(package = "base", functions = c(
-                    "file.exists", "file.copy",
-                    "file.remove", "dir.create",
-                    "Sys.glob"
-                )),
+                                      list(package = "base", functions = c("file.exists", "file.copy",
+                    "file.remove", "dir.create", "Sys.glob")),
                                       list(package = "utils", functions = c("read.csv", "head", "tail"))
         )
     }
@@ -154,6 +140,28 @@ load_config <- function(cwd = getwd()) {
     # Dry-run mode (validate tools without executing)
     if (is.null(config$dry_run)) {
         config$dry_run <- FALSE
+    }
+
+    # Legacy memory tools (slash commands /remember /recall /flush)
+    if (is.null(config$legacy_memory_tools_enabled)) {
+        config$legacy_memory_tools_enabled <- FALSE
+    }
+    # Auto-flush memories before context compaction
+    if (is.null(config$memory_flush_enabled)) {
+        config$memory_flush_enabled <- TRUE
+    }
+    # Prompt sent to the model during the pre-compaction memory flush.
+    if (is.null(config$memory_flush_prompt)) {
+        config$memory_flush_prompt <- paste0(
+            "Pre-compaction memory flush. ",
+            "Store durable memories now using write_file to memory/YYYY-MM-DD.md ",
+            "in the workspace. Include: preferences discovered, decisions made, ",
+            "technical details worth preserving. ",
+            "If nothing to store, reply with exactly: NO_REPLY")
+    }
+    # Include daily memory logs in context
+    if (is.null(config$context_include_memory_logs)) {
+        config$context_include_memory_logs <- FALSE
     }
 
     # Rate limits per provider
@@ -179,6 +187,21 @@ load_config <- function(cwd = getwd()) {
     if (is.null(sub$allow_nested)) {
         sub$allow_nested <- FALSE
     }
+    # MCP exposure is opt-in: serve() must not hand subagent tools to an
+    # (often unattended) MCP client by default, since a spawned child
+    # spends autonomously on the host's credentials. See serve().
+    if (is.null(sub$expose_over_mcp)) {
+        sub$expose_over_mcp <- FALSE
+    }
+    # When exposure is on, cap cumulative subagent spend over MCP. USD
+    # cap default $5.00; <= 0 disables it. Token cap (for cost-blind
+    # providers) is off unless set.
+    if (is.null(sub$mcp_spend_cap_usd)) {
+        sub$mcp_spend_cap_usd <- 5.00
+    }
+    if (is.null(sub$mcp_spend_cap_tokens)) {
+        sub$mcp_spend_cap_tokens <- NA_integer_
+    }
     if (is.null(sub$default_tools)) {
         sub$default_tools <- c("base::readLines", "base::writeLines",
                                "bash", "grep_files")
@@ -186,7 +209,89 @@ load_config <- function(cwd = getwd()) {
     if (is.null(sub$base_port)) {
         sub$base_port <- 7851L
     }
+    # Child context compaction. Working subagents (not archive holders)
+    # may compact their own in-memory history when it grows past the
+    # effective threshold. The on-disk transcript is unaffected.
+    if (is.null(sub$context_compaction)) {
+        sub$context_compaction <- list()
+    }
+    cc <- sub$context_compaction
+    if (is.null(cc$mode)) {
+        # inherit_strict: effective threshold = min(parent, child).
+        # inherit: use parent's context_compact_pct verbatim.
+        # off: never compact.
+        cc$mode <- "inherit_strict"
+    }
+    if (is.null(cc$compact_pct)) {
+        cc$compact_pct <- 75L
+    }
+    if (is.null(cc$keep_recent_turns)) {
+        cc$keep_recent_turns <- 1L
+    }
+    if (is.null(cc$min_messages)) {
+        cc$min_messages <- 6L
+    }
+    if (is.null(cc$timeout_seconds)) {
+        cc$timeout_seconds <- 60L
+    }
+    sub$context_compaction <- cc
     config$subagents <- sub
+
+    # Archival (retroactive-extraction) configuration. Default off so
+    # CRAN users see no behavior change. When enabled, finished turns
+    # collapse into subagents that hold the full transcript; the parent
+    # context keeps {summary, subagent_id} and the live-subagents block
+    # in the system prompt lets the LLM pick query_subagent or
+    # spawn_subagent as a normal tool decision.
+    if (is.null(config$archival)) {
+        config$archival <- list()
+    }
+    arc <- config$archival
+    if (is.null(arc$enabled)) {
+        arc$enabled <- FALSE
+    }
+    if (is.null(arc$trigger)) {
+        arc$trigger <- list()
+    }
+    if (is.null(arc$trigger$on_max_turns)) {
+        arc$trigger$on_max_turns <- TRUE
+    }
+    if (is.null(arc$trigger$token_threshold)) {
+        arc$trigger$token_threshold <- 8000L
+    }
+    if (is.null(arc$trigger$tool_call_threshold)) {
+        arc$trigger$tool_call_threshold <- 5L
+    }
+    if (is.null(arc$trigger$depth_cap)) {
+        arc$trigger$depth_cap <- 3L
+    }
+    if (is.null(arc$summary)) {
+        arc$summary <- list()
+    }
+    if (is.null(arc$summary$style)) {
+        arc$summary$style <- "structured"
+    }
+    # arc$summary$model: NULL means "match parent provider/model".
+    if (is.null(arc$summary$timeout_seconds)) {
+        arc$summary$timeout_seconds <- 60L
+    }
+    # Async archival: spawn + seed + persist sync, summary in
+    # callr::r_bg. Default TRUE so the parent CLI never blocks on a
+    # slow LLM. Set FALSE to fall back to synchronous (with the same
+    # timeout but blocking).
+    if (is.null(arc$async)) {
+        arc$async <- TRUE
+    }
+    config$archival <- arc
+
+    # Archival requires the subagent runtime. Refuse to load a config
+    # that opts into archival while disabling subagents instead of
+    # silently overriding.
+    if (isTRUE(config$archival$enabled) && !isTRUE(config$subagents$enabled)) {
+        stop("archival.enabled requires subagents.enabled. ",
+             "Set subagents.enabled: true or archival.enabled: false.",
+             call. = FALSE)
+    }
 
     # Workspace config (managed runtime state)
     if (is.null(config$workspace)) {
@@ -216,38 +321,6 @@ load_config <- function(cwd = getwd()) {
     }
     config$workspace <- ws
 
-    # Channels config (matches openclaw structure)
-    if (is.null(config$channels)) {
-        config$channels <- list()
-    }
-
-    # Signal channel config (channels.signal.*)
-    if (is.null(config$channels$signal)) {
-        config$channels$signal <- list()
-    }
-    sig <- config$channels$signal
-    if (is.null(sig$enabled)) {
-        sig$enabled <- FALSE
-    }
-    if (is.null(sig$httpHost)) {
-        sig$httpHost <- "127.0.0.1"
-    }
-    if (is.null(sig$httpPort)) {
-        sig$httpPort <- 8080L
-    }
-    # sig$httpUrl - optional, overrides httpHost/httpPort
-    # sig$account - required, no default
-    # sig$allowFrom - optional allowlist (E.164 numbers)
-    # sig$cliPath - optional path to signal-cli
-    # Chunking config (matches openclaw)
-    if (is.null(sig$textChunkLimit)) {
-        sig$textChunkLimit <- 4000L
-    }
-    if (is.null(sig$chunkMode)) {
-        sig$chunkMode <- "length" # "length" or "newline"
-    }
-    config$channels$signal <- sig
-
     config
 }
 
@@ -260,3 +333,4 @@ get_context_files <- function(cwd = getwd()) {
     config <- load_config(cwd)
     config$context_files
 }
+

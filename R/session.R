@@ -30,20 +30,103 @@ sessions_store_path <- function(agent_id = DEFAULT_AGENT_ID) {
     file.path(sessions_dir(agent_id), "sessions.json")
 }
 
-#' Generate a new session ID (UUID format like openclaw)
-#' @return Character string UUID
+#' Adjectives + surnames for human-readable session names, in the
+#' docker-container style ("boring_wozniak", "elated_turing").
+#' Adjectives lifted from Docker's own moby/moby names-generator
+#' wordlist; surnames are scientists / mathematicians /
+#' computer-scientists who are uncontroversial enough to use as
+#' identifiers.
 #' @noRd
-session_id <- function() {
-    # Generate UUID v4
+.SESSION_ADJECTIVES <- c("admiring", "adoring", "affectionate", "agitated",
+                         "amazing", "angry", "awesome", "blissful", "bold",
+                         "boring", "brave", "busy", "charming", "clever",
+                         "cool", "compassionate", "competent",
+                         "condescending", "confident", "cranky", "crazy",
+                         "dazzling", "determined", "distracted", "dreamy",
+                         "eager", "ecstatic", "elastic", "elated",
+                         "elegant", "eloquent", "epic", "exciting",
+                         "fervent", "festive", "flamboyant", "focused",
+                         "friendly", "frosty", "funny", "gallant",
+                         "gifted", "goofy", "gracious", "great", "happy",
+                         "hardcore", "heuristic", "hopeful", "hungry",
+                         "infallible", "inspiring", "intelligent",
+                         "interesting", "jolly", "jovial", "keen", "kind",
+                         "laughing", "loving", "lucid", "magical",
+                         "mystifying", "modest", "musing", "naughty",
+                         "nervous", "nice", "nifty", "nostalgic",
+                         "objective", "optimistic", "peaceful", "pedantic",
+                         "pensive", "practical", "priceless", "quirky",
+                         "quizzical", "recursing", "relaxed", "reverent",
+                         "romantic", "serene", "sharp", "silly", "sleepy",
+                         "stoic", "strange", "stupefied", "suspicious",
+                         "sweet", "tender", "thirsty", "trusting",
+                         "unruffled", "upbeat", "vibrant", "vigilant",
+                         "vigorous", "wizardly", "wonderful", "youthful",
+                         "zealous")
+
+.SESSION_SURNAMES <- c("turing", "wozniak", "knuth", "ritchie",
+                       "kernighan", "torvalds", "lovelace", "hopper",
+                       "shannon", "dijkstra", "tesla", "edison", "newton",
+                       "darwin", "einstein", "curie", "feynman", "hawking",
+                       "galileo", "kepler", "neumann", "lamarr", "boole",
+                       "babbage", "godel", "church", "fermat", "euler",
+                       "gauss", "ramanujan", "noether", "hilbert",
+                       "lagrange", "laplace", "poincare", "fourier",
+                       "leibniz", "pascal", "fermi", "bohr", "planck",
+                       "schrodinger", "heisenberg", "mendel", "watson",
+                       "crick", "franklin", "lovelace", "hamilton", "wing",
+                       "liskov", "perlis", "stallman", "stroustrup",
+                       "matsumoto", "vanrossum", "hejlsberg", "engelbart",
+                       "mccarthy", "minsky", "papert", "djikstra",
+                       "iverson")
+
+#' Generate a new session ID in docker-container style
+#' (`adjective_surname`, e.g. `boring_wozniak`). Replaces an older
+#' UUID v4 generator. The names are used as both the in-memory
+#' sessionId and the on-disk filename root, so they stay short
+#' and filesystem-safe.
+#'
+#' Collisions across the lifetime of a project are possible (the
+#' wordlist is ~100 x ~60 = ~6000 names). If a collision is
+#' detected against an existing session in the **target agent's**
+#' store, retry up to 10 times before falling back to appending a
+#' 4-char hex suffix.
+#' @param agent_id Agent whose store to check for collisions
+#'   (codex 2026-05-20: previously hardcoded to the default agent,
+#'   so a non-main agent could reuse an existing session's
+#'   transcript silently).
+#' @return Character string.
+#' @noRd
+session_id <- function(agent_id = DEFAULT_AGENT_ID) {
+    for (attempt in seq_len(10L)) {
+        nm <- paste0(sample(.SESSION_ADJECTIVES, 1L), "_",
+                     sample(.SESSION_SURNAMES, 1L))
+        if (!.session_name_exists(nm, agent_id = agent_id)) {
+            return(nm)
+        }
+    }
+    # Fallback: append a hex suffix to disambiguate.
     hex <- c(0:9, letters[1:6])
-    paste0(
-           paste0(sample(hex, 8, replace = TRUE), collapse = ""), "-",
-           paste0(sample(hex, 4, replace = TRUE), collapse = ""), "-",
-           "4", paste0(sample(hex, 3, replace = TRUE), collapse = ""), "-",
-           sample(c("8", "9", "a", "b"), 1), paste0(sample(hex, 3, replace = TRUE),
-            collapse = ""), "-",
-           paste0(sample(hex, 12, replace = TRUE), collapse = "")
-    )
+    paste0(sample(.SESSION_ADJECTIVES, 1L), "_",
+           sample(.SESSION_SURNAMES, 1L), "_",
+           paste0(sample(hex, 4L, replace = TRUE), collapse = ""))
+}
+
+#' Probe whether a session with this id already has a transcript or
+#' store entry in the given agent. Checks both the on-disk
+#' transcript path and the in-store metadata so a session living
+#' under either path still counts as occupied.
+#' @noRd
+.session_name_exists <- function(nm, agent_id = DEFAULT_AGENT_ID) {
+    transcript <- file.path(sessions_dir(agent_id), paste0(nm, ".jsonl"))
+    if (file.exists(transcript)) {
+        return(TRUE)
+    }
+    store <- tryCatch(store_load(agent_id), error = function(e) list())
+    if (length(store) == 0L) {
+        return(FALSE)
+    }
+    nm %in% vapply(store, function(s) s$sessionId %||% "", character(1))
 }
 
 #' Get path to session transcript file
@@ -68,10 +151,8 @@ store_load <- function(agent_id = DEFAULT_AGENT_ID) {
         return(list())
     }
 
-    tryCatch(
-             jsonlite::fromJSON(path, simplifyVector = FALSE),
-             error = function(e) list()
-    )
+    tryCatch(jsonlite::fromJSON(path, simplifyVector = FALSE),
+             error = function(e) list())
 }
 
 #' Save session metadata store
@@ -100,7 +181,8 @@ store_update <- function(session_key, updates, agent_id = DEFAULT_AGENT_ID) {
     store <- store_load(agent_id)
 
     if (is.null(store[[session_key]])) {
-        store[[session_key]] <- list(sessionId = updates$sessionId %||% session_id())
+        store[[session_key]] <- list(sessionId = updates$sessionId %||%
+                                     session_id(agent_id = agent_id))
     }
 
     # Merge updates
@@ -126,25 +208,16 @@ store_update <- function(session_key, updates, agent_id = DEFAULT_AGENT_ID) {
 #' @noRd
 session_new <- function(provider = "anthropic", model = NULL, cwd = getwd(),
                         session_key = NULL, agent_id = DEFAULT_AGENT_ID) {
-    id <- session_id()
+    id <- session_id(agent_id = agent_id)
     now <- as.numeric(Sys.time()) * 1000
     session_key <- session_key %||% paste0("corteza:", id)
 
-    session <- list(
-                    sessionId = id,
-                    sessionKey = session_key,
-                    createdAt = now,
-                    updatedAt = now,
-                    provider = provider,
-                    model = model,
-                    cwd = normalizePath(cwd, mustWork = FALSE),
-                    inputTokens = 0L,
-                    outputTokens = 0L,
-                    totalTokens = 0L,
-                    compactionCount = 0L,
-                    memoryFlushCompactionCount = 0L,
-                    messages = list()
-    )
+    session <- list(sessionId = id, sessionKey = session_key,
+                    createdAt = now, updatedAt = now, provider = provider,
+                    model = model, cwd = normalizePath(cwd, mustWork = FALSE),
+                    inputTokens = 0L, outputTokens = 0L, totalTokens = 0L,
+                    compactionCount = 0L, memoryFlushCompactionCount = 0L,
+                    tasks = list(), messages = list())
 
     # Write session header to transcript
     transcript_write_header(id, cwd, agent_id)
@@ -160,7 +233,8 @@ session_new <- function(provider = "anthropic", model = NULL, cwd = getwd(),
                                    outputTokens = 0L,
                                    totalTokens = 0L,
                                    compactionCount = 0L,
-                                   memoryFlushCompactionCount = 0L
+                                   memoryFlushCompactionCount = 0L,
+                                   tasks = list()
         ), agent_id)
 
     session
@@ -183,7 +257,8 @@ session_save <- function(session, agent_id = DEFAULT_AGENT_ID) {
                                    outputTokens = session$outputTokens %||% 0L,
                                    totalTokens = session$totalTokens %||% 0L,
                                    compactionCount = session$compactionCount %||% 0L,
-                                   memoryFlushCompactionCount = session$memoryFlushCompactionCount %||% 0L
+                                   memoryFlushCompactionCount = session$memoryFlushCompactionCount %||% 0L,
+                                   tasks = session$tasks %||% list()
         ), agent_id)
 
     invisible(session_key)
@@ -223,6 +298,7 @@ session_load <- function(session_key, agent_id = DEFAULT_AGENT_ID,
                     totalTokens = entry$totalTokens %||% 0L,
                     compactionCount = entry$compactionCount %||% 0L,
                     memoryFlushCompactionCount = entry$memoryFlushCompactionCount %||% 0L,
+                    tasks = entry$tasks %||% list(),
                     messages = transcript_load(id, agent_id,
             from_compaction = from_compaction)
     )
@@ -242,8 +318,13 @@ session_list <- function(agent_id = DEFAULT_AGENT_ID, n = 20) {
         return(list())
     }
 
+    # Only list user sessions (keys starting with "corteza:"); subagent
+    # entries share the same store but have "agent:...:subagent:" keys and
+    # are not meaningful to the user in the --list / /sessions surface.
+    user_keys <- Filter(function(k) startsWith(k, "corteza:"), names(store))
+
     # Convert to list and sort by updatedAt
-    sessions <- lapply(names(store), function(key) {
+    sessions <- lapply(user_keys, function(key) {
         entry <- store[[key]]
         entry$sessionKey <- key
         entry$messages <- transcript_count(entry$sessionId, agent_id)
@@ -281,10 +362,8 @@ session_latest <- function(agent_id = DEFAULT_AGENT_ID) {
 #' @noRd
 session_add_message <- function(session, role, content) {
     # Store in pi-coding-agent compatible format
-    msg <- list(
-                role = role,
-                content = list(list(type = "text", text = content))
-    )
+    msg <- list(role = role,
+                content = list(list(type = "text", text = content)))
 
     session$messages <- c(session$messages, list(msg))
     session
@@ -403,10 +482,8 @@ transcript_load <- function(id, agent_id = DEFAULT_AGENT_ID,
 
     # Parse all lines
     entries <- lapply(lines, function(line) {
-        tryCatch(
-                 jsonlite::fromJSON(line, simplifyVector = FALSE),
-                 error = function(e) NULL
-        )
+        tryCatch(jsonlite::fromJSON(line, simplifyVector = FALSE),
+                 error = function(e) NULL)
     })
 
     entries <- Filter(Negate(is.null), entries)
@@ -456,14 +533,10 @@ transcript_compact <- function(session, summary, agent_id = DEFAULT_AGENT_ID) {
     # Compaction in pi-coding-agent format is an assistant message with special marker
     # For now, just append as a regular assistant message
     # TODO: Match exact compaction format from pi-coding-agent
-    transcript_append(
-                      session,
-                      role = "assistant",
+    transcript_append(session, role = "assistant",
                       content = paste0("[Compaction Summary]\n\n", summary),
-                      provider = "corteza",
-                      model = "compaction",
-                      agent_id = agent_id
-    )
+                      provider = "corteza", model = "compaction",
+                      agent_id = agent_id)
 }
 
 #' Format session list for display
@@ -495,12 +568,10 @@ format_session_list <- function(sessions) {
         compactions <- if ((s$compactionCount %||% 0) > 0) {
             sprintf(" [%d compactions]", s$compactionCount)
         } else ""
-        sprintf("  %s  %s  %d msgs  %s/%s%s",
-                safe_str(s$sessionKey, "?"),
+        sprintf("  %s  %s  %d msgs  %s/%s%s", safe_str(s$sessionKey, "?"),
                 format_time(s$updatedAt),
             if (is.numeric(s$messages)) s$messages else 0L,
-                safe_str(s$modelProvider, "?"),
-                safe_str(s$model, "default"),
+                safe_str(s$modelProvider, "?"), safe_str(s$model, "default"),
                 compactions)
     }, character(1))
 
@@ -597,10 +668,8 @@ trace_load <- function(session_id, agent_id = DEFAULT_AGENT_ID, n = NULL) {
     }
 
     lapply(lines, function(line) {
-        tryCatch(
-                 jsonlite::fromJSON(line, simplifyVector = FALSE),
-                 error = function(e) NULL
-        )
+        tryCatch(jsonlite::fromJSON(line, simplifyVector = FALSE),
+                 error = function(e) NULL)
     })
 }
 
@@ -624,8 +693,7 @@ format_trace <- function(trace, show_args = FALSE) {
             "?"
         }
 
-        base <- sprintf("  [%s] %s %s (%s)",
-                        status, entry$tool, time_str,
+        base <- sprintf("  [%s] %s %s (%s)", status, entry$tool, time_str,
                         substr(entry$timestamp, 12, 19))
 
         if (show_args && length(entry$args) > 0) {

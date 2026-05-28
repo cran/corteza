@@ -3,10 +3,8 @@
 # Detect providers supported by the currently loaded llm.api namespace.
 # @noRd
 llm_api_supported_providers <- function() {
-    providers <- tryCatch(
-                          eval(formals(llm.api::agent)$provider),
-                          error = function(e) character()
-    )
+    providers <- tryCatch(eval(formals(llm.api::agent)$provider),
+                          error = function(e) character())
 
     unique(as.character(providers %||% character()))
 }
@@ -176,8 +174,14 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
         stop("chat() requires an interactive R session", call. = FALSE)
     }
 
+    # Signal that chat() is the active console REPL so the RStudio
+    # addin (corteza_execute_in_chat()) knows to auto-prefix /r or !
+    # when sending lines from a script editor. Cleared on exit.
+    options(corteza.chat_active = TRUE)
+    on.exit(options(corteza.chat_active = NULL), add = TRUE)
+
     max_turns <- as.integer(
-        max_turns %||% getOption("corteza.max_turns") %||% 50L
+                            max_turns %||% getOption("corteza.max_turns") %||% 50L
     )
 
     cwd <- getwd()
@@ -191,18 +195,13 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
 
     # Shared pre-session setup: config, provider, API key, skills,
     # system prompt.
-    turn_session <- session_setup(
-                                  channel = "console",
-                                  cwd = cwd,
-                                  provider = provider,
-                                  model = model,
-                                  tools = tools,
-                                  history = history,
+    turn_session <- session_setup(channel = "console", cwd = cwd,
+                                  provider = provider, model = model,
+                                  tools = tools, history = history,
                                   load_project_context = TRUE,
                                   validate_api_key = TRUE,
                                   approval_cb = chat_approval_cb(cwd),
-                                  max_turns = max_turns
-    )
+                                  max_turns = max_turns)
     config <- turn_session$config
     provider <- turn_session$provider
     model <- turn_session$model_map$cloud
@@ -212,6 +211,16 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     # Attach on-disk session metadata so observers can trace.
     turn_session$sessionId <- disk_session$sessionId
     turn_session$disk_session <- disk_session$session
+    # Carry any persisted task list from the resumed session into the
+    # live turn_session env so the next turn's prompt addendum sees it.
+    turn_session$tasks <- disk_session$session$tasks %||% list()
+    # task_create routes the approval prompt through this cb so we
+    # use the R-console's blocking readline() and an empty Enter
+    # means "yes" (matching the rest of corteza's prompt UX).
+    turn_session$task_approval_cb <- function() {
+        ans <- readline("Approve this plan? [y/n] ")
+        tolower(trimws(ans)) %in% c("", "y", "yes")
+    }
 
     # Workspace setup (session-scoped, resumed from disk when appropriate)
     ws_enabled <- isTRUE(config$workspace$enabled %||% TRUE)
@@ -220,8 +229,15 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     # Register observers: progress printer + trace row per tool call.
     add_observer(turn_session, observer_progress())
     add_observer(turn_session, chat_trace_observer(turn_session))
+    # Capture successful tool outputs into the per-session buffer so
+    # /last and /outputs can replay them. Keyed by sessionId in the
+    # package; this observer just relays. The "kind" attr lets /clear
+    # find and replace this specific observer when the session resets.
+    tool_buf_obs <- tool_buffer_observer(disk_session$session)
+    attr(tool_buf_obs, "kind") <- "tool_buffer"
+    add_observer(turn_session, tool_buf_obs)
 
-    # Optional experimental layers — off by default; opt in via options.
+    # Optional experimental layers -- off by default; opt in via options.
     if (isTRUE(getOption("corteza.experimental_ce", FALSE))) {
         ce_init(cwd, config)
         for (i in seq_along(history)) {
@@ -237,128 +253,68 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     on.exit(set_log_enabled(TRUE), add = TRUE)
 
     n_tools <- length(skills_as_api_tools(tools))
-    display_model <- model %||% "(provider default)"
-    cat(sprintf(
-                "corteza chat | %s @ %s | %d tools | /clear, /quit%s\n\n",
-                display_model, provider, n_tools,
-            if (resumed_count > 0L) {
-                sprintf(" | resumed (%d msgs)", resumed_count)
-            } else {
-                ""
-            }
-        ))
+    # Resolve a placeholder NULL model to the provider's default name
+    # (from llm.api's table) so the banner shows the actual model the
+    # agent is about to call, matching the CLI's display.
+    display_model <- resolve_provider_model(provider, model) %||%
+    "(provider default)"
+    color <- ansi_colors()
+    session_line <- if (resumed_count > 0L) {
+        sprintf("  %ssession %s  \u00b7  resumed (%d msgs)%s\n",
+                color$dim, disk_session$sessionId, resumed_count,
+                color$reset)
+    } else {
+        sprintf("  %ssession %s%s\n",
+                color$dim, disk_session$sessionId, color$reset)
+    }
+    cat(corteza_startup_banner(
+                               version = as.character(utils::packageVersion("corteza")),
+                               model = display_model,
+                               provider = provider
+        ),
+        "\n\n",
+        session_line,
+        "\n",
+        sep = "")
 
     # /r evals are buffered here and prepended to the next real user
     # message, so the LLM sees what the user evaluated locally.
     pending_r_context <- character(0)
 
-    while (TRUE) {
-        prompt <- read_prompt_input("> ")
-        if (length(prompt) == 0L) {
-            cat("\nBye.\n")
-            break
-        }
-        if (nchar(trimws(prompt)) == 0) {
-            next
-        }
-        if (trimws(prompt) %in% c("/quit", "/exit", "/q")) {
-            if (ws_enabled) {
-                ws_prune()
-                tryCatch(ws_save(disk_session$sessionId),
-                         error = function(e) NULL)
-            }
-            cat("Bye.\n")
-            break
-        }
-        if (trimws(prompt) %in% c("/clear", "/reset", "/new")) {
-            # Archive the current session's workspace so it stays
-            # resumable, then spin up a fresh on-disk + in-memory
-            # session. The old transcript is left on disk.
-            if (ws_enabled) {
-                tryCatch(ws_save(disk_session$sessionId),
-                         error = function(e) NULL)
-            }
-            fresh <- session_new(provider, model, cwd)
-            disk_session <- list(session = fresh,
-                                 sessionId = fresh$sessionId,
-                                 resumed = FALSE)
-            turn_session$history <- list()
-            turn_session$sessionId <- fresh$sessionId
-            turn_session$disk_session <- fresh
-            pending_r_context <- character(0)
-            cat(sprintf("Cleared. New session: %s\n\n", fresh$sessionId))
-            next
-        }
-        if (startsWith(trimws(prompt), "/r ")) {
-            code <- sub("^/r\\s+", "", trimws(prompt))
-            r_env <- new.env(parent = emptyenv())
-            result_lines <- tryCatch(
-                capture.output({
-                    r_env$r <- withVisible(eval(parse(text = code),
-                                                envir = .GlobalEnv))
-                    if (r_env$r$visible) print(r_env$r$value)
-                }),
-                error = function(e) {
-                    r_env$r <- NULL
-                    paste("Error:", e$message)
-                }
-            )
-            result_text <- paste(result_lines, collapse = "\n")
-            # Show the output immediately so the user can react.
-            if (nchar(result_text) > 0) cat(result_text, "\n", sep = "")
-            # Stage for the next send so the LLM has the same context —
-            # but a printed data frame or big vector can easily be tens
-            # of thousands of tokens, so cap the staged text and fall
-            # back to str() for the oversize case.
-            staged <- if (nchar(result_text) > 4000L && !is.null(r_env$r)) {
-                str_lines <- tryCatch(
-                    capture.output(utils::str(r_env$r$value)),
-                    error = function(e) paste("Error:", e$message)
-                )
-                sprintf(
-                    "(%d chars of output truncated; showing str())\n%s",
-                    nchar(result_text),
-                    paste(str_lines, collapse = "\n")
-                )
-            } else {
-                result_text
-            }
-            pending_r_context <- c(
-                pending_r_context,
-                sprintf("[/r] %s\n%s", code, staged)
-            )
-            next
-        }
+    # Most recent assistant reply text, exposed via /copy.
+    last_assistant_response <- ""
 
-        if (length(pending_r_context) > 0) {
-            prompt <- paste(c(pending_r_context, prompt), collapse = "\n\n")
-            pending_r_context <- character(0)
-        }
-        transcript_append(disk_session$session, "user", prompt)
-
-        cat(sprintf("\u25cf Thinking with %s\n",
-                    model %||% "(provider default)"))
-        result <- tryCatch(
-                           turn(prompt, turn_session),
-                           error = function(e) {
-            message("Error: ", e$message)
-            NULL
-        }
-        )
-        if (is.null(result)) {
-            next
-        }
-
-        reply <- result$reply %||% ""
-        if (nchar(reply) == 0) {
-            cat("[No response text]\n\n")
-        } else {
-            cat(reply, "\n\n")
-        }
-        transcript_append(disk_session$session, "assistant", reply)
+    # Build the shared REPL context. The loop lives in run_repl_loop()
+    # (R/repl.R); chat() supplies console-flavored hooks. ctx is an env
+    # so the loop's reassignments to mutable state persist here.
+    ctx <- new.env(parent = emptyenv())
+    ctx$session <- turn_session
+    ctx$disk_session <- disk_session
+    ctx$config <- config
+    ctx$cwd <- cwd
+    ctx$ws_enabled <- ws_enabled
+    ctx$provider <- provider
+    ctx$model <- model
+    ctx$pending_r_context <- pending_r_context
+    ctx$last_assistant_response <- last_assistant_response
+    ctx$read_input <- function(p) read_prompt_input(p)
+    ctx$palette <- color
+    ctx$render_reply <- function(txt) cat(render_md_ansi(txt, palette = color), "\n\n")
+    ctx$help_text <- chat_help_text
+    ctx$new_session_fn <- function() {
+        # Read provider/model from ctx, not the original locals: /model
+        # and /provider mutate ctx, so a later /clear must spin up the
+        # fresh session with the current model/provider.
+        fresh <- session_new(ctx$provider, ctx$model, cwd)
+        list(session = fresh, sessionId = fresh$sessionId, resumed = FALSE)
     }
+    ctx$handle_copy <- chat_handle_copy
+    ctx$format_tools <- chat_format_tools_list
+    ctx$turn_fn <- turn
+    run_repl_loop(ctx)
 
-    invisible(disk_session$session)
+    # ctx$disk_session, not the original local: /clear reassigns it.
+    invisible(ctx$disk_session$session)
 }
 
 # --- Chat-specific helpers ---
@@ -367,6 +323,7 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
 # "allow always" support.
 chat_approval_cb <- function(cwd = getwd()) {
     approved <- new.env(parent = emptyenv())
+    color <- ansi_colors()
 
     function(call, decision) {
         key <- call$tool %||% ""
@@ -374,16 +331,13 @@ chat_approval_cb <- function(cwd = getwd()) {
             return(TRUE)
         }
 
-        lines <- cli_approval_lines(
-            call,
-            decision,
-            gate_reason = "Console session approval required.",
-            cwd = cwd,
-            persistent_label = "Allow always for this session"
-        )
+        persistent_label <- "Allow always for this session"
+        lines <- cli_approval_lines(call, decision, cwd = cwd,
+                                    persistent_label = persistent_label,
+                                    deny_label = .console_deny_label())
         cat(paste(lines, collapse = "\n"), "\n")
 
-        ans <- read_prompt_input("Choice [1]: ")
+        ans <- read_prompt_input("Choice: ")
         if (length(ans) == 0L) {
             ans <- ""
         }
@@ -394,6 +348,19 @@ chat_approval_cb <- function(cwd = getwd()) {
         if (ans == "2") {
             approved[[key]] <- TRUE
         }
+        # RStudio's R console doesn't honor cursor-position escapes, so
+        # we leave the approval block in scrollback and just append the
+        # one-line summary below it.
+        summary <- cli_user_replied_line(call, ans,
+            persistent_label = persistent_label,
+            cwd = cwd)
+        cat(sprintf("%s\u25CF%s User replied:\n  %s\u23BF  %s%s\n\n",
+                    color$cyan, color$reset,
+                    color$dim, summary, color$reset))
+
+        if (ans == "3") {
+            stop(user_deny_condition(call$tool %||% ""))
+        }
         ans %in% c("1", "2")
     }
 }
@@ -403,12 +370,9 @@ resolve_disk_session <- function(session_arg, provider, model, cwd) {
     if (is.character(session_arg)) {
         resumed <- session_load(session_arg)
         if (!is.null(resumed)) {
-            return(list(
-                        session = resumed,
-                        sessionId = resumed$sessionId,
+            return(list(session = resumed, sessionId = resumed$sessionId,
                         history = disk_messages_to_history(resumed$messages),
-                        resumed = TRUE
-                ))
+                        resumed = TRUE))
         }
         fresh <- session_new(provider, model, cwd, session_key = session_arg)
         return(list(session = fresh, sessionId = fresh$sessionId,
@@ -470,16 +434,12 @@ chat_trace_observer <- function(session) {
             return(invisible(NULL))
         }
         tryCatch(
-                 trace_add(
-                           session$sessionId,
-                           event$call$tool,
-                           event$call$args,
-                           event$result,
-                           success = event$success,
+                 trace_add(session$sessionId, event$call$tool, event$call$args,
+                           event$result, success = event$success,
                            elapsed_ms = round(event$elapsed_ms),
-                           turn = event$turn_number
-            ),
+                           turn = event$turn_number),
                  error = function(e) NULL
         )
     }
 }
+

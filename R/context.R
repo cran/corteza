@@ -24,6 +24,10 @@ load_context <- function(cwd = getwd()) {
                               "You are an AI assistant with access to tools for working with R and the file system.",
                               "Use the bash tool to run shell commands. Below is context about the current project",
                               "and available skills.",
+                              "run_r and subagents may return a .h_NNN handle instead of inlining a large result;",
+                              "reference it by name when present, and don't re-read it. To get a structured value",
+                              "back from a subagent, give it run_r (the 'work' preset), have it leave the result",
+                              "bound to a name, and pass that name as query_subagent's return_name.",
                               sep = "\n"
         ))
 
@@ -45,10 +49,8 @@ load_context <- function(cwd = getwd()) {
         if (file.exists(path)) {
             content <- paste(readLines(path, warn = FALSE), collapse = "\n")
             if (nchar(content) > 0L) {
-                b <- add_context(b, paste(
-                        sprintf("## %s", basename(path)), "", content,
-                        sep = "\n"
-                    ))
+                b <- add_context(b, paste(sprintf("## %s", basename(path)),
+                        "", content, sep = "\n"))
             }
         }
     }
@@ -76,12 +78,48 @@ load_context <- function(cwd = getwd()) {
             ))
     }
 
+    # Live subagents block: surfaced when archival has produced one or
+    # more holder subagents in this process. The LLM sees ids + tasks
+    # and chooses query_subagent vs spawn_subagent as a normal tool
+    # decision (no router).
+    sub_text <- format_live_subagents()
+    if (nzchar(sub_text)) {
+        b <- add_context(b, sub_text)
+    }
+
     # If only the preamble made it in, there's nothing project-specific
     # to ship back.
     if (length(b$parts) <= 1L) {
         return(NULL)
     }
     paste(b$parts, collapse = "\n\n")
+}
+
+#' Render the live-subagents block for the system prompt.
+#'
+#' Empty string when no subagents are registered. The empty case skips
+#' the block entirely so a default-off corteza session sees byte-
+#' identical context to before archival landed.
+#' @noRd
+format_live_subagents <- function() {
+    agents <- tryCatch(subagent_list(), error = function(e) list())
+    if (length(agents) == 0L) {
+        return("")
+    }
+    lines <- vapply(agents, function(a) {
+        sprintf("- id: %s | task: %s", a$id %||% "?", a$task %||% "?")
+    }, character(1))
+    paste(c(
+            "# Live Subagents",
+            "",
+            paste0("These subagents hold archived prior turns of this ",
+                   "conversation. Use the `query_subagent(id, prompt)` tool ",
+                   "to retrieve detail; spawn a new one with ",
+                   "`spawn_subagent(task)` to fan out. Do not query unless ",
+                   "you actually need the detail."),
+            "",
+            lines
+        ), collapse = "\n")
 }
 
 # ---- Context builder (dedupes exact-match blocks) ----
@@ -131,13 +169,10 @@ add_context <- function(builder, text) {
 load_local_agent_context <- function(cwd, config) {
     workspace_dir <- get_workspace_dir()
     tryCatch({
-        text <- agent_context(
-                              agent = "corteza",
-                              project_dir = cwd,
+        text <- agent_context(agent = "corteza", project_dir = cwd,
                               workspace_dir = workspace_dir,
                               include_soul = config$context_include_soul,
-                              include_global = config$context_include_user
-        )
+                              include_global = config$context_include_user)
         if (is.null(text) || nchar(trimws(text)) == 0L) NULL else text
     }, error = function(e) NULL)
 }
@@ -150,9 +185,14 @@ load_saber_briefing <- function(cwd) {
     project <- basename(cwd)
     scan_dir <- dirname(cwd)
     tryCatch({
-        # Suppress saber's cat() to stdout - we want the return value only
+        # saber::briefing() emits its full text via message(); without
+        # suppressMessages it leaks to the user's terminal every time a
+        # subagent calls session_setup, which masquerades as a session
+        # restart. capture.output() handles any stdout cat() too.
         utils::capture.output(
-                              text <- saber::briefing(project = project, scan_dir = scan_dir)
+                              text <- suppressMessages(
+                saber::briefing(project = project, scan_dir = scan_dir)
+            )
         )
         if (is.null(text) || nchar(trimws(text)) == 0L) {
             NULL
@@ -172,10 +212,8 @@ load_saber_agent_context <- function(cwd, config) {
     # namespace yet. When saber doesn't export it (0.3.0 and earlier),
     # this returns NULL and load_local_agent_context() covers the feature
     # via the inlined copy in R/agent_context.R.
-    saber_fn <- tryCatch(
-                         getExportedValue("saber", "agent_context"),
-                         error = function(e) NULL
-    )
+    saber_fn <- tryCatch(getExportedValue("saber", "agent_context"),
+                         error = function(e) NULL)
     if (is.null(saber_fn)) {
         return(NULL)
     }

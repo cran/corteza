@@ -42,7 +42,22 @@ the target room, and writes credentials to
 mode 0600. Call once per host. Model, provider, tools_filter, and
 auto_approve_asks are defaults the poll loop uses unless overridden
 at call time.
+}
+\details{
 Pre-CRAN releases stored the file at \code{~/.corteza/matrix.json};
 that path is still read for backward compatibility, but the next
 \code{matrix_configure()} call writes to the new location.
+
+}
+\examples{
+\dontrun{
+# Requires a real Matrix server and bot credentials. Configuration
+# is written under tools::R_user_dir("corteza", "config").
+matrix_configure(
+    server = "https://matrix.example.org",
+    user = "bot",
+    password = "secret",
+    room = "!roomid:example.org"
+)
+}
 }

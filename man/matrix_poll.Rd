@@ -30,9 +30,18 @@ against each. Auto-joins any pending invites the bot has received.
 Replies are sent back to the originating room. On first run there is
 no saved sync token, so this call establishes a baseline and returns
 without processing history.
+}
+\details{
 Pass \code{sessions = NULL} (the default) for a stateless one-shot —
 each incoming message builds a fresh session. Pass a registry created
 by \code{matrix_new_session_registry()} so a long-running
 \code{matrix_run} keeps a separate history per room (conversations
 in different rooms don't cross-contaminate).
+
+}
+\examples{
+\dontrun{
+# Single poll cycle against the configured Matrix homeserver.
+matrix_poll(timeout = 5000L)
+}
 }

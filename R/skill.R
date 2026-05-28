@@ -244,10 +244,8 @@ validate_skill_args <- function(skill, args) {
 #' @return Character string preview
 #' @noRd
 format_dry_run_preview <- function(skill, args) {
-    lines <- c(
-               sprintf("[DRY RUN] Would execute: %s", skill$name),
-               sprintf("Description: %s", skill$description)
-    )
+    lines <- c(sprintf("[DRY RUN] Would execute: %s", skill$name),
+               sprintf("Description: %s", skill$description))
 
     if (length(args) > 0) {
         lines <- c(lines, "Arguments:")
@@ -367,11 +365,8 @@ skills_as_tools <- function() {
     skill_names <- list_skills()
     lapply(skill_names, function(name) {
         skill <- get_skill(name)
-        list(
-             name = skill$name,
-             description = skill$description,
-             inputSchema = skill$inputSchema
-        )
+        list(name = skill$name, description = skill$description,
+             inputSchema = skill$inputSchema)
     })
 }
 
@@ -420,13 +415,9 @@ parse_skill_md <- function(path) {
         # No frontmatter, treat entire file as body
         body <- paste(lines, collapse = "\n")
         body <- gsub("\\{baseDir\\}", dirname(path), body)
-        return(list(
-                    name = tools::file_path_sans_ext(basename(dirname(path))),
-                    description = "",
-                    metadata = list(),
-                    body = body,
-                    path = path
-            ))
+        return(list(name = tools::file_path_sans_ext(basename(dirname(path))),
+                    description = "", metadata = list(), body = body,
+                    path = path))
     }
 
     # Find end of frontmatter
@@ -638,16 +629,13 @@ parse_skill_json <- function(path) {
     tryCatch({
         meta <- jsonlite::fromJSON(path, simplifyVector = FALSE)
 
-        list(
-             name = meta$name %||% basename(dirname(path)),
+        list(name = meta$name %||% basename(dirname(path)),
              version = meta$version %||% "0.0.0",
              schema_version = meta$schema_version %||% "1",
              description = meta$description %||% "",
              tools = meta$tools %||% list(),
              dependencies = meta$dependencies %||% list(),
-             author = meta$author,
-             license = meta$license
-        )
+             author = meta$author, license = meta$license)
     }, error = function(e) {
         warning(sprintf("Failed to parse SKILL.json at %s: %s", path,
                         e$message))
@@ -700,6 +688,29 @@ validate_skill_package <- function(path) {
     list(valid = length(errors) == 0, errors = errors)
 }
 
+#' Shallow-clone a git repository into `dest`.
+#'
+#' Wraps `processx::run()` with `error_on_status = FALSE` so a nonzero
+#' git exit surfaces as a clear corteza error (with the captured
+#' output) instead of processx's default throw. Extracted from
+#' `skill_install()` so the status handling can be unit-tested against
+#' a local repository, no network required.
+#'
+#' @param url Repository URL or local path to clone.
+#' @param dest Destination directory (must not already exist).
+#' @return `dest`, invisibly, on success; errors otherwise.
+#' @noRd
+git_clone <- function(url, dest) {
+    res <- processx::run("git", c("clone", "--depth", "1", url, dest),
+                         error_on_status = FALSE)
+    if (res$status != 0L || !dir.exists(dest)) {
+        stop("Failed to clone repository: ",
+             paste(c(res$stdout, res$stderr), collapse = "\n"),
+             call. = FALSE)
+    }
+    invisible(dest)
+}
+
 #' Install a skill from a path or URL
 #'
 #' @param source Path to skill directory or URL
@@ -707,6 +718,25 @@ validate_skill_package <- function(path) {
 #'   \code{tools::R_user_dir("corteza", "data")/skills}.
 #' @param force Overwrite if exists
 #' @return Installed skill name
+#' @examples
+#' # Install into a throwaway directory rather than the user's
+#' # R_user_dir, so this example doesn't mutate state.
+#' src <- file.path(tempdir(), "demo_skill")
+#' dir.create(src, showWarnings = FALSE)
+#' writeLines(c(
+#'                "---",
+#'                "name: demo",
+#'                "description: A demo skill",
+#'                "---",
+#'                "Demo body."
+#'             ),
+#'            file.path(src, "SKILL.md"))
+#'
+#' dest <- file.path(tempdir(), "skills_lib")
+#' skill_install(src, target_dir = dest)
+#'
+#' unlink(src, recursive = TRUE)
+#' unlink(dest, recursive = TRUE)
 #' @export
 skill_install <- function(source, target_dir = NULL, force = FALSE) {
     if (is.null(target_dir)) {
@@ -720,14 +750,7 @@ skill_install <- function(source, target_dir = NULL, force = FALSE) {
         # For GitHub URLs, try git clone
         if (grepl("github.com", source)) {
             temp_dir <- tempfile("skill_")
-            result <- system2("git", c("clone", "--depth", "1", source,
-                                       temp_dir),
-                              stdout = TRUE, stderr = TRUE)
-            if (!dir.exists(temp_dir)) {
-                stop("Failed to clone repository: ", paste(result,
-                        collapse = "\n"),
-                     call. = FALSE)
-            }
+            git_clone(source, temp_dir)
             source <- temp_dir
         } else {
             stop("URL installation only supported for GitHub repositories",
@@ -780,6 +803,20 @@ skill_install <- function(source, target_dir = NULL, force = FALSE) {
 #' @param name Skill name
 #' @param skill_dir Skills directory
 #' @return Invisible TRUE on success
+#' @examples
+#' # Install a demo skill into a tempdir, then remove it. The
+#' # installed name is the source directory's basename.
+#' src <- file.path(tempdir(), "demo_skill")
+#' dir.create(src, showWarnings = FALSE)
+#' writeLines(c("---", "name: demo_skill",
+#'              "description: A demo skill", "---"),
+#'            file.path(src, "SKILL.md"))
+#' dest <- file.path(tempdir(), "skills_lib")
+#' name <- skill_install(src, target_dir = dest)
+#' skill_remove(name, skill_dir = dest)
+#'
+#' unlink(src, recursive = TRUE)
+#' unlink(dest, recursive = TRUE)
 #' @export
 skill_remove <- function(name, skill_dir = NULL) {
     if (is.null(skill_dir)) {
@@ -811,6 +848,13 @@ skill_remove <- function(name, skill_dir = NULL) {
 #'
 #' @param skill_dir Skills directory
 #' @return Data frame with skill info
+#' @examples
+#' # List skills from an empty tempdir; returns a zero-row data frame
+#' # with the documented columns.
+#' empty <- file.path(tempdir(), "empty_skills")
+#' dir.create(empty, showWarnings = FALSE)
+#' skill_list_installed(skill_dir = empty)
+#' unlink(empty, recursive = TRUE)
 #' @export
 skill_list_installed <- function(skill_dir = NULL) {
     if (is.null(skill_dir)) {
@@ -819,12 +863,8 @@ skill_list_installed <- function(skill_dir = NULL) {
     skill_dir <- path.expand(skill_dir)
 
     if (!dir.exists(skill_dir)) {
-        return(data.frame(
-                          name = character(),
-                          version = character(),
-                          description = character(),
-                          stringsAsFactors = FALSE
-            ))
+        return(data.frame(name = character(), version = character(),
+                          description = character(), stringsAsFactors = FALSE))
     }
 
     dirs <- list.dirs(skill_dir, recursive = FALSE, full.names = TRUE)
@@ -882,6 +922,13 @@ skill_list_installed <- function(skill_dir = NULL) {
 #' @param path Path to skill directory
 #' @param verbose Print test output
 #' @return List with passed, failed, errors
+#' @examples
+#' # A skill directory with no test_*.R files returns a zero-result
+#' # summary rather than erroring.
+#' p <- file.path(tempdir(), "skill_no_tests")
+#' dir.create(p, showWarnings = FALSE)
+#' skill_test(p, verbose = FALSE)
+#' unlink(p, recursive = TRUE)
 #' @export
 skill_test <- function(path, verbose = TRUE) {
     path <- path.expand(path)
@@ -955,8 +1002,8 @@ format_skill_list <- function(skills) {
 
     for (i in seq_len(nrow(skills))) {
         s <- skills[i,]
-        lines <- c(lines, sprintf("  %s (v%s) - %s",
-                                  s$name, s$version, s$description))
+        lines <- c(lines,
+                   sprintf("  %s (v%s) - %s", s$name, s$version, s$description))
     }
 
     paste(lines, collapse = "\n")

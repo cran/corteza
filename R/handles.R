@@ -2,17 +2,24 @@
 #
 # A printed data.frame can blow thousands of tokens through the LLM's
 # context on a single `run_r` call. Instead of returning the printed
-# value, we stash the real object in a worker-local store and hand the
+# value, we stash the real object in a process-local store and hand the
 # LLM back a `summary + handle` pair. Later tool calls can reference
-# the handle by its name (a short `.h_NNN` symbol) — the worker
+# the handle by its name (a short `.h_NNN` symbol) and the store
 # substitutes the real object at eval time.
 #
-# Handles live for the life of the worker session. A fresh
-# `callr::r_session` starts with an empty store.
+# Handles live for the life of the R process. The store is per-process:
+# a subagent's `callr::r_session` child has its own, starting empty.
 
-#' Worker-local handle store.
+#' Process-local handle store.
 #' @noRd
 .handle_store <- new.env(parent = emptyenv())
+
+#' Registry of handle names this package has copied into the user's
+#' globalenv. Used by `handle_eval_env()` to remove stale handle
+#' bindings (handles that were in globalenv on a previous call but
+#' have since been cleared or rebound in the handle store).
+#' @noRd
+.handle_managed <- new.env(parent = emptyenv())
 
 #' Mint the next handle id for the current session.
 #' @noRd
@@ -21,7 +28,9 @@
     n <- length(existing) + 1L
     repeat {
         id <- sprintf(".h_%03d", n)
-        if (!exists(id, envir = .handle_store, inherits = FALSE)) return(id)
+        if (!exists(id, envir = .handle_store, inherits = FALSE)) {
+            return(id)
+        }
         n <- n + 1L
     }
 }
@@ -32,12 +41,24 @@
 #' matrices are always handled. Anything over 10 KB is handled.
 #' @noRd
 .is_large_result <- function(x) {
-    if (is.null(x)) return(FALSE)
-    if (is.atomic(x) && length(x) == 1L) return(FALSE)
-    if (is.data.frame(x)) return(TRUE)
-    if (is.matrix(x)) return(TRUE)
-    if (is.list(x) && length(x) > 10L) return(TRUE)
-    if (is.atomic(x) && length(x) > 50L) return(TRUE)
+    if (is.null(x)) {
+        return(FALSE)
+    }
+    if (is.atomic(x) && length(x) == 1L) {
+        return(FALSE)
+    }
+    if (is.data.frame(x)) {
+        return(TRUE)
+    }
+    if (is.matrix(x)) {
+        return(TRUE)
+    }
+    if (is.list(x) && length(x) > 10L) {
+        return(TRUE)
+    }
+    if (is.atomic(x) && length(x) > 50L) {
+        return(TRUE)
+    }
     tryCatch(as.numeric(utils::object.size(x)) > 10000L,
              error = function(e) FALSE)
 }
@@ -46,8 +67,8 @@
 #' @noRd
 .default_summary <- function(x) {
     out <- tryCatch(
-        utils::capture.output(utils::str(x, max.level = 1L, list.len = 10L)),
-        error = function(e) paste("Error summarising:", conditionMessage(e))
+                    utils::capture.output(utils::str(x, max.level = 1L, list.len = 10L)),
+                    error = function(e) paste("Error summarising:", conditionMessage(e))
     )
     paste(out, collapse = "\n")
 }
@@ -71,8 +92,12 @@ with_handle <- function(value, summary_fn = .default_summary) {
 #' @return The stashed value, or NULL if the handle is unknown.
 #' @noRd
 get_handle <- function(handle) {
-    if (!is.character(handle) || length(handle) != 1L) return(NULL)
-    if (!exists(handle, envir = .handle_store, inherits = FALSE)) return(NULL)
+    if (!is.character(handle) || length(handle) != 1L) {
+        return(NULL)
+    }
+    if (!exists(handle, envir = .handle_store, inherits = FALSE)) {
+        return(NULL)
+    }
     get(handle, envir = .handle_store)
 }
 
@@ -82,10 +107,20 @@ list_handles <- function() {
     ls(.handle_store, all.names = TRUE)
 }
 
-#' Drop all handles from the worker-local store (for tests).
+#' Drop all handles from the process-local store (for tests). Also
+#' removes any `.h_NNN` bindings the package previously copied into
+#' globalenv so a subsequent `tool_run_r()` doesn't see stale
+#' handle symbols.
 #' @noRd
 clear_handles <- function() {
     rm(list = ls(.handle_store, all.names = TRUE), envir = .handle_store)
+    ge <- globalenv()
+    for (h in ls(.handle_managed, all.names = TRUE)) {
+        if (exists(h, envir = ge, inherits = FALSE)) {
+            rm(list = h, envir = ge)
+        }
+    }
+    rm(list = ls(.handle_managed, all.names = TRUE), envir = .handle_managed)
     invisible(NULL)
 }
 
@@ -98,11 +133,56 @@ clear_handles <- function() {
 #' handle symbols into the user's globalenv.
 #' @noRd
 handle_eval_env <- function(parent = globalenv()) {
-    env <- new.env(parent = parent)
-    for (h in list_handles()) {
-        assign(h, get(h, envir = .handle_store), envir = env)
+    # Earlier versions (PR #36) returned a CHILD env of globalenv,
+    # which sandboxed handle symbols nicely but silently broke
+    # `<-` persistence across tool_run_r() calls -- assignments
+    # landed in the child env, not in globalenv, so they
+    # disappeared as soon as the call returned. The behavior
+    # contradicted the tool's docstring ("Execute R code in the
+    # session's global environment") and required users to discover
+    # they had to use `<<-` to make anything stick.
+    #
+    # Restored to: copy handles INTO globalenv (under their hidden
+    # `.h_NNN` names, which `ls()` doesn't show by default) and
+    # return globalenv. eval(envir = globalenv()) makes `<-` write
+    # to the right place. The `parent` argument is now ignored;
+    # kept for API parity.
+    # R CMD check NOTEs the literal `envir = globalenv()` pattern
+    # because most packages shouldn't write to the user's globalenv.
+    # For corteza this is intentional: handles need to be visible
+    # to the user's eval'd code, and the user's eval'd code runs
+    # in globalenv so `<-` persists across run_r() calls (per the
+    # tool's docstring). Tried `pos = 1L` to skirt the NOTE but it
+    # diverges from globalenv() when there's a sandbox env on the
+    # search path (e.g. under tinytest::run_test_file), so back to
+    # the explicit form and we live with the NOTE.
+    #
+    # Codex caught a staleness bug here (2026-05-20): the original
+    # version skipped reassignment when the handle name already
+    # existed in globalenv. Reusing a handle id (.h_001 rebound in
+    # the store to a different value) left the old globalenv copy
+    # in place, so tool_run_r('.h_001') returned the previous
+    # snapshot. Fix: assign unconditionally so the globalenv copy
+    # always reflects the current store, and remove globalenv
+    # bindings the package previously created that are no longer
+    # in the store.
+    ge <- globalenv()
+    current <- list_handles()
+    previously_managed <- ls(.handle_managed, all.names = TRUE)
+    stale <- setdiff(previously_managed, current)
+    for (h in stale) {
+        # Only remove if the binding still exists; user code might
+        # have rm()'d it already, in which case rm() would error.
+        if (exists(h, envir = ge, inherits = FALSE)) {
+            rm(list = h, envir = ge)
+        }
+        rm(list = h, envir = .handle_managed)
     }
-    env
+    for (h in current) {
+        assign(h, get(h, envir = .handle_store), envir = ge)
+        assign(h, TRUE, envir = .handle_managed)
+    }
+    ge
 }
 
 #' Read / inspect a stashed handle.
@@ -132,3 +212,4 @@ tool_read_handle <- function(handle, op = "str") {
                      error = function(e) paste("Error:", conditionMessage(e)))
     ok(paste(text, collapse = "\n"))
 }
+

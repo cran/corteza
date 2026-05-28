@@ -55,6 +55,8 @@ A session environment from \code{\link{new_session}}, with
 }
 \description{
 Performs pre-turn setup common to all channels:
+}
+\details{
 \enumerate{
 \item Loads project + global corteza config from \code{cwd}.
 \item Resolves provider, model, and verifies the required API
@@ -65,5 +67,14 @@ and \code{<cwd>/.corteza/skills}.
 \item Loads skill packages declared in the config.
 \item Optionally builds the system prompt via \code{load_context(cwd)}.
 \item Returns a \code{new_session()} built from the above.
+}
+
+}
+\examples{
+\dontrun{
+# Requires the relevant provider API key in the environment.
+s <- session_setup("cli", provider = "anthropic",
+                   load_project_context = FALSE)
+s$model
 }
 }

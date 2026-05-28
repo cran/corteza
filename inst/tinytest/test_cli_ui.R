@@ -1,5 +1,7 @@
 library(tinytest)
 
+# Static approval prompt: simplified single-line Access, no Reason
+# section, key hints on choices 1 and 3.
 call <- list(
     tool = "write_file",
     args = list(path = "R/chat.R", content = "x"),
@@ -7,57 +9,380 @@ call <- list(
 )
 decision <- list(model = "cloud", reason = "default: code/write/cli")
 lines <- corteza:::cli_approval_lines(
-    call,
-    decision,
-    gate_reason = "Config requires approval for write_file.",
-    cwd = "/tmp/project",
-    persistent_label = "Allow always for this session"
+                                      call,
+                                      decision,
+                                      cwd = "/tmp/project",
+                                      persistent_label = "Allow always for this session",
+                                      deny_label = "Deny (Esc)"
 )
 
+# Title still reflects the long tool label.
 expect_true(any(grepl("Write file", lines, fixed = TRUE)))
-expect_true(any(grepl("Write access to local files", lines, fixed = TRUE)))
-expect_true(any(grepl("Path: R/chat.R", lines, fixed = TRUE)))
+# Access collapses to one line that names the path directly.
+expect_true(any(grepl("Write to R/chat.R", lines, fixed = TRUE)))
+# Old verbose Access lines are gone.
+expect_false(any(grepl("Write access to local files", lines, fixed = TRUE)))
+# Reason / Policy / Model route stripped.
+expect_false(any(grepl("Policy:", lines, fixed = TRUE)))
+expect_false(any(grepl("Model route", lines, fixed = TRUE)))
+expect_false(any(grepl("Reason", lines, fixed = TRUE)))
+# Key hints land on choices 1 and 3. Choice 3 advertises the
+# surface-appropriate interrupt key (Esc in the R console, Ctrl+C in
+# the terminal CLI). The key doesn't literally cancel the prompt
+# itself -- readline doesn't catch Esc/Ctrl+C -- but it cancels the
+# in-flight turn, which is the user-facing escape hatch they want.
+expect_true(any(grepl("Allow once (Enter)", lines, fixed = TRUE)))
+expect_true(any(grepl("Deny (Esc)", lines, fixed = TRUE)))
 expect_true(any(grepl("Allow always for this session", lines, fixed = TRUE)))
-expect_true(any(grepl("Policy: default: code/write/cli", lines, fixed = TRUE)))
 
-summary_start <- corteza:::cli_event_summary(list(
-    event = "tool_call",
+# CLI surface uses Ctrl+C instead of Esc.
+cli_lines <- corteza:::cli_approval_lines(
+                                          call,
+                                          decision,
+                                          cwd = "/tmp/project",
+                                          persistent_label = "Allow always for this project",
+                                          deny_label = "Deny (Ctrl+C)"
+)
+expect_true(any(grepl("Deny (Ctrl+C)", cli_lines, fixed = TRUE)))
+
+# Default deny_label stays unadorned for callers that don't pass it.
+default_lines <- corteza:::cli_approval_lines(call, decision,
+                                              cwd = "/tmp/project")
+expect_true(any(grepl("^   3\\. Deny$", default_lines)))
+
+# Duplicate Path detail under the title is suppressed once Access
+# names the same path.
+expect_false(any(grepl("^   Path: R/chat.R$", lines)))
+
+# bash call: Access shows "Run command in <cwd>", no path.
+bash_call <- list(
     tool = "bash",
-    args = list(command = "git status\nls")
+    args = list(command = "git status"),
+    channel = "cli"
+)
+bash_lines <- corteza:::cli_approval_lines(bash_call,
+                                           decision = NULL,
+                                           cwd = "/tmp/proj")
+expect_true(any(grepl("Run command in /tmp/proj", bash_lines, fixed = TRUE)))
+# Boilerplate "Shell commands can invoke scripts..." is dropped now
+# that we only show noteworthy warnings.
+expect_false(any(grepl("Shell commands can invoke scripts",
+                       bash_lines, fixed = TRUE)))
+
+# Noteworthy warnings still surface. A credential-touching call gets
+# a Warning line.
+cred_call <- list(tool = "read_file",
+                  args = list(path = "~/.ssh/id_rsa"),
+                  channel = "cli")
+cred_decision <- list(reason = "credential path")
+cred_lines <- corteza:::cli_approval_lines(cred_call,
+                                           cred_decision,
+                                           cwd = "/tmp/proj")
+expect_true(any(grepl("Warning", cred_lines, fixed = TRUE)))
+expect_true(any(grepl("credential path", cred_lines, fixed = TRUE)))
+
+# cli_user_replied_line paraphrases the choice into a single line.
+ur1 <- corteza:::cli_user_replied_line(
+                                       list(tool = "replace_in_file",
+                                            args = list(path = "CLAUDE.md",
+                                                        old_text = "a", new_text = "b"),
+                                            channel = "cli"),
+                                       "1",
+                                       persistent_label = "Allow always for this project"
+)
+expect_identical(ur1, "Allow writing to CLAUDE.md once")
+
+ur2 <- corteza:::cli_user_replied_line(
+                                       list(tool = "bash",
+                                            args = list(command = "git status"),
+                                            channel = "cli"),
+                                       "2",
+                                       persistent_label = "Allow always for this project"
+)
+expect_true(grepl("Always allow running `git status`", ur2, fixed = TRUE))
+expect_true(grepl("for this project", ur2, fixed = TRUE))
+
+ur3 <- corteza:::cli_user_replied_line(
+                                       list(tool = "run_r",
+                                            args = list(code = "1 + 1"),
+                                            channel = "cli"),
+                                       "3",
+                                       persistent_label = "Allow always for this project"
+)
+expect_identical(ur3, "Deny running R code")
+
+# Scope phrase tracks the persistent label so chat() gets "for this
+# session" instead of "for this project".
+ur2_chat <- corteza:::cli_user_replied_line(
+                                            list(tool = "replace_in_file",
+                                                 args = list(path = "CLAUDE.md"),
+                                                 channel = "console"),
+                                            "2",
+                                            persistent_label = "Allow always for this session"
+)
+expect_true(grepl("for this session", ur2_chat, fixed = TRUE))
+
+# Existing cli_event_summary contract is unchanged.
+summary_start <- corteza:::cli_event_summary(list(
+                                                  event = "tool_call",
+                                                  tool = "bash",
+                                                  args = list(command = "git status\nls")
 ))
 expect_equal(summary_start$kind, "start")
 expect_true(grepl("Bash\\(git status\\)", summary_start$title))
 expect_true(any(grepl("git status", summary_start$detail_lines, fixed = TRUE)))
 
 summary_result <- corteza:::cli_event_summary(list(
-    event = "tool_result",
-    tool = "bash",
-    success = TRUE,
-    result_lines = 3L,
-    elapsed_ms = 15
+                                                   event = "tool_result",
+                                                   tool = "bash",
+                                                   success = TRUE,
+                                                   result_lines = 3L,
+                                                   elapsed_ms = 15
 ))
 expect_equal(summary_result$kind, "ok")
 expect_true(any(grepl("3 lines in 15ms", summary_result$detail_lines,
                       fixed = TRUE)))
 
 pretty_call <- tryCatch(
-    capture.output(corteza:::.cli_render_event(list(
-        event = "tool_call",
-        tool = "read_file",
-        args = list(path = "/tmp/x")
-    ), pretty = TRUE)),
-    error = function(e) e
+                        capture.output(corteza:::.cli_render_event(list(
+                                                                       event = "tool_call",
+                                                                       tool = "read_file",
+                                                                       args = list(path = "/tmp/x")
+                            ), pretty = TRUE)),
+                        error = function(e) e
 )
 expect_false(inherits(pretty_call, "error"))
 
 pretty_result <- tryCatch(
-    capture.output(corteza:::.cli_render_event(list(
-        event = "tool_result",
-        tool = "read_file",
-        success = TRUE,
-        result_lines = 2L,
-        elapsed_ms = 4
-    ), pretty = TRUE)),
-    error = function(e) e
+                          capture.output(corteza:::.cli_render_event(list(
+                                                                         event = "tool_result",
+                                                                         tool = "read_file",
+                                                                         success = TRUE,
+                                                                         result_lines = 2L,
+                                                                         elapsed_ms = 4
+                              ), pretty = TRUE)),
+                          error = function(e) e
 )
 expect_false(inherits(pretty_result, "error"))
+
+# Backslash continuation: odd trailing backslashes trigger; even
+# trailing don't. Helper returns the seed (line minus the last `\`)
+# or NULL.
+expect_identical(corteza:::backslash_continuation_seed("foo\\"), "foo")
+expect_null(corteza:::backslash_continuation_seed("foo\\\\"))
+expect_null(corteza:::backslash_continuation_seed("foo"))
+expect_null(corteza:::backslash_continuation_seed(""))
+# Three trailing backslashes is odd, counted as continuation. Seed
+# preserves the two leading backslashes.
+expect_identical(corteza:::backslash_continuation_seed("foo\\\\\\"), "foo\\\\")
+# Non-character / wrong-shape inputs return NULL defensively.
+expect_null(corteza:::backslash_continuation_seed(NULL))
+expect_null(corteza:::backslash_continuation_seed(c("a\\", "b\\")))
+expect_null(corteza:::backslash_continuation_seed(42L))
+
+# ANSI prompt markup wraps escape sequences so bash readline's column
+# math stays correct.
+expect_identical(corteza:::.markup_prompt_for_readline("> "), "> ")
+ansi_wrapped <- corteza:::.markup_prompt_for_readline("\033[32m> \033[0m")
+expect_true(grepl("\001\033\\[32m\002", ansi_wrapped))
+expect_true(grepl("\001\033\\[0m\002", ansi_wrapped))
+
+# read_paste_block: drive it via a stubbed read_prompt_input so we can
+# test the state machine without a TTY. Two regression cases:
+#   1. A single returned line containing embedded "\n" + "/end"
+#      (mimics bash's pasted-multi-line drain) — must terminate
+#      immediately, not consume another input.
+#   2. A line ending with no trailing `\` terminates with the line
+#      included.
+# Heredoc mode: trailing-backslash continuation entry. First sub-line
+# without trailing `\` is final. Embedded `/end` in a pasted block
+# fires immediately (bash drains pasted lines into a single joined
+# string).
+local({
+    inputs <- c("line one \\", "line two\n/end\nshould not appear")
+    i <- 0L
+    fake_read <- function(prompt) {
+        i <<- i + 1L
+        if (i > length(inputs)) return(character())
+        inputs[i]
+    }
+    ns <- asNamespace("corteza")
+    orig <- ns$read_prompt_input
+    on.exit({
+        unlockBinding("read_prompt_input", ns)
+        assign("read_prompt_input", orig, envir = ns)
+        lockBinding("read_prompt_input", ns)
+    }, add = TRUE)
+    unlockBinding("read_prompt_input", ns)
+    assign("read_prompt_input", fake_read, envir = ns)
+
+    out <- corteza:::read_paste_block(seed = NULL,
+                                      empty_message = "",
+                                      heredoc = TRUE)
+    # "line one \" strips to "line one " (trailing space preserved,
+    # matching bash's behavior). "line two" has no `\` and is the
+    # final line, included in the buffer. "/end" never reached because
+    # heredoc already terminated.
+    expect_identical(out, "line one \nline two")
+    expect_equal(i, 2L)
+})
+
+# Heredoc mode: a single non-backslash line terminates with that line
+# included.
+local({
+    inputs <- c("just one line")
+    i <- 0L
+    fake_read <- function(prompt) {
+        i <<- i + 1L
+        if (i > length(inputs)) return(character())
+        inputs[i]
+    }
+    ns <- asNamespace("corteza")
+    orig <- ns$read_prompt_input
+    on.exit({
+        unlockBinding("read_prompt_input", ns)
+        assign("read_prompt_input", orig, envir = ns)
+        lockBinding("read_prompt_input", ns)
+    }, add = TRUE)
+    unlockBinding("read_prompt_input", ns)
+    assign("read_prompt_input", fake_read, envir = ns)
+
+    out <- corteza:::read_paste_block(seed = "first",
+                                      empty_message = "",
+                                      heredoc = TRUE)
+    expect_identical(out, "first\njust one line")
+})
+
+# /paste mode (heredoc = FALSE, the default): collect every sub-line
+# verbatim until /end or EOF. Codex caught the bug where this used to
+# terminate on the first non-backslash line, dropping the rest of a
+# pasted log/code block.
+local({
+    inputs <- c("line one\nline two\nline three\n/end\ndropped")
+    i <- 0L
+    fake_read <- function(prompt) {
+        i <<- i + 1L
+        if (i > length(inputs)) return(character())
+        inputs[i]
+    }
+    ns <- asNamespace("corteza")
+    orig <- ns$read_prompt_input
+    on.exit({
+        unlockBinding("read_prompt_input", ns)
+        assign("read_prompt_input", orig, envir = ns)
+        lockBinding("read_prompt_input", ns)
+    }, add = TRUE)
+    unlockBinding("read_prompt_input", ns)
+    assign("read_prompt_input", fake_read, envir = ns)
+
+    out <- corteza:::read_paste_block(seed = NULL,
+                                      empty_message = "")
+    expect_identical(out, "line one\nline two\nline three")
+})
+
+# /paste mode preserves literal trailing backslashes — code or paths
+# with `\` at end of line shouldn't be interpreted as continuation
+# markers in the explicit /paste contract.
+local({
+    inputs <- c("export PATH=foo\\", "/end")
+    i <- 0L
+    fake_read <- function(prompt) {
+        i <<- i + 1L
+        if (i > length(inputs)) return(character())
+        inputs[i]
+    }
+    ns <- asNamespace("corteza")
+    orig <- ns$read_prompt_input
+    on.exit({
+        unlockBinding("read_prompt_input", ns)
+        assign("read_prompt_input", orig, envir = ns)
+        lockBinding("read_prompt_input", ns)
+    }, add = TRUE)
+    unlockBinding("read_prompt_input", ns)
+    assign("read_prompt_input", fake_read, envir = ns)
+
+    out <- corteza:::read_paste_block(seed = NULL, empty_message = "")
+    # The `\` survives because /paste mode doesn't strip continuation.
+    expect_identical(out, "export PATH=foo\\")
+})
+
+# .console_deny_label ----
+# Regression: PR #103 hardcoded "Deny (Esc)" for chat()'s approval
+# prompt. That's correct in RStudio (Esc raises an interrupt) but
+# wrong in a plain terminal where Esc is a raw \033 byte and only
+# Ctrl+C raises SIGINT. The label must follow the actual key.
+
+# Explicit argument path -- no env-var juggling.
+expect_equal(corteza:::.console_deny_label(rstudio = TRUE), "Deny (Esc)")
+expect_equal(corteza:::.console_deny_label(rstudio = FALSE), "Deny (Ctrl+C)")
+
+# Env-var detection path.
+local({
+    old <- Sys.getenv("RSTUDIO", unset = NA)
+    on.exit({
+        if (is.na(old)) {
+            Sys.unsetenv("RSTUDIO")
+        } else {
+            Sys.setenv(RSTUDIO = old)
+        }
+    }, add = TRUE)
+
+    Sys.setenv(RSTUDIO = "1")
+    expect_equal(corteza:::.console_deny_label(), "Deny (Esc)")
+
+    Sys.setenv(RSTUDIO = "0")
+    expect_equal(corteza:::.console_deny_label(), "Deny (Ctrl+C)")
+
+    Sys.unsetenv("RSTUDIO")
+    expect_equal(corteza:::.console_deny_label(), "Deny (Ctrl+C)")
+})
+
+# .handle_bash_prompt_status ----
+# Regression: PR #49 wired the approval prompt to bash's `read -e -p`
+# via .read_prompt_via_bash. When bash is killed by SIGINT (Ctrl+C
+# at the prompt) it exits 130; before this fix the function returned
+# character() and the caller defaulted empty -> "1" (Approve), so
+# Ctrl+C silently approved the pending tool call. Status 130 must
+# now raise an R-level interrupt so the surrounding
+# tryCatch(interrupt = ...) handlers in inst/bin/corteza and
+# R/chat.R catch it the same as a real terminal Ctrl+C.
+
+# Status 130 -> interrupt condition. tryCatch's interrupt handler
+# matches by class, and our stop() carries class c("interrupt",
+# "condition").
+caught_interrupt <- FALSE
+tryCatch(
+    corteza:::.handle_bash_prompt_status(130L, ""),
+    interrupt = function(c) caught_interrupt <<- TRUE
+)
+expect_true(caught_interrupt)
+
+# Non-zero non-130 status (read failure that isn't SIGINT) returns
+# empty -- caller behavior unchanged for genuine read errors.
+expect_identical(corteza:::.handle_bash_prompt_status(1L, ""), character())
+
+# Status 0 with a missing tempfile path returns empty (defensive
+# guard for the case where bash succeeded but the output file
+# vanished).
+expect_identical(
+    corteza:::.handle_bash_prompt_status(0L, tempfile("nonexistent-")),
+    character()
+)
+
+# Status 0 with a valid tempfile reads its lines back.
+local({
+    tmp <- tempfile("bash-prompt-status-")
+    writeLines(c("first line", "second line"), tmp)
+    on.exit(unlink(tmp), add = TRUE)
+    expect_identical(corteza:::.handle_bash_prompt_status(0L, tmp),
+                     c("first line", "second line"))
+})
+
+# NULL status is treated as success (system2 returns NULL when stdout
+# = "" was requested and the child exited cleanly).
+local({
+    tmp <- tempfile("bash-prompt-null-")
+    writeLines("ok", tmp)
+    on.exit(unlink(tmp), add = TRUE)
+    expect_identical(corteza:::.handle_bash_prompt_status(NULL, tmp), "ok")
+})

@@ -54,8 +54,7 @@ format_numbered_lines <- function(lines, start = 1L) {
 
     width <- nchar(as.character(start + length(lines) - 1L))
     numbered <- sprintf(paste0("%", width, "d | %s"),
-                        seq.int(start, length.out = length(lines)),
-                        lines)
+                        seq.int(start, length.out = length(lines)), lines)
     paste(numbered, collapse = "\n")
 }
 
@@ -66,10 +65,8 @@ git_run <- function(args, path = ".") {
                        error = function(e) structure(paste("Error:", e$message), status = 1L)
     )
 
-    list(
-         status = attr(output, "status") %||% 0L,
-         text = paste(output, collapse = "\n")
-    )
+    list(status = attr(output, "status") %||% 0L,
+         text = paste(output, collapse = "\n"))
 }
 
 git_repo_available <- function(path = ".") {
@@ -108,15 +105,9 @@ tool_list_files <- function(path = ".", pattern = NULL, recursive = FALSE,
         limit <- 200L
     }
 
-    entries <- list.files(
-                          path = path,
-                          pattern = pattern %||% NULL,
-                          all.files = all_files,
-                          recursive = recursive,
-                          full.names = TRUE,
-                          include.dirs = TRUE,
-                          no.. = TRUE
-    )
+    entries <- list.files(path = path, pattern = pattern %||% NULL,
+                          all.files = all_files, recursive = recursive,
+                          full.names = TRUE, include.dirs = TRUE, no.. = TRUE)
     entries <- sort(entries)
 
     if (length(entries) == 0) {
@@ -189,10 +180,14 @@ tool_read_file <- function(path, from = 1L, lines = NULL, line_numbers = TRUE) {
     }
 
     from <- as.integer(from %||% 1L)
-    if (is.na(from) || from < 1L) from <- 1L
+    if (is.na(from) || from < 1L) {
+        from <- 1L
+    }
 
     count <- lines
-    if (!is.null(count)) count <- as.integer(count)
+    if (!is.null(count)) {
+        count <- as.integer(count)
+    }
 
     if (from > total) {
         return(ok(sprintf("File: %s\nLines: %d-%d of %d\n(no content in requested range)",
@@ -257,6 +252,14 @@ tool_write_file <- function(path, content, append = FALSE, create_dirs = TRUE) {
     content <- content %||% ""
     append <- isTRUE(append)
 
+    # Read prior content so we can show the user a diff after the
+    # write. Empty string when the file is new or unreadable; that
+    # path produces an all-green diff, which is what we want.
+    old_content <- ""
+    if (file.exists(path) && !dir.exists(path)) {
+        old_content <- tryCatch(tool_read_text(path), error = function(e) "")
+    }
+
     write_error <- tryCatch({
         tool_write_text(path, content, append = append)
         NULL
@@ -265,10 +268,20 @@ tool_write_file <- function(path, content, append = FALSE, create_dirs = TRUE) {
         return(err(paste("Write error:", write_error)))
     }
 
-    ok(sprintf("%s %d byte(s) to %s",
-            if (append) "Appended" else "Wrote",
-               nchar(content, type = "bytes"),
-               path))
+    summary <- sprintf("%s %d byte(s) to %s",
+        if (append) "Appended" else "Wrote",
+                       nchar(content, type = "bytes"), path)
+    # Append mode writes after existing content; the on-disk file now
+    # has old_content + content. Reflect that in the displayed diff so
+    # the user sees what was actually written, not a misleading
+    # whole-file overwrite preview.
+    if (append) {
+        new_for_diff <- paste0(old_content, content)
+    } else {
+        new_for_diff <- content
+    }
+    diff <- compute_unified_diff(old_content, new_for_diff, path)
+    ok_with_diff(summary, diff)
 }
 
 #' Replace exact text in a file without rewriting the whole file manually.
@@ -343,10 +356,17 @@ tool_replace_in_file <- function(path, old_text, new_text, all = FALSE,
         return(err(paste("Write error:", write_error)))
     }
 
-    ok(sprintf("Updated %s (%d replacement%s)",
-               path,
-            if (replace_all) match_count else 1L,
-            if ((if (replace_all) match_count else 1L) == 1L) "" else "s"))
+    if (replace_all) {
+        replacements <- match_count
+    } else {
+        replacements <- 1L
+    }
+    summary <- sprintf("Updated %s (%d replacement%s)",
+                       path,
+                       replacements,
+        if (replacements == 1L) "" else "s")
+    diff <- compute_unified_diff(original, updated, path)
+    ok_with_diff(summary, diff)
 }
 
 # Search ----
@@ -445,9 +465,11 @@ tool_run_r <- function(code) {
         outcome$printed
     }
 
-    # Auto-capture new globalenv bindings into the workspace. Variables
-    # assigned inside eval_env don't leak to globalenv, so this only
-    # fires when the user explicitly uses `<<-` or `assign()`.
+    # Auto-capture new globalenv bindings into the workspace. As of
+    # the handle_eval_env() fix that restored eval in globalenv,
+    # ordinary `<-` assignments land here, so any new visible name
+    # gets captured. Hidden names (`.foo`, `.h_NNN`) are excluded by
+    # default ls() rules.
     new_names <- setdiff(ls(globalenv()), before)
     origin <- list(tool = "run_r", args = list(code = code))
     for (nm in new_names) {
@@ -484,9 +506,26 @@ tool_run_r_script <- function(code, timeout = 30L) {
     writeLines(code, tmp)
 
     result <- tryCatch({
-        out <- system2("r", c("-f", tmp), stdout = TRUE, stderr = TRUE,
-                       timeout = timeout)
-        paste(out, collapse = "\n")
+        # callr::rscript runs Rscript portably (Linux, macOS, Windows).
+        # stderr = "2>&1" merges stderr into stdout so the LLM sees both
+        # streams as a single text blob in res$stdout.
+        #
+        # stdout = NULL (not "|"): in CRAN callr <= 3.7.6 on Windows,
+        # stdout = "|" combined with stderr = "2>&1" hangs indefinitely
+        # when the child errors via stop() — internal timeout never
+        # fires (r-lib/callr#313, fixed upstream in e93efd1). Passing
+        # stdout = NULL skips the hanging cat(file = "|") call in
+        # setup_callbacks() while still populating res$stdout via the
+        # 2>&1 redirect. Can be reverted to "|" once corteza depends
+        # on a fixed callr release.
+        res <- callr::rscript(tmp, show = FALSE, fail_on_status = FALSE,
+                              timeout = timeout, stdout = NULL,
+                              stderr = "2>&1")
+        if (isTRUE(res$timeout)) {
+            paste0("Error: timed out after ", timeout, "s")
+        } else {
+            res$stdout
+        }
     }, error = function(e) {
         paste("Error:", e$message)
     })
@@ -505,8 +544,8 @@ tool_run_r_script <- function(code, timeout = 30L) {
 #' @export
 tool_bash <- function(command, timeout = 30L, background = FALSE) {
     tool_shell_impl(
-        list(command = command, timeout = timeout, background = background),
-        "bash"
+                    list(command = command, timeout = timeout, background = background),
+                    "bash"
     )
 }
 
@@ -522,8 +561,8 @@ tool_bash <- function(command, timeout = 30L, background = FALSE) {
 #' @export
 tool_cmd <- function(command, timeout = 30L, background = FALSE) {
     tool_shell_impl(
-        list(command = command, timeout = timeout, background = background),
-        "cmd"
+                    list(command = command, timeout = timeout, background = background),
+                    "cmd"
     )
 }
 
@@ -533,18 +572,22 @@ tool_cmd <- function(command, timeout = 30L, background = FALSE) {
 # first (the likely install for anyone building R packages), then Git
 # for Windows, then plain "bash" as a last-resort PATH lookup.
 .find_bash_exe <- function() {
-    if (.Platform$OS.type != "windows") return("bash")
-    rtools_home <- Sys.getenv("RTOOLS45_HOME",
-                              Sys.getenv("RTOOLS44_HOME", ""))
+    if (.Platform$OS.type != "windows") {
+        return("bash")
+    }
+    rtools_home <- Sys.getenv("RTOOLS45_HOME", Sys.getenv("RTOOLS44_HOME", ""))
     candidates <- c(
-                    if (nzchar(rtools_home)) file.path(rtools_home, "usr", "bin", "bash.exe"),
+        if (nzchar(rtools_home)) file.path(rtools_home, "usr", "bin",
+            "bash.exe"),
                     "C:/rtools45/usr/bin/bash.exe",
                     "C:/rtools44/usr/bin/bash.exe",
                     "C:/Program Files/Git/bin/bash.exe",
                     "C:/Program Files (x86)/Git/bin/bash.exe"
     )
     for (p in candidates) {
-        if (file.exists(p)) return(p)
+        if (file.exists(p)) {
+            return(p)
+        }
     }
     "bash"
 }
@@ -569,17 +612,11 @@ tool_shell_impl <- function(args, shell_name) {
                         stop(sprintf("Unknown shell %s", shell_name), call. = FALSE)
     )
 
-    exe_args <- switch(
-                       shell_name,
-                       bash = c("-lc", cmd),
-                       cmd = c("/c", cmd)
-    )
+    exe_args <- switch(shell_name, bash = c("-c", cmd), cmd = c("/c", cmd))
 
     if (background) {
-        proc <- processx::process$new(
-                                      shell_exe, exe_args,
-                                      stdout = "|", stderr = "|", cleanup_tree = TRUE
-        )
+        proc <- processx::process$new(shell_exe, exe_args, stdout = "|",
+                                      stderr = "|", cleanup_tree = TRUE)
         id <- bg_register(cmd, proc)
         return(ok(sprintf(
                           "Started background process [%s] (pid %d)\nCheck with: bg_status tool",
@@ -587,21 +624,36 @@ tool_shell_impl <- function(args, shell_name) {
                 )))
     }
 
-    # Windows cmd.exe does not need shQuote and doesn't understand -lc.
-    exe_args_fg <- switch(
-                          shell_name,
-                          bash = c("-lc", shQuote(cmd)),
-                          cmd = c("/c", cmd)
-    )
-
-    result <- tryCatch({
-        out <- system2(shell_exe, exe_args_fg, stdout = TRUE,
-                       stderr = TRUE, timeout = timeout)
-        paste(out, collapse = "\n")
+    # Foreground uses the same args as background now: processx passes
+    # each arg literally (no shell word-splitting), so the command goes
+    # through as a single unquoted `-c` arg. (system2 needed shQuote
+    # because it pastes args; processx does not.)
+    tryCatch({
+        # processx::run() instead of system2(stdout = TRUE): the latter
+        # is a blocking C call R can't interrupt, so Ctrl+C during a
+        # foreground tool (e.g. `bash sleep 30`) halted the whole REPL.
+        # processx polls and is interruptible -- the interrupt propagates
+        # to the turn's handler in run_repl_loop, which returns to the
+        # prompt. cleanup_tree kills the child's descendants; status is
+        # surfaced structurally via err()/ok() rather than a warning.
+        res <- processx::run(shell_exe, exe_args,
+                             error_on_status = FALSE,
+                             stderr_to_stdout = TRUE,
+                             timeout = timeout,
+                             cleanup_tree = TRUE)
+        status <- res$status %||% 0L
+        text <- res$stdout %||% ""
+        if (!is.null(status) && status != 0L) {
+            err(sprintf("[exit status %d]\n%s", status, text))
+        } else {
+            ok(text)
+        }
+    }, system_command_timeout_error = function(e) {
+        partial <- tryCatch(e$stdout %||% "", error = function(e2) "")
+        err(sprintf("[timed out after %ss]\n%s", timeout, partial))
     }, error = function(e) {
-        paste("Error:", e$message)
+        err(paste("Error:", e$message))
     })
-    ok(result)
 }
 
 # Background process registry ----
@@ -610,12 +662,8 @@ tool_shell_impl <- function(args, shell_name) {
 
 bg_register <- function(cmd, proc) {
     id <- sprintf("bg_%d", length(ls(.bg_processes)) + 1L)
-    .bg_processes[[id]] <- list(
-                                id = id,
-                                command = substr(cmd, 1, 80),
-                                process = proc,
-                                started = Sys.time()
-    )
+    .bg_processes[[id]] <- list(id = id, command = substr(cmd, 1, 80),
+                                process = proc, started = Sys.time())
     id
 }
 
@@ -678,8 +726,8 @@ tool_bg_kill <- function(id) {
         entry$process$kill_tree()
         ok(sprintf("Killed process [%s] (pid %d)", id, entry$process$get_pid()))
     } else {
-        ok(sprintf("Process [%s] already exited with status %d",
-                   id, entry$process$get_exit_status()))
+        ok(sprintf("Process [%s] already exited with status %d", id,
+                   entry$process$get_exit_status()))
     }
 }
 
@@ -786,12 +834,8 @@ tool_web_search <- function(query, max_results = 5L) {
     }
 
     tryCatch({
-        body <- list(
-                     api_key = api_key,
-                     query = query,
-                     max_results = max_results,
-                     include_answer = TRUE
-        )
+        body <- list(api_key = api_key, query = query,
+                     max_results = max_results, include_answer = TRUE)
 
         h <- curl::new_handle()
         curl::handle_setopt(h,
@@ -988,19 +1032,17 @@ tool_git_log <- function(n = 10L, ref = "HEAD", path = ".") {
 #'
 #' @param task (character) Task description for the subagent.
 #' @param model (character) Optional model override.
-#' @param tools (character vector) Optional tool filter (list of tool names).
+#' @param tools (character vector) Optional explicit tool filter.
+#' @param preset (character) Preset name: "investigate" (default, read-only),
+#'   "work" (read + write + bash), or "minimal" (read_file + grep_files only).
 #' @return An MCP tool-result list.
 #' @keywords internal
 #' @export
 tool_spawn_subagent <- function(task, model = NULL, tools = NULL,
-                                ctx = list()) {
+                                preset = NULL, ctx = list()) {
     tryCatch({
-        id <- subagent_spawn(
-                             task = task,
-                             model = model,
-                             tools = tools,
-                             parent_session = ctx$session
-        )
+        id <- subagent_spawn(task = task, model = model, tools = tools,
+                             preset = preset, parent_session = ctx$session)
         ok(sprintf("Spawned subagent %s for: %s", id, task))
     }, error = function(e) {
         err(paste("Spawn failed:", e$message))
@@ -1011,15 +1053,54 @@ tool_spawn_subagent <- function(task, model = NULL, tools = NULL,
 #'
 #' @param id (character) Subagent ID.
 #' @param prompt (character) Prompt to send.
+#' @param wait (logical) If TRUE (default), block until the child
+#'   replies and return the reply. If FALSE, fire the prompt and
+#'   return immediately; caller collects via `collect_subagent`.
+#' @param return_name (string) Optional name or `.h_NNN` handle for a
+#'   value the subagent should hand back. Tell the subagent to leave
+#'   its result bound under this name (it needs `run_r`); the value is
+#'   returned as a handle you can reference in a later `run_r`, instead
+#'   of being inlined into the reply text.
 #' @return An MCP tool-result list.
 #' @keywords internal
 #' @export
-tool_query_subagent <- function(id, prompt) {
+tool_query_subagent <- function(id, prompt, wait = TRUE, return_name = NULL) {
     tryCatch({
-        result <- subagent_query(id, prompt)
-        ok(result)
+        result <- subagent_query(id, prompt, wait = wait,
+                                 return_name = return_name)
+        if (isTRUE(wait)) {
+            ok(result)
+        } else {
+            ok(sprintf("Queued for subagent %s; collect with collect_subagent.",
+                       result))
+        }
     }, error = function(e) {
         err(paste("Query failed:", e$message))
+    })
+}
+
+#' Collect the result of a previously-fired async subagent query.
+#'
+#' @param id (character) Subagent ID.
+#' @param wait (logical) If TRUE (default), block up to `timeout`
+#'   seconds. If FALSE, poll once and return immediately.
+#' @param timeout (numeric) Maximum seconds to block when `wait =
+#'   TRUE`. Default 60.
+#' @return An MCP tool-result list. On timeout returns a note that
+#'   the query is still running.
+#' @keywords internal
+#' @export
+tool_collect_subagent <- function(id, wait = TRUE, timeout = 60) {
+    tryCatch({
+        result <- subagent_collect(id, wait = wait, timeout = timeout)
+        if (is.null(result)) {
+            ok(sprintf("Subagent %s still working; try collect_subagent again.",
+                       id))
+        } else {
+            ok(result)
+        }
+    }, error = function(e) {
+        err(paste("Collect failed:", e$message))
     })
 }
 
@@ -1077,7 +1158,7 @@ register_builtin_skills <- function() {
     # or Git for Windows); otherwise fall back to cmd so minimal-install
     # Windows users still have a working shell tool.
     use_bash <- .Platform$OS.type != "windows" ||
-        file.exists(.find_bash_exe())
+    file.exists(.find_bash_exe())
     if (use_bash) {
         register_skill_from_fn("bash", tool_bash)
     } else {
@@ -1104,27 +1185,40 @@ register_builtin_skills <- function() {
     # cheap `.git` directory case and the more general `git rev-parse`
     # form so worktrees and submodules still count.
     .in_git_repo <- function() {
-        if (dir.exists(".git")) return(TRUE)
+        if (dir.exists(".git")) {
+            return(TRUE)
+        }
         status <- tryCatch(
-            suppressWarnings(system2("git",
-                                     c("rev-parse", "--is-inside-work-tree"),
-                                     stdout = TRUE, stderr = FALSE)),
-            error = function(e) character()
+                           suppressWarnings(system2("git",
+                    c("rev-parse", "--is-inside-work-tree"),
+                    stdout = TRUE, stderr = FALSE)),
+                           error = function(e) character()
         )
         isTRUE(identical(trimws(status[1]), "true"))
     }
     register_skill_from_fn("git_status", tool_git_status,
                            available = .in_git_repo)
-    register_skill_from_fn("git_diff", tool_git_diff,
-                           available = .in_git_repo)
-    register_skill_from_fn("git_log", tool_git_log,
-                           available = .in_git_repo)
+    register_skill_from_fn("git_diff", tool_git_diff, available = .in_git_repo)
+    register_skill_from_fn("git_log", tool_git_log, available = .in_git_repo)
 
     # Subagent tools
     register_skill_from_fn("spawn_subagent", tool_spawn_subagent)
     register_skill_from_fn("query_subagent", tool_query_subagent)
+    register_skill_from_fn("collect_subagent", tool_collect_subagent)
     register_skill_from_fn("list_subagents", tool_list_subagents)
     register_skill_from_fn("kill_subagent", tool_kill_subagent)
+
+    # Plan mode: exit_plan_mode is registered always but exposed in the
+    # tool list only when session$plan_mode is TRUE
+    # (see .plan_mode_filter_tools).
+    register_skill_from_fn("exit_plan_mode", tool_exit_plan_mode)
+
+    # Task tracker: schema only -- the real handlers live in
+    # task_tool_intercept() called from .make_tool_handler(), so they
+    # mutate the live session env directly (a registered stub handler
+    # only ever sees ctx = list(), not the session).
+    register_skill_from_fn("task_create", tool_task_create)
+    register_skill_from_fn("task_update", tool_task_update)
 
     invisible(list_skills())
 }

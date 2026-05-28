@@ -9,6 +9,52 @@ expect_true(grepl("2", result$content[[1]]$text))
 result <- corteza:::tool_run_r(code = "stop('test error')")
 expect_true(grepl("Error", result$content[[1]]$text))
 
+# Regression: `<-` assignments must persist in globalenv across
+# tool_run_r() calls. PR #36 (Phase 5 of CLI/worker split, Apr 2026)
+# silently broke this by evaluating in a child env, contradicting
+# the tool's docstring ("Execute R code in the session's global
+# environment"). Reported May 2026.
+local({
+    var_name <- "._corteza_persist_test"
+    on.exit(suppressWarnings(rm(list = var_name, envir = globalenv())),
+            add = TRUE)
+    suppressWarnings(rm(list = var_name, envir = globalenv()))
+
+    corteza:::tool_run_r(code = sprintf("%s <- 42", var_name))
+    expect_true(exists(var_name, envir = globalenv(), inherits = FALSE))
+    expect_equal(get(var_name, envir = globalenv()), 42)
+
+    # Second call reads what the first call wrote.
+    result <- corteza:::tool_run_r(code = sprintf("%s + 1", var_name))
+    expect_true(grepl("43", result$content[[1]]$text))
+
+    # Assignment via `=` also persists.
+    other <- "._corteza_persist_test_eq"
+    on.exit(suppressWarnings(rm(list = other, envir = globalenv())),
+            add = TRUE)
+    suppressWarnings(rm(list = other, envir = globalenv()))
+    corteza:::tool_run_r(code = sprintf("%s = 7", other))
+    expect_true(exists(other, envir = globalenv(), inherits = FALSE))
+})
+
+# Test run_r_script: fresh-subprocess execution via callr::rscript().
+# Smoke test was missing entirely before; the prior implementation called
+# system2("r", c("-f", tmp)) which failed everywhere ("-f" is not a valid
+# littler flag) but the bug stayed undetected because no test invoked it.
+result <- corteza:::tool_run_r_script(code = "cat(1+1)")
+expect_false(isTRUE(result$isError))
+expect_true(grepl("2", result$content[[1]]$text))
+
+# Error-case run_r_script: the prior implementation hung on Windows
+# with CRAN callr 3.7.6 (r-lib/callr#313, the stdout = "|" +
+# stderr = "2>&1" + stop() trio). tool_run_r_script() now passes
+# stdout = NULL, which skips the hanging cat(file = "|") path in
+# callr's setup_callbacks() while still merging stderr into res$stdout
+# via "2>&1". Assertion checks for the specific message so a generic
+# wrapper Error couldn't accidentally pass.
+result <- corteza:::tool_run_r_script(code = "stop('test error')")
+expect_true(grepl("test error", result$content[[1]]$text, fixed = TRUE))
+
 # Test shell tool (bash when available, cmd on minimal-install Windows)
 if (.Platform$OS.type == "windows" && !file.exists(corteza:::.find_bash_exe())) {
     result <- corteza:::tool_cmd(command = "echo hello")
@@ -17,6 +63,21 @@ if (.Platform$OS.type == "windows" && !file.exists(corteza:::.find_bash_exe())) 
 }
 expect_false(isTRUE(result$isError))
 expect_true(grepl("hello", result$content[[1]]$text))
+
+# Regression: the shell tool must return err() (isError = TRUE) when
+# the child process exits non-zero, so the LLM can detect command
+# failure. tool_shell_impl previously ignored attr(out, "status") and
+# always wrapped output in ok(), silently swallowing failures.
+local({
+    fail_result <- if (.Platform$OS.type == "windows" &&
+                       !file.exists(corteza:::.find_bash_exe())) {
+        corteza:::tool_cmd(command = "exit 42")
+    } else {
+        corteza:::tool_bash(command = "exit 42")
+    }
+    expect_true(isTRUE(fail_result$isError))
+    expect_true(grepl("exit status 42", fail_result$content[[1]]$text))
+})
 
 # Test grep_files
 tmp_dir <- tempfile("grep_test")

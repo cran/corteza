@@ -9,18 +9,21 @@
 
 matrix_require_mx <- function() {
     if (!requireNamespace("mx.api", quietly = TRUE)) {
-        stop(
-             "Matrix integration requires the 'mx.api' package. ",
+        stop("Matrix integration requires the 'mx.api' package. ",
              "Install it from CRAN, or from the cornball-ai GitHub mirror, ",
-             "before calling Matrix functions.",
-             call. = FALSE
-        )
+             "before calling Matrix functions.", call. = FALSE)
     }
 }
 
 # Active write target for matrix config: under R_user_dir per CRAN
-# policy on home-filespace writes.
+# policy on home-filespace writes. CORTEZA_MATRIX_CONFIG overrides
+# this so multiple bots (e.g. a personal and a company identity) can
+# coexist on one host with separate systemd units.
 matrix_config_path <- function() {
+    env <- Sys.getenv("CORTEZA_MATRIX_CONFIG", "")
+    if (nzchar(env)) {
+        return(path.expand(env))
+    }
     file.path(tools::R_user_dir("corteza", "config"), "matrix.json")
 }
 
@@ -33,15 +36,17 @@ matrix_legacy_config_path <- function() path.expand("~/.corteza/matrix.json")
 matrix_load_config <- function() {
     path <- matrix_config_path()
     legacy <- matrix_legacy_config_path()
+    # When CORTEZA_MATRIX_CONFIG is set, treat it as authoritative: a
+    # missing/typo'd path must error rather than silently falling back
+    # to the default identity at the legacy location.
+    explicit <- nzchar(Sys.getenv("CORTEZA_MATRIX_CONFIG", ""))
     src <- if (file.exists(path)) {
         path
-    } else if (file.exists(legacy)) {
+    } else if (!explicit && file.exists(legacy)) {
         legacy
     } else {
-        stop(
-             "Matrix not configured. Call matrix_configure() first.",
-             call. = FALSE
-        )
+        stop("Matrix not configured. Call matrix_configure() first.",
+             call. = FALSE)
     }
     jsonlite::fromJSON(src, simplifyVector = TRUE)
 }
@@ -55,12 +60,8 @@ matrix_save_config <- function(cfg) {
 }
 
 matrix_mx_session <- function(cfg) {
-    mx.api::mx_session(
-                       server = cfg$server,
-                       token = cfg$token,
-                       user_id = cfg$user_id,
-                       device_id = cfg$device_id
-    )
+    mx.api::mx_session(server = cfg$server, token = cfg$token,
+                       user_id = cfg$user_id, device_id = cfg$device_id)
 }
 
 #' Configure the Matrix channel for this host
@@ -94,6 +95,17 @@ matrix_mx_session <- function(cfg) {
 #'   declined until the thumbs-up reaction protocol lands.
 #'
 #' @return The saved configuration, invisibly.
+#' @examples
+#' \dontrun{
+#' # Requires a real Matrix server and bot credentials. Configuration
+#' # is written under tools::R_user_dir("corteza", "config").
+#' matrix_configure(
+#'     server = "https://matrix.example.org",
+#'     user = "bot",
+#'     password = "secret",
+#'     room = "!roomid:example.org"
+#' )
+#' }
 #' @export
 matrix_configure <- function(server, user, password, room, model = NULL,
                              provider = c("anthropic", "openai", "moonshot", "ollama"),
@@ -104,20 +116,12 @@ matrix_configure <- function(server, user, password, room, model = NULL,
     s <- mx.api::mx_login(server, user, password)
     room_id <- mx.api::mx_room_join(s, room)
 
-    cfg <- list(
-                server = server,
-                user = user,
-                password = password,
-                token = s$token,
-                user_id = s$user_id,
-                device_id = s$device_id,
-                room_id = room_id,
-                model = model,
-                provider = provider,
-                tools_filter = tools_filter,
+    cfg <- list(server = server, user = user, password = password,
+                token = s$token, user_id = s$user_id,
+                device_id = s$device_id, room_id = room_id, model = model,
+                provider = provider, tools_filter = tools_filter,
                 auto_approve_asks = isTRUE(auto_approve_asks),
-                sync_token = NULL
-    )
+                sync_token = NULL)
     matrix_save_config(cfg)
     message(sprintf("Configured %s in room %s", s$user_id, room_id))
     invisible(cfg)
@@ -131,12 +135,19 @@ matrix_configure <- function(server, user, password, room, model = NULL,
 #' @param msgtype Character. Matrix msgtype, default "m.text".
 #'
 #' @return The event ID of the sent message.
+#' @examples
+#' \dontrun{
+#' # Requires matrix_configure() to have run.
+#' matrix_send("hello from corteza")
+#' }
 #' @export
 matrix_send <- function(text, room_id = NULL, msgtype = "m.text") {
     matrix_require_mx()
     cfg <- matrix_load_config()
     s <- matrix_mx_session(cfg)
-    if (is.null(room_id) || !nzchar(room_id)) room_id <- cfg$room_id
+    if (is.null(room_id) || !nzchar(room_id)) {
+        room_id <- cfg$room_id
+    }
     mx.api::mx_send(s, room_id, text, msgtype = msgtype)
 }
 
@@ -156,14 +167,11 @@ matrix_extract_messages <- function(sync_resp, self_id) {
             if (isTRUE(ev$type == "m.room.message") &&
                 isTRUE(ev$content$msgtype == "m.text") &&
                 !is.null(ev$content$body)) {
-                out[[length(out) + 1L]] <- list(
-                    room_id = rid,
-                    event_id = ev$event_id,
-                    sender = ev$sender,
+                out[[length(out) + 1L]] <- list(room_id = rid,
+                    event_id = ev$event_id, sender = ev$sender,
                     is_self = isTRUE(ev$sender == self_id),
                     body = ev$content$body,
-                    mentions = ev$content$`m.mentions`$user_ids
-                )
+                    mentions = ev$content$`m.mentions`$user_ids)
             }
         }
     }
@@ -175,7 +183,9 @@ matrix_extract_messages <- function(sync_resp, self_id) {
 matrix_session_to_markdown <- function(session, room_id, room_name = NULL) {
     history <- session$history %||% list()
     start <- (session$ingested_through %||% 0L) + 1L
-    if (start > length(history)) return(NULL)
+    if (start > length(history)) {
+        return(NULL)
+    }
     new_msgs <- history[start:length(history)]
     parts <- vapply(new_msgs, function(m) {
         role <- m$role %||% "?"
@@ -199,15 +209,17 @@ matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
     # DESCRIPTION; the dynamic getExportedValue lookup keeps the
     # archive feature available to users who installed pensar from
     # GitHub while staying CRAN-clean.
-    pensar_ingest <- tryCatch(
-        getExportedValue("pensar", "ingest"),
-        error = function(e) NULL
-    )
-    if (is.null(pensar_ingest)) return(invisible(NULL))
+    pensar_ingest <- tryCatch(getExportedValue("pensar", "ingest"),
+                              error = function(e) NULL)
+    if (is.null(pensar_ingest)) {
+        return(invisible(NULL))
+    }
 
     history <- session$history %||% list()
     last <- session$ingested_through %||% 0L
-    if (length(history) <= last) return(invisible(NULL))
+    if (length(history) <= last) {
+        return(invisible(NULL))
+    }
 
     room_name <- if (!is.null(mx_sess)) {
         tryCatch(mx.api::mx_room_name(mx_sess, room_id),
@@ -216,16 +228,18 @@ matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
         NULL
     }
     md <- matrix_session_to_markdown(session, room_id, room_name)
-    if (is.null(md)) return(invisible(NULL))
+    if (is.null(md)) {
+        return(invisible(NULL))
+    }
     out <- tryCatch(
-        pensar_ingest(content = md, type = "matrix",
-                      source = room_name %||% room_id,
-                      title = room_name %||% room_id),
-        error = function(e) {
-            message("matrix_archive_session: pensar ingest failed: ",
-                    conditionMessage(e))
-            NULL
-        }
+                    pensar_ingest(content = md, type = "matrix",
+                                  source = room_name %||% room_id,
+                                  title = room_name %||% room_id),
+                    error = function(e) {
+        message("matrix_archive_session: pensar ingest failed: ",
+                conditionMessage(e))
+        NULL
+    }
     )
     if (!is.null(out)) {
         session$ingested_through <- length(history)
@@ -248,6 +262,13 @@ matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
 #'   NULL, the room ID is used as the source identifier.
 #'
 #' @return Integer count of rooms ingested, invisibly.
+#' @examples
+#' \dontrun{
+#' # Requires a running Matrix session registry and the optional
+#' # pensar package for the actual archive step.
+#' reg <- new.env(parent = emptyenv())
+#' matrix_archive_all(reg)
+#' }
 #' @export
 matrix_archive_all <- function(sessions, mx_sess = NULL) {
     if (!is.environment(sessions)) {
@@ -269,7 +290,9 @@ matrix_archive_all <- function(sessions, mx_sess = NULL) {
 # will include the @-mention prefix — accept the command at the end of
 # the message after any leading mention text, or on its own.
 matrix_is_clear_command <- function(body) {
-    if (is.null(body) || !nzchar(body)) return(FALSE)
+    if (is.null(body) || !nzchar(body)) {
+        return(FALSE)
+    }
     trimmed <- trimws(body)
     # Accept // as well as / so Element's slash-command interception
     # doesn't swallow the verb (Element's escape is to double the slash).
@@ -280,16 +303,27 @@ matrix_is_clear_command <- function(body) {
 # NULL if not a model command, else a list(model = ..., provider = ...,
 # query_only = ...).
 matrix_parse_model_command <- function(body) {
-    if (is.null(body) || !nzchar(body)) return(NULL)
+    if (is.null(body) || !nzchar(body)) {
+        return(NULL)
+    }
     trimmed <- trimws(body)
     m <- regmatches(trimmed,
                     regexec("(?:^|\\s)/+model(?:\\s+(\\S+)(?:\\s+(\\S+))?)?\\s*$",
                             trimmed, perl = TRUE))[[1]]
-    if (!length(m)) return(NULL)
-    model <- if (length(m) >= 2L && nzchar(m[2])) m[2] else NA_character_
-    provider <- if (length(m) >= 3L && nzchar(m[3])) m[3] else NA_character_
-    list(model = model, provider = provider,
-         query_only = is.na(model))
+    if (!length(m)) {
+        return(NULL)
+    }
+    if (length(m) >= 2L && nzchar(m[2])) {
+        model <- m[2]
+    } else {
+        model <- NA_character_
+    }
+    if (length(m) >= 3L && nzchar(m[3])) {
+        provider <- m[3]
+    } else {
+        provider <- NA_character_
+    }
+    list(model = model, provider = provider, query_only = is.na(model))
 }
 
 # Apply a parsed model command to a session. Returns the ack text to
@@ -352,9 +386,21 @@ matrix_extract_invites <- function(sync_resp) {
 matrix_default_system <- function(cfg, room_id = NULL, mx_sess = NULL,
                                   cwd = NULL, description = NULL,
                                   room_name = NULL) {
-    base <- sprintf("You are %s, a helpful assistant for %s.",
-                    cfg$user_id, cfg$user)
+    base <- sprintf("You are %s, a helpful assistant for %s.", cfg$user_id,
+                    cfg$user)
     parts <- base
+
+    # Optional persona file declared by the matrix config. Path layout
+    # is left to the caller (e.g. cerebro keeps personas alongside its
+    # other prompts inside the instance dir); corteza just reads what
+    # the config points at. Silent no-op when unset or missing.
+    spf <- cfg$system_prompt_file
+    if (!is.null(spf) && nzchar(spf)) {
+        spf <- path.expand(spf)
+        if (file.exists(spf)) {
+            parts <- c(parts, readLines(spf, warn = FALSE))
+        }
+    }
 
     if (!is.null(cwd) && nzchar(cwd)) {
         parts <- c(parts,
@@ -470,10 +516,8 @@ matrix_reaction_approval <- function(cfg, call, decision,
     mx_sess <- matrix_mx_session(cfg)
     msg <- matrix_approval_prompt(call, decision, timeout_sec)
 
-    eid <- tryCatch(
-                    mx.api::mx_send(mx_sess, room_id, msg),
-                    error = function(e) NULL
-    )
+    eid <- tryCatch(mx.api::mx_send(mx_sess, room_id, msg),
+                    error = function(e) NULL)
     if (is.null(eid)) {
         return(FALSE)
     }
@@ -669,12 +713,9 @@ matrix_get_or_create_session <- function(registry, room_id, cfg,
     if (exists(room_id, envir = registry, inherits = FALSE)) {
         return(get(room_id, envir = registry))
     }
-    s <- matrix_new_session(
-                            cfg,
-                            system = system, model = model,
+    s <- matrix_new_session(cfg, system = system, model = model,
                             provider = provider, tools_filter = tools_filter,
-                            room_id = room_id
-    )
+                            room_id = room_id)
     s$is_dm <- matrix_detect_dm(cfg, room_id)
     assign(room_id, s, envir = registry)
     s
@@ -688,10 +729,8 @@ matrix_detect_dm <- function(cfg, room_id) {
     if (is.null(mx_sess)) {
         return(TRUE) # conservative fallback
     }
-    members <- tryCatch(
-                        mx.api::mx_room_members(mx_sess, room_id),
-                        error = function(e) character()
-    )
+    members <- tryCatch(mx.api::mx_room_members(mx_sess, room_id),
+                        error = function(e) character())
     length(members) == 2L && cfg$user_id %in% members
 }
 
@@ -702,8 +741,8 @@ matrix_accept_invites <- function(mx_sess, invites) {
         joined <- tryCatch(
                            mx.api::mx_room_join(mx_sess, rid),
                            error = function(e) {
-            message(sprintf("matrix: failed to join %s: %s",
-                            rid, conditionMessage(e)))
+            message(sprintf("matrix: failed to join %s: %s", rid,
+                            conditionMessage(e)))
             NULL
         }
         )
@@ -737,6 +776,11 @@ matrix_accept_invites <- function(mx_sess, invites) {
 #'   keyed by room_id, or NULL to build fresh sessions each call.
 #'
 #' @return An integer count of messages replied to, invisibly.
+#' @examples
+#' \dontrun{
+#' # Single poll cycle against the configured Matrix homeserver.
+#' matrix_poll(timeout = 5000L)
+#' }
 #' @export
 matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
                         tools_filter = NULL, timeout = 0L, sessions = NULL) {
@@ -744,11 +788,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
     cfg <- matrix_load_config()
     mx_sess <- matrix_mx_session(cfg)
 
-    sync <- mx.api::mx_sync(
-                            mx_sess,
-                            since = cfg$sync_token,
-                            timeout = as.integer(timeout)
-    )
+    sync <- mx.api::mx_sync(mx_sess, since = cfg$sync_token,
+                            timeout = as.integer(timeout))
 
     first_run <- is.null(cfg$sync_token)
     cfg$sync_token <- sync$next_batch
@@ -794,8 +835,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
         if (isTRUE(m$is_self)) {
             if (!(m$event_id %in% session$seen_event_ids)) {
                 session$history <- c(
-                    session$history %||% list(),
-                    list(list(role = "assistant", content = m$body))
+                                     session$history %||% list(),
+                                     list(list(role = "assistant", content = m$body))
                 )
                 session$seen_event_ids <- matrix_remember_event(
                     session$seen_event_ids, m$event_id
@@ -833,8 +874,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
         if (!is.null(model_cmd)) {
             ack <- matrix_apply_model_command(session, model_cmd)
             sent_id <- tryCatch(
-                mx.api::mx_send(mx_sess, m$room_id, ack),
-                error = function(e) NULL
+                                mx.api::mx_send(mx_sess, m$room_id, ack),
+                                error = function(e) NULL
             )
             if (!is.null(sent_id)) {
                 session$seen_event_ids <- matrix_remember_event(
@@ -849,8 +890,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
             # Archive whatever's in the session before nuking it so the
             # topic isn't lost. Best-effort; failures already log.
             tryCatch(
-                matrix_archive_session(session, m$room_id, mx_sess),
-                error = function(e) NULL
+                     matrix_archive_session(session, m$room_id, mx_sess),
+                     error = function(e) NULL
             )
             if (exists(m$room_id, envir = sessions, inherits = FALSE)) {
                 rm(list = m$room_id, envir = sessions)
@@ -866,8 +907,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
             reply <- "(no reply)"
         }
         sent_id <- tryCatch(
-            mx.api::mx_send(mx_sess, m$room_id, reply),
-            error = function(e) NULL
+                            mx.api::mx_send(mx_sess, m$room_id, reply),
+                            error = function(e) NULL
         )
         if (!is.null(sent_id)) {
             session$seen_event_ids <- matrix_remember_event(
@@ -884,9 +925,13 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
 # events that have been processed. Lets matrix_poll skip duplicates when
 # sync echoes back something the backfill already replayed.
 matrix_remember_event <- function(seen, event_id, cap = 256L) {
-    if (is.null(event_id) || !nzchar(event_id)) return(seen)
+    if (is.null(event_id) || !nzchar(event_id)) {
+        return(seen)
+    }
     seen <- c(seen, event_id)
-    if (length(seen) > cap) seen <- tail(seen, cap)
+    if (length(seen) > cap) {
+        seen <- tail(seen, cap)
+    }
     seen
 }
 
@@ -901,21 +946,22 @@ matrix_remember_event <- function(seen, event_id, cap = 256L) {
 # history shape that turn() consumes on the next live message.
 #
 # @return Integer count of rooms backfilled, invisibly.
-matrix_backfill_sessions <- function(mx_sess, sessions, cfg,
-                                     system = NULL, model = NULL,
-                                     provider = NULL, tools_filter = NULL,
-                                     limit = 30L) {
+matrix_backfill_sessions <- function(mx_sess, sessions, cfg, system = NULL,
+                                     model = NULL, provider = NULL,
+                                     tools_filter = NULL, limit = 30L) {
     rooms <- tryCatch(mx.api::mx_rooms(mx_sess),
                       error = function(e) character())
     n <- 0L
     for (rid in rooms) {
         msgs <- tryCatch(
-            mx.api::mx_messages(mx_sess, rid, dir = "b",
-                                limit = as.integer(limit)),
-            error = function(e) NULL
+                         mx.api::mx_messages(mx_sess, rid, dir = "b",
+                limit = as.integer(limit)),
+                         error = function(e) NULL
         )
-        if (is.null(msgs) || !length(msgs$chunk)) next
-        chunk <- rev(msgs$chunk)  # API returns newest-first; flip
+        if (is.null(msgs) || !length(msgs$chunk)) {
+            next
+        }
+        chunk <- rev(msgs$chunk) # API returns newest-first; flip
         session <- matrix_get_or_create_session(
             sessions, rid, cfg,
             system = system, model = model,
@@ -923,18 +969,24 @@ matrix_backfill_sessions <- function(mx_sess, sessions, cfg,
         )
         added <- 0L
         for (ev in chunk) {
-            if (!isTRUE(ev$type == "m.room.message")) next
-            if (!isTRUE(ev$content$msgtype == "m.text")) next
+            if (!isTRUE(ev$type == "m.room.message")) {
+                next
+            }
+            if (!isTRUE(ev$content$msgtype == "m.text")) {
+                next
+            }
             body <- ev$content$body
-            if (is.null(body) || !nzchar(body)) next
+            if (is.null(body) || !nzchar(body)) {
+                next
+            }
             role <- if (isTRUE(ev$sender == cfg$user_id)) {
                 "assistant"
             } else {
                 "user"
             }
             session$history <- c(
-                session$history %||% list(),
-                list(list(role = role, content = body))
+                                 session$history %||% list(),
+                                 list(list(role = role, content = body))
             )
             session$seen_event_ids <- matrix_remember_event(
                 session$seen_event_ids, ev$event_id
@@ -981,6 +1033,12 @@ matrix_run_turn_in_cwd <- function(prompt, session) {
 #'
 #' @return Never returns under normal operation. Crashes on fatal error
 #'   so systemd can restart.
+#' @examples
+#' \dontrun{
+#' # Run the Matrix bot loop -- typically launched by a systemd unit
+#' # rather than from an interactive R session.
+#' matrix_run()
+#' }
 #' @export
 matrix_run <- function(timeout = 30000L, system = NULL, model = NULL,
                        provider = NULL, tools_filter = NULL) {
@@ -997,10 +1055,8 @@ matrix_run <- function(timeout = 30000L, system = NULL, model = NULL,
     if (!is.null(cfg)) {
         mx_sess <- tryCatch(matrix_mx_session(cfg), error = function(e) NULL)
         if (!is.null(mx_sess)) {
-            initial <- tryCatch(
-                                mx.api::mx_sync(mx_sess, timeout = 0L),
-                                error = function(e) NULL
-            )
+            initial <- tryCatch(mx.api::mx_sync(mx_sess, timeout = 0L),
+                                error = function(e) NULL)
             invites <- matrix_extract_invites(initial)
             if (length(invites)) {
                 matrix_accept_invites(mx_sess, invites)
@@ -1011,15 +1067,14 @@ matrix_run <- function(timeout = 30000L, system = NULL, model = NULL,
             # the last ~30 messages per joined room and replay them into
             # the session registry so context survives crashes / deploys.
             n_rooms <- tryCatch(
-                matrix_backfill_sessions(mx_sess, sessions, cfg,
-                                         system = system, model = model,
-                                         provider = provider,
-                                         tools_filter = tools_filter),
-                error = function(e) {
-                    message("matrix_run: backfill failed: ",
-                            conditionMessage(e))
-                    0L
-                }
+                                matrix_backfill_sessions(mx_sess, sessions, cfg,
+                    system = system, model = model,
+                    provider = provider,
+                    tools_filter = tools_filter),
+                                error = function(e) {
+                message("matrix_run: backfill failed: ", conditionMessage(e))
+                0L
+            }
             )
             if (n_rooms > 0L) {
                 message(sprintf("matrix_run: backfilled %d room session(s)",
@@ -1054,7 +1109,9 @@ matrix_run <- function(timeout = 30000L, system = NULL, model = NULL,
 # directly.) Created lazily when first written to.
 matrix_signal_dir <- function() {
     env <- Sys.getenv("CORTEZA_STATE_DIR", "")
-    if (nzchar(env)) return(env)
+    if (nzchar(env)) {
+        return(env)
+    }
     file.path(tools::R_user_dir("corteza", "data"), "state")
 }
 
@@ -1068,6 +1125,16 @@ matrix_signal_dir <- function() {
 #' to know the bot's PID or share its memory.
 #'
 #' @return The signal file path, invisibly.
+#' @examples
+#' # Writes a sentinel file under CORTEZA_STATE_DIR (or the package's
+#' # R_user_dir data path). Redirect to a tempdir for the example so
+#' # we don't touch persistent state.
+#' old <- Sys.getenv("CORTEZA_STATE_DIR")
+#' Sys.setenv(CORTEZA_STATE_DIR = file.path(tempdir(), "state"))
+#' sig <- matrix_request_flush()
+#' file.exists(sig)
+#' unlink(Sys.getenv("CORTEZA_STATE_DIR"), recursive = TRUE)
+#' Sys.setenv(CORTEZA_STATE_DIR = old)
 #' @export
 matrix_request_flush <- function() {
     dir <- matrix_signal_dir()
@@ -1082,15 +1149,16 @@ matrix_request_flush <- function() {
 # Flush sessions to pensar when the signal file exists. Removes the
 # file on success so each touch fires exactly one flush. Errors are
 # logged, never raised — the long-poll loop must keep running.
-matrix_handle_flush_signal <- function(flush_signal, sessions,
-                                       mx_sess = NULL) {
-    if (!file.exists(flush_signal)) return(invisible(0L))
+matrix_handle_flush_signal <- function(flush_signal, sessions, mx_sess = NULL) {
+    if (!file.exists(flush_signal)) {
+        return(invisible(0L))
+    }
     n <- tryCatch(
-        matrix_archive_all(sessions, mx_sess),
-        error = function(e) {
-            message("matrix_run: flush failed: ", conditionMessage(e))
-            -1L
-        }
+                  matrix_archive_all(sessions, mx_sess),
+                  error = function(e) {
+        message("matrix_run: flush failed: ", conditionMessage(e))
+        -1L
+    }
     )
     tryCatch(file.remove(flush_signal), error = function(e) NULL)
     if (isTRUE(n >= 0L)) {

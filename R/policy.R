@@ -51,8 +51,8 @@ get_code_paths <- function() {
 resolve_paths <- function(call) {
     args <- call$args %||% list()
     out <- character()
-    for (key in c("path", "file", "filename", "dir", "directory",
-                  "dest", "destination", "from", "to", "src", "target")) {
+    for (key in c("path", "file", "filename", "dir", "directory", "dest",
+                  "destination", "from", "to", "src", "target")) {
         v <- args[[key]]
         if (is.character(v)) {
             out <- c(out, v)
@@ -78,9 +78,8 @@ resolve_urls <- function(call) {
 
 # Classify the operation class of a tool.
 classify_op <- function(tool_name) {
-    read_tools <- c("read_file", "list_files", "grep_files",
-                    "git_log", "git_diff", "git_status",
-                    "web_search", "fetch_url",
+    read_tools <- c("read_file", "list_files", "grep_files", "git_log",
+                    "git_diff", "git_status", "web_search", "fetch_url",
                     "r_help", "installed_packages")
     write_tools <- c("write_file", "replace_in_file")
     exec_tools <- c("bash", "cmd", "run_r", "run_r_script")
@@ -129,6 +128,31 @@ classify_data <- function(call, context = NULL) {
     "random"
 }
 
+# Run the plan-mode gate. Returns a deny decision to short-circuit when
+# the session is in plan mode and the tool would mutate state, or NULL.
+# `exit_plan_mode` is always allowed (it's the escape hatch). Reads pass
+# through. Sticky data-class routing still applies to the read result.
+check_plan_mode <- function(call) {
+    if (!isTRUE(call$context$plan_mode)) {
+        return(NULL)
+    }
+    tool <- call$tool %||% ""
+    if (identical(tool, "exit_plan_mode")) {
+        return(NULL)
+    }
+    op <- classify_op(tool)
+    if (op %in% c("write", "exec")) {
+        return(list(
+                    model = "cloud",
+                    approval = "deny",
+                    reason = sprintf(
+                                     "plan mode: %s would modify state; present a plan via exit_plan_mode first",
+                                     tool)
+            ))
+    }
+    NULL
+}
+
 # Run hard safety checks. Returns a decision list to short-circuit, or NULL.
 check_safety <- function(call) {
     paths <- path.expand(call$paths %||% character())
@@ -162,7 +186,7 @@ check_safety <- function(call) {
     ),
                         code = list(
                                     read = list(cli = "allow", console = "allow", matrix = "allow"),
-                                    write = list(cli = "ask", console = "allow", matrix = "ask"),
+                                    write = list(cli = "ask", console = "ask", matrix = "ask"),
                                     exec = list(cli = "ask", console = "allow", matrix = "ask")
     ),
                         random = list(
@@ -187,10 +211,8 @@ default_policy <- function(call) {
     op <- classify_op(call$tool %||% "")
     channel <- call$channel %||% "cli"
 
-    approval <- tryCatch(
-                         .default_tensor[[data_class]][[op]][[channel]],
-                         error = function(e) NULL
-    )
+    approval <- tryCatch(.default_tensor[[data_class]][[op]][[channel]],
+                         error = function(e) NULL)
     if (is.null(approval)) {
         approval <- "ask"
     }
@@ -210,13 +232,34 @@ default_policy <- function(call) {
 #' \code{"cloud"} or \code{"local"}; \code{approval} is \code{"allow"},
 #' \code{"ask"}, or \code{"deny"}.
 #'
+#' When \code{config} is supplied, the project's
+#' \code{approval_mode} / \code{dangerous_tools} / per-tool
+#' \code{permissions} are overlaid on top of the default tensor: a
+#' tool the user has configured as \code{"ask"} or \code{"deny"} will
+#' have its decision promoted accordingly. Safety verdicts (credential
+#' paths, plan mode) still win because those represent invariants the
+#' user can't waive from config.
+#'
+#' Both \code{corteza::chat()} and the CLI tool dispatch loop pass
+#' their session's config through here so the \code{/permissions}
+#' contract advertised by both surfaces is enforced consistently.
+#'
 #' @param call A list describing the tool call. See the file header in
 #'   \code{R/policy.R} for the expected fields.
+#' @param config Optional config list from \code{load_config()}. When
+#'   \code{NULL} (default), only the built-in tensor and user policy
+#'   apply; this matches the historical \code{policy(call)} contract.
 #'
 #' @return A decision list with fields \code{model}, \code{approval},
 #'   \code{reason}.
+#' @examples
+#' # A bare-environment read_file call resolves under the default
+#' # built-in policy without needing any session config.
+#' decision <- policy(list(name = "read_file",
+#'                         arguments = list(path = "DESCRIPTION")))
+#' decision$approval
 #' @export
-policy <- function(call) {
+policy <- function(call, config = NULL) {
     if (is.null(call$paths)) {
         call$paths <- resolve_paths(call)
     }
@@ -229,6 +272,11 @@ policy <- function(call) {
         return(safety)
     }
 
+    plan <- check_plan_mode(call)
+    if (!is.null(plan)) {
+        return(plan)
+    }
+
     user_fn <- getOption("corteza.policy")
     if (is.function(user_fn)) {
         user <- tryCatch(user_fn(call), error = function(e) NULL)
@@ -236,10 +284,78 @@ policy <- function(call) {
             if (is.null(user$reason)) {
                 user$reason <- "user policy"
             }
+            # User policy is final. Project config does NOT overlay
+            # here — a process-level user policy is explicitly the
+            # "I know better than the project config" hook, so we
+            # respect that precedence in both directions: config can't
+            # tighten and can't relax it.
             return(user)
         }
     }
 
-    default_policy(call)
+    .apply_config_overlay(default_policy(call), call, config)
+}
+
+#' Overlay the configured tool permissions on top of a base policy
+#' decision. Honors approval_mode + dangerous_tools + per-tool
+#' permissions so the /permissions contract is actually enforced in
+#' both chat() and CLI.
+#'
+#' Resolution rules (in order):
+#'
+#' \itemize{
+#'   \item Safety verdicts (credential paths, etc.) have already
+#'     short-circuited by the time we get here, so a base \code{"deny"}
+#'     can only come from the data tensor or a user fn. We never
+#'     downgrade that.
+#'   \item Config \code{"deny"} wins over base \code{"allow"} or
+#'     \code{"ask"} — config can always tighten.
+#'   \item Config \code{"ask"} promotes base \code{"allow"} to
+#'     \code{"ask"}. (It doesn't downgrade base \code{"deny"}.)
+#'   \item Config \code{"allow"} downgrades base \code{"ask"} to
+#'     \code{"allow"}. This mirrors the CLI's
+#'     \code{requires_approval(name, dangerous_tools)} semantics: a
+#'     tool the user has explicitly marked allow skips approval
+#'     regardless of data class. It does **not** override a base
+#'     \code{"deny"} — config can tighten or relax \code{"ask"},
+#'     never widen a \code{"deny"}.
+#' }
+#' @noRd
+.apply_config_overlay <- function(base, call, config) {
+    if (is.null(config)) {
+        return(base)
+    }
+    tool <- call$tool %||% ""
+    if (!nzchar(tool)) {
+        return(base)
+    }
+    perm <- tryCatch(get_tool_permission(tool, config),
+                     error = function(e) NULL)
+    if (is.null(perm)) {
+        return(base)
+    }
+
+    if (identical(perm, "deny")) {
+        return(list(model = base$model %||% "cloud",
+                    approval = "deny",
+                    reason = sprintf("config: %s denied", tool)))
+    }
+    if (identical(perm, "ask")) {
+        if (identical(base$approval, "allow")) {
+            return(list(model = base$model %||% "cloud",
+                        approval = "ask",
+                        reason = sprintf("config: %s requires approval", tool)))
+        }
+        return(base)
+    }
+    if (identical(perm, "allow")) {
+        if (identical(base$approval, "ask")) {
+            return(list(model = base$model %||% "cloud",
+                        approval = "allow",
+                        reason = sprintf("config: %s allowed", tool)))
+        }
+        return(base)
+    }
+    base
 }
 
