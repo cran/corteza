@@ -1,3 +1,80 @@
+# corteza 0.7.0
+
+CRAN release consolidating the 0.6.9.1-0.6.9.8 development cycle plus a
+runtime-hardening batch. Last CRAN release: 0.6.9. Per-cycle detail follows.
+
+## Highlights since 0.6.9
+
+- **Matrix loop split** into `matrix_run_init()` / `matrix_run_step()`, with
+  the channel delegating session and transport plumbing to `mx.client`.
+- **`anthropic_claude` provider** (Claude on a subscription via OAuth),
+  requiring llm.api (>= 0.1.8).
+- **Tool-timeout hardening.** bash/cmd/run_r/run_r_script and the network
+  tools (`fetch_url`/`web_search`, now bounded by curl's own timeout) are no
+  longer wrapped in an R-level `setTimeLimit`; the residual flush moved to
+  `skill_run` entry so a validation/dry-run early return can't leak a queued
+  interrupt (#142, #139).
+- **Narration guard.** Every tool outcome (executed, denied, declined,
+  dry-run, task) routes through one nudge finalizer; the streak resets at
+  each agent-run boundary.
+- **Approval-prompt hardening.** Model-controlled fields rendered into the
+  approval prompt and the model-visible history (paths, tool names, args,
+  policy reasons) are sanitized so a crafted value can't forge a prompt line.
+  Untrusted Matrix room metadata is sanitized and framed as informational in
+  the system prompt.
+- **`/compact` survives provider-native history** (Anthropic, OpenAI chat, and
+  role-less OpenAI Codex Responses entries), including tool calls and outputs.
+
+# corteza 0.6.9.8
+
+## Changes
+
+- `/compact` now renders Anthropic, OpenAI chat, and role-less OpenAI Codex
+  Responses history safely, including tool calls and tool outputs. This prevents
+  provider-native history entries from wedging compaction.
+
+- Matrix documentation now matches the `anthropic_claude` provider default and
+  documents the optional `crypto` polling context.
+
+# corteza 0.6.9.7
+
+## Changes
+
+- Accept the `anthropic_claude` provider, which drives Claude on a Claude
+  subscription (OAuth) via llm.api instead of an API key. Added to
+  `matrix_configure()`'s provider whitelist and routed through the Anthropic
+  message shape for interrupt-time tool-result repair. Requires llm.api
+  (>= 0.1.4.3).
+
+# corteza 0.6.9.6
+
+## Changes
+
+- The Matrix long-poll loop is split into two new exports,
+  `matrix_run_init()` (build the session registry, catch up on invites,
+  backfill history, init E2EE) and `matrix_run_step(state, timeout)` (one
+  poll-and-reply iteration). `matrix_run()` is now a thin wrapper over
+  them. Lets an external scheduler own the main process and interleave
+  the Matrix poll with its own work. No behavior change for
+  `matrix_run()`.
+
+# corteza 0.6.9.5
+
+## Changes
+
+- Matrix channel now delegates config persistence, session construction,
+  message sending, sync/cursor handling, relogin, and encrypted-room
+  detection to the `mx.client` package instead of hand-rolled plumbing
+  over `mx.api`. Behavior is unchanged; ~37 fewer lines in the adapter.
+
+# corteza 0.6.9.1
+
+## Changes
+
+- The system prompt now includes a runtime-guidance block describing the
+  live, persistent R session, `run_r`/`run_r_script` semantics, and that
+  the bash tool makes corteza a general-purpose agent rather than R-only.
+
 # corteza 0.6.9
 
 ## Fix: scope all three `tools::R_user_dir()` roots to tempdir under R CMD check
@@ -845,8 +922,8 @@ Alt+Enter) to the two corteza addins. Override the built-in
 # corteza 0.6.1
 
 * Relicensed from MIT to Apache License (>= 2) for explicit patent
-  grant. Aligns with the rest of the cerebro toolchain (saber, pensar,
-  hacer, cerebro). The LICENSE stub file is removed; Apache 2.0
+  grant. Aligns with the rest of the cornball.ai toolchain (saber,
+  pensar, hacer). The LICENSE stub file is removed; Apache 2.0
   R-package convention points to the system-installed template.
 
 # corteza 0.6.0
