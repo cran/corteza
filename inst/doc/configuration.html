@@ -291,7 +291,8 @@ global config &gt; built-in defaults.</p>
 <tr class="odd">
 <td style="text-align: left;"><code>--provider &lt;p&gt;</code></td>
 <td style="text-align: left;">LLM provider: <code>anthropic</code>,
-<code>openai</code>, <code>moonshot</code>, <code>ollama</code></td>
+<code>openai</code>, <code>moonshot</code>, <code>openai_codex</code>,
+<code>ollama</code>, <code>openai_compatible</code></td>
 <td style="text-align: left;"><code>anthropic</code></td>
 </tr>
 <tr class="even">
@@ -300,39 +301,45 @@ global config &gt; built-in defaults.</p>
 <td style="text-align: left;">provider default</td>
 </tr>
 <tr class="odd">
+<td style="text-align: left;"><code>--base-url &lt;url&gt;</code></td>
+<td style="text-align: left;">Endpoint for
+<code>--provider openai_compatible</code></td>
+<td style="text-align: left;">config / env</td>
+</tr>
+<tr class="even">
 <td style="text-align: left;"><code>--tools &lt;filter&gt;</code></td>
 <td style="text-align: left;">Tool filter: <code>core</code>,
 <code>file</code>, <code>code</code>, <code>git</code>, <code>r</code>,
 <code>data</code>, <code>web</code>, <code>chat</code></td>
 <td style="text-align: left;">all</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>--session &lt;key&gt;</code></td>
 <td style="text-align: left;">Session key; resumes if exists</td>
 <td style="text-align: left;">none</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>--resume</code></td>
 <td style="text-align: left;">Resume most recent session</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>--list</code></td>
 <td style="text-align: left;">List sessions and exit</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>--dry-run</code></td>
 <td style="text-align: left;">Preview tool calls without executing</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>--trace</code></td>
 <td style="text-align: left;">Print structured tool-call events to
 stderr</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>--help</code></td>
 <td style="text-align: left;">Show help and exit</td>
 <td style="text-align: left;">-</td>
@@ -340,6 +347,41 @@ stderr</td>
 </tbody>
 </table>
 <p>Flags override config values for the current run.</p>
+<h2 id="openai-compatible-endpoints">OpenAI-compatible endpoints</h2>
+<p>The <code>openai_compatible</code> provider targets any endpoint that
+speaks the OpenAI chat-completions wire format: OpenRouter, DeepSeek,
+DeepInfra, a local proxy, or a corporate gateway. It separates three
+things the named providers hardcode:</p>
+<ul>
+<li><strong>provider</strong> — <code>openai_compatible</code> (the wire
+format, not an official endpoint)</li>
+<li><strong>endpoint</strong> — <code>base_url</code>, from config or
+the <code>OPENAI_COMPATIBLE_BASE_URL</code> environment variable</li>
+<li><strong>model</strong> — passed through untouched; required, since
+there is no default</li>
+</ul>
+<p><code>base_url</code> is used as given with
+<code>/chat/completions</code> appended, so include whatever
+<code>/v1</code> prefix the gateway expects.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;openai_compatible&quot;</span><span class="fu">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;base_url&quot;</span><span class="fu">:</span> <span class="st">&quot;https://openrouter.ai/api/v1&quot;</span><span class="fu">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The API key is read from <code>OPENAI_COMPATIBLE_API_KEY</code>,
+falling back to <code>OPENAI_API_KEY</code>. A keyless gateway (an
+internal proxy that needs no <code>Authorization</code> header) works
+with neither set. Equivalent one-liners:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> <span class="at">--provider</span> openai_compatible <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--base-url</span> https://openrouter.ai/api/v1 <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--model</span> meta-llama/llama-3-70b-instruct</span></code></pre></div>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># base_url comes from config or OPENAI_COMPATIBLE_BASE_URL</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">chat</span>(<span class="at">provider =</span> <span class="st">&quot;openai_compatible&quot;</span>,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>              <span class="at">model =</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span>)</span></code></pre></div>
+<p>A missing endpoint or model is reported at startup, not at the first
+request. Cost is usually <code>NA</code>, since gateway model ids rarely
+match the bundled price table. Requires
+<code>llm.api &gt;= 0.1.9</code>.</p>
 <h2 id="json-config-keys">JSON config keys</h2>
 <p>All keys shown with type and default, current as of corteza 0.6.3.
 Most defaults live in <code>R/config.R::load_config()</code>; a few
@@ -366,15 +408,25 @@ Most defaults live in <code>R/config.R::load_config()</code>; a few
 <td style="text-align: left;"><code>provider</code></td>
 <td style="text-align: left;">string</td>
 <td style="text-align: left;"><code>&quot;anthropic&quot;</code></td>
-<td style="text-align: left;">LLM provider</td>
+<td style="text-align: left;">LLM provider: <code>anthropic</code>,
+<code>openai</code>, <code>moonshot</code>, <code>openai_codex</code>,
+<code>ollama</code>, <code>openai_compatible</code></td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>model</code></td>
 <td style="text-align: left;">string or null</td>
 <td style="text-align: left;">null</td>
-<td style="text-align: left;">Model name (null = provider default)</td>
+<td style="text-align: left;">Model name (null = provider default;
+required for <code>openai_compatible</code>)</td>
 </tr>
 <tr class="odd">
+<td style="text-align: left;"><code>base_url</code></td>
+<td style="text-align: left;">string or null</td>
+<td style="text-align: left;">null</td>
+<td style="text-align: left;">Endpoint for
+<code>openai_compatible</code> (see below)</td>
+</tr>
+<tr class="even">
 <td style="text-align: left;"><code>port</code></td>
 <td style="text-align: left;">integer</td>
 <td style="text-align: left;"><code>7850</code></td>
@@ -733,14 +785,14 @@ startup</td>
 <h4 id="matrix">Matrix</h4>
 <p>Matrix channel requires <code>mx.api</code> (Suggests). Configured
 via a separate helper, not the main JSON config.</p>
-<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">matrix_configure</span>(</span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">server =</span> <span class="st">&quot;https://matrix.example.com&quot;</span>,</span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">user =</span> <span class="st">&quot;corteza_bot&quot;</span>,</span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">password =</span> <span class="st">&quot;verysecure&quot;</span>,</span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">room =</span> <span class="st">&quot;#general:example.com&quot;</span>,</span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">model =</span> <span class="st">&quot;llama3.2&quot;</span>,</span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;ollama&quot;</span></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">matrix_configure</span>(</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">server =</span> <span class="st">&quot;https://matrix.example.com&quot;</span>,</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">user =</span> <span class="st">&quot;corteza_bot&quot;</span>,</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">password =</span> <span class="st">&quot;verysecure&quot;</span>,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">room =</span> <span class="st">&quot;#general:example.com&quot;</span>,</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">model =</span> <span class="st">&quot;llama3.2&quot;</span>,</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;ollama&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
 <h3 id="legacy-memory">Legacy memory</h3>
 <table style="width:98%;">
 <colgroup>
@@ -950,14 +1002,14 @@ layouts both work.</p>
 <h2 id="mcp-server">MCP server</h2>
 <p>Expose corteza tools to external MCP clients. <code>serve()</code>
 supports two transports:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># stdio transport (Claude Desktop, Claude Code, other MCP clients)</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>()</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># socket transport (corteza CLI, R-to-R clients)</span></span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>)</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># restrict the toolset</span></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>, <span class="at">tools =</span> <span class="st">&quot;core&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># stdio transport (Claude Desktop, Claude Code, other MCP clients)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>()</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># socket transport (corteza CLI, R-to-R clients)</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>)</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># restrict the toolset</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>, <span class="at">tools =</span> <span class="st">&quot;core&quot;</span>)</span></code></pre></div>
 <p><code>port = NULL</code> (the default) selects stdio.
 <code>cwd = NULL</code> (the default) leaves the working directory
 alone; pass an explicit path to anchor the server elsewhere. Tools
@@ -965,29 +1017,29 @@ execute in a persistent R session, so objects and loaded packages
 survive across calls.</p>
 <p>Claude Desktop config
 (<code>~/.config/claude/claude_desktop_config.json</code>):</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;corteza&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;Rscript&quot;</span><span class="fu">,</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;-e&quot;</span><span class="ot">,</span> <span class="st">&quot;corteza::serve()&quot;</span><span class="ot">]</span></span>
-<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
-<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
-<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb9"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;corteza&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;Rscript&quot;</span><span class="fu">,</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;-e&quot;</span><span class="ot">,</span> <span class="st">&quot;corteza::serve()&quot;</span><span class="ot">]</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <h2 id="session-tuning">Session tuning</h2>
 <p><code>new_session()</code> is the programmatic entry point for
 embedding corteza in your own R code: a Shiny app, a batch script, a
 custom approval flow, or tests. The CLI and Matrix channels build on
 this same primitive.</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(corteza)</span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>s <span class="ot">&lt;-</span> <span class="fu">new_session</span>(</span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">channel =</span> <span class="st">&quot;cli&quot;</span>,</span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;anthropic&quot;</span>,</span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">max_turns =</span> <span class="dv">20</span><span class="dt">L</span>,</span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">verbose =</span> <span class="cn">FALSE</span></span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>)</span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">turn</span>(<span class="st">&quot;What packages are loaded?&quot;</span>, <span class="at">session =</span> s)</span></code></pre></div>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(corteza)</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>s <span class="ot">&lt;-</span> <span class="fu">new_session</span>(</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">channel =</span> <span class="st">&quot;cli&quot;</span>,</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;anthropic&quot;</span>,</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">max_turns =</span> <span class="dv">20</span><span class="dt">L</span>,</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">verbose =</span> <span class="cn">FALSE</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">turn</span>(<span class="st">&quot;What packages are loaded?&quot;</span>, <span class="at">session =</span> s)</span></code></pre></div>
 <p>The session is an environment that carries history, the active
 provider/model, and the approval callback. <code>turn()</code> mutates
 it in place and also returns the updated session, so you can chain calls
@@ -1072,24 +1124,24 @@ falls back to <code>corteza.model_map</code> option</td>
 <h2 id="systemd-service">systemd service</h2>
 <p><code>matrix_run()</code> is designed for a systemd user unit.</p>
 <p><code>~/.config/systemd/user/corteza-matrix.service</code>:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode ini"><code class="sourceCode ini"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
-<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">corteza Matrix bot</span></span>
-<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network.target</span></span>
-<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
-<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">simple</span></span>
-<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">Rscript -e &#39;corteza::matrix_run()&#39;</span></span>
-<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
-<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="dv">5</span></span>
-<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
-<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">default.target</span></span></code></pre></div>
+<div class="sourceCode" id="cb11"><pre class="sourceCode ini"><code class="sourceCode ini"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">corteza Matrix bot</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network.target</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">simple</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">Rscript -e &#39;corteza::matrix_run()&#39;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="dv">5</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">default.target</span></span></code></pre></div>
 <p>Enable and start:</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable corteza-matrix.service</span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> start corteza-matrix.service</span></code></pre></div>
+<div class="sourceCode" id="cb12"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable corteza-matrix.service</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> start corteza-matrix.service</span></code></pre></div>
 <p>View logs:</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--user</span> <span class="at">-u</span> corteza-matrix.service <span class="at">-f</span></span></code></pre></div>
+<div class="sourceCode" id="cb13"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--user</span> <span class="at">-u</span> corteza-matrix.service <span class="at">-f</span></span></code></pre></div>
 <h2 id="environment-variables">Environment variables</h2>
 <table>
 <thead>

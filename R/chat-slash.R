@@ -263,7 +263,7 @@ chat_help_text <- function() {
           "  /help                         Show this help",
           "  /tools                        List active tools",
           "  /model <name>                 Switch model",
-          "  /provider <name>              Switch provider (anthropic, openai, moonshot, openai_codex, ollama)",
+          "  /provider <name>              Switch provider (anthropic, openai, moonshot, openai_codex, ollama, openai_compatible)",
           "  /context, /status             Session + context meter (model, dir, tokens by component)",
           "  /spent, /cost                 Approximate USD spent this run (main-agent turns)",
           "  /doctor                       Diagnostics: provider/git/context health",
@@ -457,4 +457,3 @@ chat_format_tools_list <- function(turn_session) {
     }
     paste(c(lines, ""), collapse = "\n")
 }
-

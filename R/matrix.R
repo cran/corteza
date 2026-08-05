@@ -100,6 +100,17 @@ matrix_relogin <- function(cfg) {
 #'   returns \code{"ask"} for are auto-approved. Suitable for a
 #'   personal bot on a trusted tailnet. When FALSE (default) asks are
 #'   declined until the thumbs-up reaction protocol lands.
+#' @param bots Character vector or NULL. Full Matrix IDs of other known
+#'   bot accounts. Their messages only get a reply when they mention
+#'   this bot, and they are not counted as humans when deciding whether
+#'   a room gets ungated replies (a room whose only non-bot member is
+#'   one human is answered without a mention).
+#' @param models Character vector or NULL. Extra entries for the
+#'   \code{/model} menu, each a \code{"model provider"} pair (e.g.
+#'   \code{"claude-sonnet-4-6 anthropic_claude"}; a bare model name
+#'   uses the default provider). The menu always lists the configured
+#'   default and the live local Ollama inventory; this key adds hosted
+#'   models that can't be discovered automatically.
 #'
 #' @return The saved configuration, invisibly.
 #' @examples
@@ -116,18 +127,35 @@ matrix_relogin <- function(cfg) {
 #' @export
 matrix_configure <- function(server, user, password, room, model = NULL,
                              provider = "anthropic", tools_filter = NULL,
-                             auto_approve_asks = FALSE) {
+                             auto_approve_asks = FALSE, bots = NULL,
+                             models = NULL) {
     providers <- c("anthropic", "anthropic_claude", "openai", "moonshot",
                    "openai_codex", "ollama")
     matrix_require_mx()
     provider <- match.arg(provider, providers)
+    if (!is.null(bots)) {
+        bots <- as.character(bots)
+        bad <- bots[!grepl("^@.+:.+", bots)]
+        if (length(bad)) {
+            stop("bots must be full Matrix IDs like '@name:example.org': ",
+                 paste(bad, collapse = ", "), call. = FALSE)
+        }
+    }
+    if (!is.null(models)) {
+        models <- as.character(models)
+        models <- models[nzchar(trimws(models))]
+        if (!length(models)) {
+            models <- NULL
+        }
+    }
 
     cfg <- mx.client::mx_client_configure(
         server, user, password, room,
         app = "corteza", path = matrix_config_path(),
         extra = list(model = model, provider = provider,
                      tools_filter = tools_filter,
-                     auto_approve_asks = isTRUE(auto_approve_asks)))
+                     auto_approve_asks = isTRUE(auto_approve_asks),
+                     bots = bots, models = models))
     message(sprintf("Configured %s in room %s", cfg$user_id, cfg$room_id))
     invisible(matrix_plain_cfg(cfg))
 }
@@ -160,15 +188,93 @@ matrix_extract_messages <- function(sync_resp, self_id) {
     mx.client::mx_extract_text_events(sync_resp, self_id)
 }
 
-# Format new turns since the session's `ingested_through` watermark
-# as a markdown transcript. Returns NULL when nothing new to archive.
-matrix_session_to_markdown <- function(session, room_id, room_name = NULL) {
-    history <- session$history %||% list()
-    start <- (session$ingested_through %||% 0L) + 1L
-    if (start > length(history)) {
+# The Matrix-visible transcript: an explicit ledger of the events this
+# room actually exchanged, each carrying the Matrix event id that
+# identifies it.
+#
+# Deliberately NOT derived by filtering session$history. History is the
+# provider's working context and holds tool calls and tool results,
+# which a restart's backfill cannot reconstruct because they were never
+# Matrix events. Any attempt to align the two by projecting history had
+# to infer which entries had been sent, and role is not that signal --
+# Anthropic returns tool results as role = "user".
+#
+# So the ledger is appended at the moments a Matrix event is seen or
+# successfully sent, and nowhere else. Backfill produces the same shape
+# from the server, which is what makes restart dedup exact.
+matrix_transcript_add <- function(session, event_id, role, content) {
+    if (is.null(event_id) || !length(event_id) || !nzchar(event_id)) {
+        return(invisible(NULL))
+    }
+    text <- if (is.character(content)) {
+        paste(content, collapse = "\n")
+    } else {
+        as.character(content %||% "")
+    }
+    session$transcript <- c(session$transcript %||% list(),
+                            list(list(event_id = as.character(event_id),
+                                      role = role, content = text)))
+    invisible(NULL)
+}
+
+matrix_transcript_ids <- function(transcript) {
+    if (!length(transcript)) {
+        return(character())
+    }
+    vapply(transcript, function(e) e$event_id %||% "", character(1))
+}
+
+# Per-room archive state, named by a hash of the COMPLETE room id.
+# Slugging punctuation collided: "!a-b:ex" and "!a_b:ex" produced the
+# same path, letting one room's state suppress another's.
+matrix_archive_state_path <- function(room_id) {
+    file.path(matrix_signal_dir(), "archive",
+              paste0(digest::digest(room_id, algo = "sha256"), ".keys"))
+}
+
+matrix_archive_state_read <- function(room_id) {
+    path <- matrix_archive_state_path(room_id)
+    if (!file.exists(path)) {
+        return(character())
+    }
+    tryCatch(readLines(path, warn = FALSE), error = function(e) character())
+}
+
+# Bounded rolling tail. Only ever called after a successful ingest, so a
+# failed archive leaves the previous state untouched and the same turns
+# are retried on the next flush.
+matrix_archive_state_write <- function(room_id, keys, cap = 512L) {
+    path <- matrix_archive_state_path(room_id)
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    keys <- utils::tail(keys, cap)
+    # Write-then-rename: a process killed mid-write leaves the previous
+    # state intact rather than a truncated file, which would read back
+    # as a short tail and re-archive everything past it.
+    tmp <- paste0(path, ".tmp")
+    writeLines(keys, tmp)
+    if (!file.rename(tmp, path)) {
+        unlink(tmp)
+        stop("could not update archive state for ", room_id, call. = FALSE)
+    }
+    invisible(keys)
+}
+
+# Format ledger entries from `start` onward as a markdown transcript.
+# Reads the Matrix-visible transcript, not session$history, so tool
+# calls and tool results stay in the provider context where they are
+# needed and out of the human conversation archive. Returns NULL when
+# there is nothing new.
+matrix_session_to_markdown <- function(session, room_id, room_name = NULL,
+                                       which = NULL) {
+    entries <- session$transcript %||% list()
+    if (is.null(which)) {
+        which <- seq_along(entries)
+    }
+    which <- which[which >= 1L & which <= length(entries)]
+    if (!length(which)) {
         return(NULL)
     }
-    new_msgs <- history[start:length(history)]
+    new_msgs <- entries[which]
     parts <- vapply(new_msgs, function(m) {
         role <- m$role %||% "?"
         text <- if (is.character(m$content)) {
@@ -178,28 +284,53 @@ matrix_session_to_markdown <- function(session, room_id, room_name = NULL) {
         }
         sprintf("## %s\n\n%s", role, text)
     }, character(1))
-    header <- sprintf("# %s", room_name %||% room_id)
-    paste(c(header, "", parts), collapse = "\n\n")
+    header <- sprintf("# %s", room_id)
+    room_label <- room_name %||% ""
+    room_label <- if (length(room_label)) room_label[[1L]] else ""
+    room_label <- .sanitize_inline(room_label, max_chars = 100L)
+    metadata <- if (nzchar(room_label)) {
+        sprintf("Room name at archive time: %s", room_label)
+    } else {
+        character()
+    }
+    paste(c(header, "", metadata, parts), collapse = "\n\n")
 }
 
 # Archive new turns from one room's session to the pensar vault and
 # advance the watermark so the same turns aren't re-ingested. Silent
 # no-op when pensar isn't installed or there's nothing new.
 matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
-    # pensar is an optional cornball-ai companion package not on CRAN.
-    # Per CRAN policy on unpublished Suggests, it cannot be listed in
-    # DESCRIPTION; the dynamic getExportedValue lookup keeps the
-    # archive feature available to users who installed pensar from
-    # GitHub while staying CRAN-clean.
+    # pensar is an optional cornball-ai companion package, declared in
+    # Suggests. The dynamic getExportedValue lookup keeps archiving a
+    # no-op when it is absent rather than erroring at load.
+    #
+    # It used to be off CRAN, which is why it went undeclared. It has
+    # been on CRAN since 0.6.4, and Writing R Extensions requires a
+    # package used from a function body or conditionally in tests to be
+    # declared, so the omission was a bug.
     pensar_ingest <- tryCatch(getExportedValue("pensar", "ingest"),
                               error = function(e) NULL)
     if (is.null(pensar_ingest)) {
         return(invisible(NULL))
     }
 
-    history <- session$history %||% list()
-    last <- session$ingested_through %||% 0L
-    if (length(history) <= last) {
+    entries <- session$transcript %||% list()
+    if (!length(entries)) {
+        return(invisible(NULL))
+    }
+    # Matrix event ids are unique and stable across a restart, so
+    # "already archived" is exact set membership rather than an
+    # alignment guess. Anything the persisted tail has not seen is new,
+    # in ledger order.
+    ids <- matrix_transcript_ids(entries)
+    persisted <- matrix_archive_state_read(room_id)
+    fresh <- which(!(ids %in% persisted))
+    if (!length(fresh)) {
+        # Everything queued is already archived -- a restart backfill
+        # replaying known events. Drop it: leaving it queued lets an
+        # entry outlive its id in the bounded persisted tail and come
+        # back as fresh later.
+        session$transcript <- list()
         return(invisible(NULL))
     }
 
@@ -209,14 +340,15 @@ matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
     } else {
         NULL
     }
-    md <- matrix_session_to_markdown(session, room_id, room_name)
+    md <- matrix_session_to_markdown(session, room_id, room_name,
+                                     which = fresh)
     if (is.null(md)) {
         return(invisible(NULL))
     }
     out <- tryCatch(
                     pensar_ingest(content = md, type = "matrix",
-                                  source = room_name %||% room_id,
-                                  title = room_name %||% room_id),
+                                  source = room_id,
+                                  title = room_id),
                     error = function(e) {
         message("matrix_archive_session: pensar ingest failed: ",
                 conditionMessage(e))
@@ -224,22 +356,35 @@ matrix_archive_session <- function(session, room_id, mx_sess = NULL) {
     }
     )
     if (!is.null(out)) {
-        session$ingested_through <- length(history)
+        matrix_archive_state_write(room_id, c(persisted, ids[fresh]))
+        # Consume everything present, not just what was archived: the
+        # rest was already in persisted state. The queue can grow past
+        # the tail's size between flushes -- what it must never do is
+        # hold an already-archived entry long enough for that entry's id
+        # to age out of the tail, which is how one got archived twice.
+        # Draining on every pass is what rules that out.
+        session$transcript <- list()
+    } else {
+        # Ingest failed. Keep only what still needs archiving so a retry
+        # does not resend events already in persisted state.
+        session$transcript <- entries[fresh]
     }
     invisible(out)
 }
 
 #' Flush all in-memory matrix sessions to the pensar vault
 #'
-#' Walks the per-room session registry and archives any turns that
-#' haven't been ingested yet via the pensar archive ingest.
-#' Each session tracks an \code{ingested_through} watermark so repeated
-#' calls only write new turns. Silent no-op when \code{pensar} is not
-#' installed.
+#' Walks the per-room session registry and archives each room's
+#' unarchived Matrix events via the pensar archive ingest. Archived
+#' events are consumed from the session ledger, and their Matrix event
+#' ids are persisted per room under \code{CORTEZA_STATE_DIR} so a
+#' restart's backfill is recognized rather than archived again. Silent
+#' no-op when \code{pensar} is not installed.
 #'
 #' @param sessions A registry environment built by
 #'   \code{matrix_run}/\code{matrix_poll}. Keys are room IDs, values
-#'   are session lists carrying \code{$history}.
+#'   are session environments carrying \code{$transcript}, the
+#'   Matrix-visible event ledger.
 #' @param mx_sess Optional Matrix session for room-name lookups. When
 #'   NULL, the room ID is used as the source identifier.
 #'
@@ -259,9 +404,12 @@ matrix_archive_all <- function(sessions, mx_sess = NULL) {
     n <- 0L
     for (room_id in ls(envir = sessions, all.names = TRUE)) {
         s <- get(room_id, envir = sessions, inherits = FALSE)
-        before <- s$ingested_through %||% 0L
-        matrix_archive_session(s, room_id, mx_sess)
-        if ((s$ingested_through %||% 0L) > before) {
+        # Count what actually reached the vault. Inspecting session
+        # state before and after cannot: a room whose pending events
+        # turn out to be already archived leaves state changed while
+        # ingesting nothing, which reported archived rooms that were
+        # never written.
+        if (!is.null(matrix_archive_session(s, room_id, mx_sess))) {
             n <- n + 1L
         }
     }
@@ -326,17 +474,122 @@ matrix_parse_model_command <- function(body) {
     list(model = model, provider = provider, query_only = is.na(model))
 }
 
+# Live local Ollama model inventory (names only). Best-effort: an
+# unreachable Ollama yields character(0) so the /model menu still
+# renders the configured entries.
+matrix_ollama_models <- function() {
+    tryCatch({
+        url <- paste0(Sys.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                      "/api/tags")
+        resp <- jsonlite::fromJSON(url, simplifyVector = FALSE)
+        vapply(resp$models %||% list(), function(m) {
+            m$name %||% m$model %||% ""
+        }, character(1))
+    }, error = function(e) character(0))
+}
+
+# Assemble the /model menu: the configured default first, then the live
+# local Ollama inventory, then the config's `models` extras ("model
+# provider" strings; hosted providers can't be enumerated remotely, so
+# they are declared). Deduped by (model, provider), order preserved.
+# `ollama_models` is injectable for tests; NULL fetches live.
+matrix_available_models <- function(cfg = NULL, ollama_models = NULL) {
+    entries <- list()
+    seen <- character()
+    add <- function(model, provider) {
+        model <- trimws(model %||% "")
+        provider <- trimws(provider %||% "")
+        if (!nzchar(model) || !nzchar(provider)) {
+            return(invisible(NULL))
+        }
+        key <- paste(model, provider)
+        if (!(key %in% seen)) {
+            seen <<- c(seen, key)
+            entries[[length(entries) + 1L]] <<- list(model = model,
+                provider = provider)
+        }
+        invisible(NULL)
+    }
+
+    default_provider <- cfg$provider %||% "ollama"
+    add(cfg$model %||% default_provider_model(default_provider),
+        default_provider)
+    if (is.null(ollama_models)) {
+        ollama_models <- matrix_ollama_models()
+    }
+    for (m in ollama_models) {
+        add(m, "ollama")
+    }
+    for (extra in cfg$models %||% character()) {
+        parts <- strsplit(trimws(extra), "\\s+")[[1]]
+        add(parts[1], if (length(parts) >= 2L) parts[2] else default_provider)
+    }
+    entries
+}
+
+# Render the numbered /model menu with the session's current pick
+# marked. Menu content (Ollama names, config entries) is external
+# input, so every rendered field is sanitized.
+matrix_render_model_menu <- function(entries, session) {
+    cur_model <- session$model %||% ""
+    cur_provider <- session$provider %||% ""
+    current <- sprintf("Current: %s (%s)",
+                       .sanitize_inline(if (nzchar(cur_model)) cur_model else "(unset)",
+                                        max_chars = 80L),
+                       .sanitize_inline(if (nzchar(cur_provider)) cur_provider else "(unset)",
+                                        max_chars = 40L))
+    if (!length(entries)) {
+        return(current)
+    }
+    lines <- vapply(seq_along(entries), function(i) {
+        e <- entries[[i]]
+        mark <- if (identical(e$model, cur_model) &&
+                    identical(e$provider, cur_provider)) {
+            "  <- current"
+        } else {
+            ""
+        }
+        sprintf("%2d. %s  (%s)%s", i,
+                .sanitize_inline(e$model, max_chars = 80L),
+                .sanitize_inline(e$provider, max_chars = 40L), mark)
+    }, character(1))
+    paste(c(current, "Available:", lines,
+            "Switch: /model <number>  or  /model <name> [provider]"),
+          collapse = "\n")
+}
+
 # Apply a parsed model command to a session. Returns the ack text to
-# post back to the room. For a query (`/model` with no args), reports
-# the current settings. For a setter, mutates session$model and
-# (optionally) session$provider in place so the next turn picks them up.
-matrix_apply_model_command <- function(session, cmd) {
+# post back to the room. For a query (`/model` with no args), renders
+# the numbered menu of available models. For a setter, mutates
+# session$model and (optionally) session$provider in place so the next
+# turn picks them up; a bare number picks that menu entry, so nobody
+# has to thumb-type a model name from a phone client. `available` is
+# injectable for tests; NULL assembles the menu from cfg + live Ollama.
+matrix_apply_model_command <- function(session, cmd, cfg = NULL,
+                                       available = NULL) {
     # The stored model/provider drive dispatch and stay raw; only the room
     # echo of these user-supplied values is sanitized so it can't forge a line.
     if (isTRUE(cmd$query_only)) {
-        return(sprintf("model: %s\nprovider: %s",
-                       .sanitize_inline(session$model %||% "(unset)", max_chars = 80L),
-                       .sanitize_inline(session$provider %||% "(unset)", max_chars = 40L)))
+        if (is.null(available)) {
+            available <- matrix_available_models(cfg)
+        }
+        return(matrix_render_model_menu(available, session))
+    }
+    if (grepl("^[0-9]+$", cmd$model)) {
+        if (is.null(available)) {
+            available <- matrix_available_models(cfg)
+        }
+        idx <- as.integer(cmd$model)
+        if (idx < 1L || idx > length(available)) {
+            return(paste0(sprintf("No menu entry %d.\n", idx),
+                          matrix_render_model_menu(available, session)))
+        }
+        entry <- available[[idx]]
+        session$model <- entry$model
+        session$provider <- entry$provider
+        return(sprintf("Model set: %s (provider: %s). Effective on the next reply.",
+                       .sanitize_inline(entry$model, max_chars = 80L),
+                       .sanitize_inline(entry$provider, max_chars = 40L)))
     }
     session$model <- cmd$model
     if (!is.na(cmd$provider)) {
@@ -366,20 +619,163 @@ matrix_message_mentions_self <- function(msg, self_id) {
     grepl(sprintf("@%s\\b", localpart), body, perl = TRUE, ignore.case = TRUE)
 }
 
-# Should the bot respond to this message? DMs: always. Group rooms
-# (3+ members, or anything the session recorded as non-DM): only when
-# the bot is explicitly mentioned.
-matrix_should_respond <- function(msg, session, self_id) {
-    if (isTRUE(session$is_dm)) {
+# Known bot accounts for gating: the configured `bots` list from the
+# Matrix config plus the bot itself.
+matrix_known_bots <- function(cfg) {
+    bots <- as.character(unlist(cfg$bots, use.names = FALSE))
+    unique(c(cfg$user_id, bots[nzchar(bots)]))
+}
+
+# Cached joined-member list for a room's session. Refetched when the
+# cache is empty, older than ttl seconds, or missing the incoming
+# sender -- covers an invite accepted after the session was created and
+# any later joiner. On fetch failure the previous cache is kept
+# (character() when never fetched); the next message retries. fetch and
+# now are injectable for tests.
+matrix_room_members_cached <- function(session, room_id, sender = NULL,
+                                       mx_sess = NULL, fetch = NULL,
+                                       now = Sys.time(), ttl = 600) {
+    if (is.null(fetch)) {
+        fetch <- function(rid) {
+            if (is.null(mx_sess)) {
+                return(NULL)
+            }
+            tryCatch(mx.api::mx_room_members(mx_sess, rid),
+                     error = function(e) NULL)
+        }
+    }
+    cached <- session$members
+    stale <- is.null(cached) || is.null(session$members_at) ||
+    as.numeric(difftime(now, session$members_at, units = "secs")) > ttl ||
+    (!is.null(sender) && !(sender %in% cached))
+    if (stale) {
+        fresh <- fetch(room_id)
+        if (!is.null(fresh)) {
+            session$members <- fresh
+            session$members_at <- now
+            cached <- fresh
+        }
+    }
+    cached %||% character()
+}
+
+# Should the bot respond to this message? Humans are the room members
+# not on the bots list. Exactly one human: respond to that human without
+# a mention. Two or more humans: respond when mentioned (replies count,
+# since clients put the replied-to user in m.mentions) or while the
+# sender's engagement window from a recent exchange is still open.
+# Messages from known bot accounts always require a mention, whatever
+# the room size -- prevents bot-loops between two AIs.
+# Humans in a room: the member list plus the current sender, minus known
+# bot accounts (self included). Folding the sender in means a demonstrable
+# poster counts even when the cached member list lags. Shared by the
+# respond gate and the ingest path so both agree on "how many humans".
+matrix_room_humans <- function(members, sender, bots) {
+    setdiff(unique(c(members, sender)), bots)
+}
+
+# Does this message need an explicit speaker label in model history?
+# Multi-human rooms need labels so participants can be distinguished.
+# Known bot senders also need labels even in one-human rooms, so multi-bot
+# rooms like cooking do not turn into unlabeled transcript fragments.
+matrix_needs_sender_attribution <- function(members, sender, bots) {
+    sender <- sender %||% ""
+    if (!nzchar(sender)) {
+        return(FALSE)
+    }
+    length(matrix_room_humans(members, sender, bots)) > 1L || sender %in% bots
+}
+
+# The body corteza ingests (and feeds to the model) for one message. When
+# attribution is needed, prefix the turn with its sender; otherwise pass
+# through unchanged so lone-human DMs keep their old history shape.
+matrix_ingest_body <- function(sender, body, attribute_sender) {
+    if (isTRUE(attribute_sender) && nzchar(sender %||% "")) {
+        sprintf("[%s] %s", sender, body)
+    } else {
+        body
+    }
+}
+
+matrix_should_respond <- function(msg, self_id, members, bots = character(),
+                                  engaged_until = NULL, now = Sys.time(),
+                                  operators = character()) {
+    bots <- unique(c(self_id, bots))
+    sender <- msg$sender %||% ""
+    if (sender %in% bots) {
+        return(matrix_message_mentions_self(msg, self_id))
+    }
+    # The sender demonstrably posts in this room, so count them even when
+    # the cached member list hasn't caught up or the fetch failed. Unknown
+    # membership degrades to "assume this is the only human", not silence.
+    humans <- matrix_room_humans(members, sender, bots)
+    if (length(humans) <= 1L) {
+        # A room with one human is a private conversation, and the
+        # ungated reply below is the bot talking to that person alone.
+        # With operators configured, only they get one: everyone else is
+        # met with silence rather than a mention-gated session, because
+        # "answers if you @ it" is still a private conversation. Group
+        # rooms are unaffected -- a non-operator is answered there on
+        # the usual mention/engagement terms.
+        return(length(operators) == 0L || all(humans %in% operators))
+    }
+    if (matrix_message_mentions_self(msg, self_id)) {
         return(TRUE)
     }
-    matrix_message_mentions_self(msg, self_id)
+    !is.null(engaged_until) &&
+    as.numeric(difftime(now, engaged_until, units = "secs")) <= 300
+}
+
+# Matrix ids permitted to open a private conversation with this bot and
+# to have their invites auto-accepted. Empty means unrestricted, which
+# is the pre-existing behavior.
+matrix_operators <- function(cfg) {
+    ops <- as.character(cfg$operators %||% character())
+    ops[!is.na(ops) & nzchar(ops)]
+}
+
+# Who invited the bot to each pending-invite room, read from the
+# stripped invite_state the server sends alongside the invite. Named by
+# room id; NA when no matching membership event is present.
+matrix_invite_inviters <- function(sync_resp, self_id) {
+    invited <- sync_resp$rooms$invite
+    out <- character()
+    for (rid in names(invited)) {
+        who <- NA_character_
+        for (ev in invited[[rid]]$invite_state$events) {
+            if (isTRUE(ev$type == "m.room.member") &&
+                isTRUE(ev$state_key == self_id) &&
+                isTRUE(ev$content$membership == "invite")) {
+                who <- ev$sender %||% NA_character_
+                break
+            }
+        }
+        out[[rid]] <- who
+    }
+    out
 }
 
 # Pending invites from a sync response: character vector of room_ids
 # the bot has been invited to but not yet joined.
-matrix_extract_invites <- function(sync_resp) {
-    mx.client::mx_extract_invites(sync_resp)
+#
+# With operators configured, an invite is only accepted when an operator
+# issued it. Auto-joining anyone's invite hands a stranger a session
+# with a tool-using agent, and refusing at the door is cheaper than
+# staying silent once inside. An invite whose inviter cannot be
+# determined is refused rather than guessed at.
+matrix_extract_invites <- function(sync_resp, self_id = NULL,
+                                   operators = character()) {
+    rooms <- mx.client::mx_extract_invites(sync_resp)
+    if (!length(rooms) || !length(operators)) {
+        return(rooms)
+    }
+    inviters <- matrix_invite_inviters(sync_resp, self_id)[rooms]
+    keep <- !is.na(inviters) & inviters %in% operators
+    for (rid in rooms[!keep]) {
+        message(sprintf("matrix: refusing invite to %s from %s (not an operator)",
+                        rid, inviters[[rid]] %||% "unknown"))
+    }
+    rooms[keep]
 }
 
 matrix_default_system <- function(cfg, room_id = NULL, mx_sess = NULL,
@@ -387,7 +783,12 @@ matrix_default_system <- function(cfg, room_id = NULL, mx_sess = NULL,
                                   room_name = NULL) {
     base <- sprintf("You are %s, a helpful assistant for %s.", cfg$user_id,
                     cfg$user)
-    parts <- base
+    parts <- c(base,
+               paste("When a room has more than one person, each incoming",
+                     "message is prefixed with its sender in square",
+                     "brackets, e.g. \"[@ann:example] hello\". Use the",
+                     "prefix to tell speakers apart; do not copy it into",
+                     "your own replies."))
 
     # Optional persona file declared by the matrix config. Path layout
     # is left to the caller (a host runner might keep personas alongside
@@ -423,6 +824,16 @@ matrix_default_system <- function(cfg, room_id = NULL, mx_sess = NULL,
         parts <- c(parts, sprintf("Topic: %s", description))
     }
     paste(parts, collapse = "\n")
+}
+
+matrix_room_system <- function(cfg, cwd, description = NULL, room_name = NULL) {
+    parts <- c(
+        matrix_default_system(cfg, cwd = cwd, description = description,
+                              room_name = room_name),
+        load_context(cwd)
+    )
+    parts <- parts[!is.na(parts) & nzchar(parts)]
+    paste(parts, collapse = "\n\n")
 }
 
 # Agent name for path-building. "@cornelius:cornball.ai" -> "Cornelius".
@@ -591,11 +1002,16 @@ matrix_approval_prompt <- function(call, decision, timeout_sec) {
         ""
     }
     expl <- cli_tool_explanation(call)
-    expl_line <- if (!is.null(expl) && nzchar(expl)) paste0(expl, "\n") else ""
+    if (!is.null(expl) && nzchar(expl)) {
+        expl_line <- paste0(expl, "\n")
+    } else {
+        expl_line <- ""
+    }
     sprintf(
             "Approval needed: %s(%s)\n%sReason: %s\n\U0001F44D approve / \U0001F44E deny  (timeout %ds)",
             .sanitize_inline(call$tool %||% "", max_chars = 60L), args_str,
-            expl_line, .sanitize_inline(decision$reason %||% "ask", max_chars = 120L),
+            expl_line, .sanitize_inline(decision$reason %||% "ask",
+                                        max_chars = 120L),
             timeout_sec
     )
 }
@@ -648,11 +1064,11 @@ matrix_new_session <- function(cfg, system = NULL, model = NULL,
             NULL
         }
         parsed <- matrix_parse_topic(topic_raw)
-        system <- matrix_default_system(
-                                        cfg,
-                                        cwd = room_cwd,
-                                        description = parsed$description,
-                                        room_name = room_name
+        system <- matrix_room_system(
+                                     cfg,
+                                     cwd = room_cwd,
+                                     description = parsed$description,
+                                     room_name = room_name
         )
     }
 
@@ -686,6 +1102,33 @@ matrix_new_session_registry <- function() {
     new.env(parent = emptyenv())
 }
 
+# Build the session that replaces one discarded by /clear, and record
+# the acknowledgement that announced the reset.
+#
+# Extracted from the handler so all three of its obligations are
+# testable. It must carry the runtime overrides the current poll runs
+# under: the replacement lands in the registry, every later lookup
+# returns it unchanged, and a default-constructed one would quietly run
+# the wrong model until restart. It must remember the sent event, or the
+# self-echo arriving through sync appends the acknowledgement a second
+# time. And it must ledger it, or backfill reinserts that event later
+# among already archived ones.
+matrix_reset_session <- function(registry, room_id, cfg, sent_id, ack,
+    system = NULL, model = NULL,
+    provider = NULL, tools_filter = NULL) {
+    if (exists(room_id, envir = registry, inherits = FALSE)) {
+        rm(list = room_id, envir = registry)
+    }
+    s <- matrix_get_or_create_session(registry, room_id, cfg, system = system,
+                                      model = model, provider = provider,
+                                      tools_filter = tools_filter)
+    if (!is.null(sent_id) && length(sent_id) && nzchar(sent_id)) {
+        s$seen_event_ids <- matrix_remember_event(s$seen_event_ids, sent_id)
+        matrix_transcript_add(s, sent_id, "assistant", ack)
+    }
+    invisible(s)
+}
+
 matrix_get_or_create_session <- function(registry, room_id, cfg,
     system = NULL, model = NULL,
     provider = NULL, tools_filter = NULL) {
@@ -695,22 +1138,8 @@ matrix_get_or_create_session <- function(registry, room_id, cfg,
     s <- matrix_new_session(cfg, system = system, model = model,
                             provider = provider, tools_filter = tools_filter,
                             room_id = room_id)
-    s$is_dm <- matrix_detect_dm(cfg, room_id)
     assign(room_id, s, envir = registry)
     s
-}
-
-# A DM is a 2-member room where one of the members is the bot itself.
-# Anything else (3+ members, or just the bot alone) is a group room
-# subject to mention-gating.
-matrix_detect_dm <- function(cfg, room_id) {
-    mx_sess <- tryCatch(matrix_mx_session(cfg), error = function(e) NULL)
-    if (is.null(mx_sess)) {
-        return(TRUE) # conservative fallback
-    }
-    members <- tryCatch(mx.api::mx_room_members(mx_sess, room_id),
-                        error = function(e) character())
-    length(members) == 2L && cfg$user_id %in% members
 }
 
 # Auto-join any rooms the bot has been invited to. Best-effort: mx.client
@@ -778,7 +1207,8 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
     # matching JOIN state is in place before any replies go out. Invites
     # in this sync won't yet appear in rooms$join; the next sync will
     # pick up their timeline.
-    invites <- matrix_extract_invites(sync)
+    invites <- matrix_extract_invites(sync, cfg$user_id,
+                                      matrix_operators(cfg))
     if (length(invites)) {
         matrix_accept_invites(cfg, invites)
     }
@@ -812,6 +1242,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
     }
 
     replied <- 0L
+    bots <- matrix_known_bots(cfg)
     for (m in msgs) {
         session <- matrix_get_or_create_session(sessions, m$room_id, cfg,
             system = system, model = model, provider = provider,
@@ -827,6 +1258,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
                                      session$history %||% list(),
                                      list(list(role = "assistant", content = m$body))
                 )
+                matrix_transcript_add(session, m$event_id, "assistant", m$body)
                 session$seen_event_ids <- matrix_remember_event(
                     session$seen_event_ids, m$event_id
                 )
@@ -852,11 +1284,59 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
                  mx.api::mx_read_receipt(mx_sess, m$room_id, m$event_id),
                  error = function(e) NULL
         )
-        # Group rooms: only respond when @-mentioned. DMs: always.
-        # Prevents bot-loops between two AIs and stops noise in
-        # multi-human rooms.
-        if (!matrix_should_respond(m, session, cfg$user_id)) {
+        # Rooms with one human: respond freely. More humans: require a
+        # mention (replies count) or an open engagement window. Messages
+        # from known bot accounts always require a mention.
+        now <- Sys.time()
+        sender <- m$sender %||% ""
+        engaged <- session$engaged %||% list()
+        # A message that mentions others but not us is the sender turning
+        # away from the bot; close their window.
+        if (nzchar(sender) && length(m$mentions) &&
+            !(cfg$user_id %in% unlist(m$mentions))) {
+            engaged[[sender]] <- NULL
+            session$engaged <- engaged
+        }
+        if (nzchar(sender)) {
+            engaged_until <- engaged[[sender]]
+        } else {
+            engaged_until <- NULL
+        }
+        members <- matrix_room_members_cached(session, m$room_id,
+            sender = m$sender,
+            mx_sess = mx_sess, now = now)
+        # Attribute turns when multiple people or another bot could be
+        # speaking; the reply gate below is unchanged.
+        attribute_sender <- matrix_needs_sender_attribution(members, sender, bots)
+        ingest_body <- matrix_ingest_body(sender, m$body, attribute_sender)
+        # Ledger the incoming event once, before the gate, so both the
+        # replied-to and the merely-ingested branch record it exactly
+        # once and in arrival order.
+        matrix_transcript_add(session, m$event_id, "user", ingest_body)
+        if (!matrix_should_respond(m, cfg$user_id, members, bots = bots,
+                                   engaged_until = engaged_until,
+                                   now = now,
+                                   operators = matrix_operators(cfg))) {
+            # No reply is warranted, but the bot still saw the message, so
+            # ingest it as context instead of dropping it. Previously a bare
+            # `next` discarded it, and because seen_event_ids was already
+            # marked above it could never be reconsidered -- the agent
+            # simply never saw non-triggering messages in a busy room. The
+            # read receipt sent above is now accurate: the message really is
+            # ingested. This does not open a reply path (the gate is
+            # unchanged), so bot-loop protection is intact.
+            session$history <- c(
+                                 session$history %||% list(),
+                                 list(list(role = "user", content = ingest_body))
+            )
             next
+        }
+        # Passing the gate is an exchange: open or refresh this human's
+        # engagement window so a back-and-forth keeps flowing without a
+        # reply or mention on every message.
+        if (nzchar(sender) && !(sender %in% bots)) {
+            engaged[[sender]] <- now
+            session$engaged <- engaged
         }
 
         if (matrix_is_status_command(m$body)) {
@@ -872,6 +1352,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
                 session$seen_event_ids <- matrix_remember_event(
                     session$seen_event_ids, sent_id
                 )
+                matrix_transcript_add(session, sent_id, "assistant", ack)
             }
             replied <- replied + 1L
             next
@@ -879,7 +1360,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
 
         model_cmd <- matrix_parse_model_command(m$body)
         if (!is.null(model_cmd)) {
-            ack <- matrix_apply_model_command(session, model_cmd)
+            ack <- matrix_apply_model_command(session, model_cmd, cfg = cfg)
             sent_id <- tryCatch(
                                 matrix_send_maybe_encrypted(crypto, cfg, m$room_id, ack),
                                 error = function(e) NULL
@@ -888,6 +1369,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
                 session$seen_event_ids <- matrix_remember_event(
                     session$seen_event_ids, sent_id
                 )
+                matrix_transcript_add(session, sent_id, "assistant", ack)
             }
             replied <- replied + 1L
             next
@@ -903,8 +1385,16 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
             if (exists(m$room_id, envir = sessions, inherits = FALSE)) {
                 rm(list = m$room_id, envir = sessions)
             }
-            matrix_send_maybe_encrypted(crypto, cfg, m$room_id,
-                                        "Cleared. Starting a fresh session.")
+            ack <- "Cleared. Starting a fresh session."
+            sent_id <- tryCatch(
+                                matrix_send_maybe_encrypted(crypto, cfg,
+                    m$room_id, ack),
+                                error = function(e) NULL
+            )
+            matrix_reset_session(sessions, m$room_id, cfg, sent_id, ack,
+                                 system = system, model = model,
+                                 provider = provider,
+                                 tools_filter = tools_filter)
             replied <- replied + 1L
             next
         }
@@ -916,7 +1406,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
         # the reply event arrives.
         tryCatch(mx.api::mx_typing(mx_sess, m$room_id, TRUE, timeout = 120000L),
                  error = function(e) NULL)
-        reply <- matrix_run_turn_in_cwd(m$body, session)
+        reply <- matrix_run_turn_in_cwd(ingest_body, session)
         tryCatch(mx.api::mx_typing(mx_sess, m$room_id, FALSE),
                  error = function(e) NULL)
         if (is.null(reply) || !nzchar(reply)) {
@@ -932,6 +1422,7 @@ matrix_poll <- function(system = NULL, model = NULL, provider = NULL,
             session$seen_event_ids <- matrix_remember_event(
                 session$seen_event_ids, sent_id
             )
+            matrix_transcript_add(session, sent_id, "assistant", reply)
         }
         replied <- replied + 1L
     }
@@ -985,6 +1476,16 @@ matrix_backfill_sessions <- function(mx_sess, sessions, cfg, system = NULL,
             system = system, model = model,
             provider = provider, tools_filter = tools_filter
         )
+        # Attribution mirrors the live path: label senders in multi-human
+        # rooms, and label known bot senders even in one-human rooms.
+        # Membership is not fetched during backfill, so multi-human is
+        # inferred from the distinct human senders in this window.
+        room_bots <- matrix_known_bots(cfg)
+        human_senders <- setdiff(
+                                 unique(vapply(chunk, function(ev) ev$sender %||% "", character(1))),
+                                 c(room_bots, "")
+        )
+        multi_human <- length(human_senders) > 1L
         added <- 0L
         for (ev in chunk) {
             if (!isTRUE(ev$type == "m.room.message")) {
@@ -997,15 +1498,23 @@ matrix_backfill_sessions <- function(mx_sess, sessions, cfg, system = NULL,
             if (is.null(body) || !nzchar(body)) {
                 next
             }
-            role <- if (isTRUE(ev$sender == cfg$user_id)) {
-                "assistant"
+            is_self <- isTRUE(ev$sender == cfg$user_id)
+            if (is_self) {
+                role <- "assistant"
             } else {
-                "user"
+                role <- "user"
+            }
+            content <- if (is_self) {
+                body
+            } else {
+                matrix_ingest_body(ev$sender, body,
+                                   multi_human || ev$sender %in% room_bots)
             }
             session$history <- c(
                                  session$history %||% list(),
-                                 list(list(role = role, content = body))
+                                 list(list(role = role, content = content))
             )
+            matrix_transcript_add(session, ev$event_id, role, content)
             session$seen_event_ids <- matrix_remember_event(
                 session$seen_event_ids, ev$event_id
             )
@@ -1084,7 +1593,8 @@ matrix_run_init <- function(system = NULL, model = NULL, provider = NULL,
         if (!is.null(mx_sess)) {
             initial <- tryCatch(mx.api::mx_sync(mx_sess, timeout = 0L),
                                 error = function(e) NULL)
-            invites <- matrix_extract_invites(initial)
+            invites <- matrix_extract_invites(initial, cfg$user_id,
+                                              matrix_operators(cfg))
             if (length(invites)) {
                 matrix_accept_invites(cfg, invites)
             }
