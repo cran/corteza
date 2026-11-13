@@ -3,14 +3,17 @@
 
 # Built-in tool categories for filtering
 .builtin_categories <- list(
-                            file = c("read_file", "write_file", "replace_in_file", "list_files"),
+                            file = c("read_file", "skill_instructions", "write_file",
+                                     "replace_in_file", "list_files"),
+                            instruction = c("skill_instructions"),
                             code = c("run_r", "run_r_script", "bash", "cmd"),
                             search = c("grep_files"),
                             web = c("web_search", "fetch_url"),
                             git = c("git_status", "git_diff", "git_log"),
                             r = c("r_help", "installed_packages"),
                             subagent = c("spawn_subagent", "query_subagent", "collect_subagent",
-        "list_subagents", "kill_subagent")
+        "list_subagents", "kill_subagent"),
+                            harness = c("harness_note")
 )
 
 #' Tools hidden by config

@@ -59,6 +59,15 @@ repair_interrupted_tool_history <- function(history, provider, marker,
         isTRUE(as.integer(r$call_message_index) > pre_turn_len)
     }, records)
 
+    # A Responses history takes function_call_output entries whatever the
+    # provider name; llm.api marks those records provider_shape "responses".
+    responses <- vapply(unfinished, function(r) {
+        identical(r$provider_shape, "responses")
+    }, logical(1))
+    history <- .append_responses_tool_results(history, unfinished[responses],
+                                              placeholder)
+    unfinished <- unfinished[!responses]
+
     if (length(unfinished) > 0L) {
         if (provider %in% c("anthropic", "anthropic_claude")) {
             history <- .append_anthropic_tool_results(history, unfinished,
@@ -104,6 +113,16 @@ repair_interrupted_tool_history <- function(history, provider, marker,
     for (r in unfinished) {
         history[[length(history) + 1L]] <- list(role = "tool",
             tool_call_id = r$id, name = r$name %||% "", content = placeholder)
+    }
+    history
+}
+
+# The Responses wire pairs each function_call item with its own
+# function_call_output entry, keyed by call_id.
+.append_responses_tool_results <- function(history, unfinished, placeholder) {
+    for (r in unfinished) {
+        history[[length(history) + 1L]] <- list(type = "function_call_output",
+            call_id = r$id, output = placeholder)
     }
     history
 }
@@ -193,5 +212,9 @@ apply_exit_marker <- function(session, prompt, pre_turn_len, marker,
     session$history <- repair_interrupted_tool_history(history = history,
         provider = provider, marker = marker, prompt = prompt,
         pre_turn_len = pre_turn_len, placeholder = placeholder)
+    # The repair only adds (synthetic results, the marker), so the
+    # journal needs no segment, just a snapshot that includes them. It
+    # never throws, which matters inside a condition handler.
+    journal_snapshot(session)
     invisible(session)
 }

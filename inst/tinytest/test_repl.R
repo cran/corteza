@@ -42,14 +42,23 @@ expect_true(help_hit)
 # 2. /quit: clean exit.
 expect_null(corteza:::run_repl_loop(base_ctx(c("/quit"))))
 
+# Both remote-control spellings dispatch locally without starting a model.
+for (command in c("/remote-control", "/rc")) {
+    output <- capture.output(corteza:::run_repl_loop(base_ctx(paste(command, "status"))))
+    expect_true(any(grepl("Remote control is off.", output, fixed = TRUE)))
+}
+
 # 3. /model: a slash command that mutates session + ctx state.
 ctx3 <- base_ctx(c("/model kimi-test"))
 ctx3$session <- new.env(parent = emptyenv())
 ctx3$session$model_map <- list(cloud = "old-model")
+ctx3$session$thinking <- "between_tools"
 ctx3$model <- "old-model"
 corteza:::run_repl_loop(ctx3)
 expect_equal(ctx3$model, "kimi-test")
 expect_equal(ctx3$session$model_map$cloud, "kimi-test")
+# The thinking type was the old model's; the new one does not get it.
+expect_null(ctx3$session$thinking)
 
 # 4. /r: local-eval path stages output into pending_r_context.
 ctx4 <- base_ctx(c("/r 40 + 2"))
@@ -131,12 +140,9 @@ expect_equal(ctx6$disk_session$sessionId, "new-sess")
 # 6b. /clear kills live subagents and retires their spend. Inject a
 # fake registry entry, clear, and assert the registry is emptied while
 # the spend lands in the process-run total.
+corteza:::subagent_spend_reset()
 reg <- corteza:::.subagent_registry
-rm(list = ls(reg), envir = reg)
 r <- corteza:::.subagent_spend_retired
-r$cost <- 0; r$input_tokens <- 0L; r$output_tokens <- 0L
-r$total_tokens <- 0L; r$query_count <- 0L; r$n_agents <- 0L
-r$cost_missing <- FALSE
 reg[["clear-test-agent"]] <- list(
     id = "clear-test-agent", seq = 1L, session_key = "agent:main:subagent:cta",
     session = NULL, cumulative_input_tokens = 300L,
@@ -211,3 +217,32 @@ sess_filt$tools_filter <- c("read_file")
 tools_out <- corteza:::chat_format_tools_list(sess_filt)
 expect_true(grepl("read_file", tools_out, fixed = TRUE))
 expect_false(grepl("write_file", tools_out, fixed = TRUE))
+
+# 11. The shared REPL installs its durable compaction hook exactly once,
+# preserves an existing caller hook, and accounts for the summarizer request.
+# Direct turn() callers install their own persistence hook; this pins the
+# interactive path that used to own auto-compaction outside turn().
+ctx_compact <- base_ctx(character())
+ctx_compact$config <- list(memory_flush_enabled = FALSE)
+ctx_compact$disk_session <- NULL
+ctx_compact$session <- new.env(parent = emptyenv())
+ctx_compact$session$sessionId <- "compact-test"
+prior_compaction <- NULL
+ctx_compact$session$on_compaction <- function(event) {
+    prior_compaction <<- event
+}
+expect_true(isTRUE(corteza:::.repl_install_compaction_hook(ctx_compact)))
+expect_false(isTRUE(corteza:::.repl_install_compaction_hook(ctx_compact)))
+
+compact_event <- list(
+    reason = "threshold",
+    summary = "older work summarized",
+    usage = list(input_tokens = 12L, output_tokens = 3L,
+                 total_tokens = 15L, cost = 0.01)
+)
+ctx_compact$session$on_compaction(compact_event)
+expect_identical(prior_compaction, compact_event)
+expect_equal(length(ctx_compact$session$spend$segments), 1L)
+expect_equal(ctx_compact$session$spend$segments[[1L]]$input_tokens, 12L)
+expect_equal(ctx_compact$session$spend$segments[[1L]]$output_tokens, 3L)
+expect_equal(ctx_compact$session$spend$segments[[1L]]$cost, 0.01)

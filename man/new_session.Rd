@@ -3,11 +3,26 @@
 \alias{new_session}
 \title{Create a new turn session}
 \usage{
-new_session(channel = c("cli", "console", "matrix"), history = NULL,
-            model_map = NULL, provider = "anthropic", tools_filter = NULL,
-            system = NULL, approval_cb = NULL, max_turns = 10L,
-            verbose = FALSE, plan_mode = FALSE, web_search = NULL,
-            base_url = NULL)
+new_session(
+  channel = c("cli", "console", "matrix"),
+  history = NULL,
+  model_map = NULL,
+  provider = "anthropic",
+  tools_filter = NULL,
+  system = NULL,
+  approval_cb = NULL,
+  max_turns = 10L,
+  verbose = FALSE,
+  plan_mode = FALSE,
+  web_search = NULL,
+  base_url = NULL,
+  max_tokens = NULL,
+  reasoning_effort = NULL,
+  thinking_budget_tokens = NULL,
+  cache = NULL,
+  compaction_prompt = NULL,
+  context_edit = NULL
+)
 }
 \arguments{
 \item{channel}{Character, one of "cli", "console", "matrix".}
@@ -50,6 +65,62 @@ corporate gateway). \code{\link{turn}} applies it via
 NULL falls back to \code{config$base_url}, then llm.api's own
 \code{OPENAI_COMPATIBLE_BASE_URL} environment variable. Ignored
 for every other provider.}
+
+\item{max_tokens}{Integer or NULL. Per-response output-token budget,
+forwarded to \code{llm.api::agent}. NULL falls back to
+\code{config$max_tokens}, then llm.api's provider default (4096
+on Anthropic). Agent turns that write long tool calls -- big
+\code{run_r} bodies especially -- need more than that default:
+an unset Anthropic budget can grow through bounded output retries.
+An explicit budget stays a ceiling unless
+\code{config$output_retry_max_tokens} permits a larger one.
+Exhausted recovery reports \code{[Output truncated: max_tokens]}.}
+
+\item{reasoning_effort}{Character or NULL. How hard a reasoning
+model should think before answering, e.g. \code{"low"},
+\code{"medium"}, \code{"high"}. One setting, routed to whichever
+field the provider's wire uses: \code{reasoning_effort} on
+\code{"openai"} / \code{"openai_codex"}, \code{output_config$effort}
+on \code{"anthropic"} / \code{"anthropic_claude"}. Dropped for
+providers with no effort control. NULL falls back to
+\code{config$reasoning_effort}, then the provider default. Not
+validated against a fixed set, because the scales differ: Anthropic
+accepts \code{"low"}, \code{"medium"}, \code{"high"},
+\code{"xhigh"} and \code{"max"}, and an unknown value is refused by
+the API with a message naming the alternatives.}
+
+\item{thinking_budget_tokens}{Integer or NULL. Extended-thinking
+budget for Anthropic models, forwarded to \code{llm.api::agent}
+for the \code{"anthropic"} and \code{"anthropic_claude"}
+providers only. Must be at least 1024 and below
+\code{max_tokens}, both enforced by llm.api. NULL falls back to
+\code{config$thinking_budget_tokens}, then the provider default
+(thinking off).}
+
+\item{cache}{Character or NULL. Anthropic prompt-cache TTL:
+\code{"none"}, \code{"5m"} or \code{"1h"}. Anthropic-only, and
+dropped for other providers so they never see a field their wire
+rejects. NULL falls back to \code{config$cache}, then llm.api's
+default (\code{"none"}). Caching is a billing setting, not a
+behavioural one: the model receives byte-identical input either
+way, so turning it on cannot change a result. llm.api (>= 0.1.9.6,
+the Imports floor) marks both the system prompt and the tail of the
+message history, so each request in an agent loop reads the
+previous request's context from cache and pays fresh input only
+for what was appended since; on a long tool loop that is most of
+the input bill. The floor is there because an older llm.api marks
+the system prompt alone and would silently deliver a fraction of
+that with this set. \code{turn()$usage} reports what was read and
+written.}
+
+\item{compaction_prompt}{Character or NULL. Optional domain-specific
+instructions for summarizing older history during context compaction.
+NULL uses corteza's general coding-agent summary brief. The prompt
+affects only the summarizer; the main agent system prompt is unchanged.}
+
+\item{context_edit}{NULL to inherit configuration, a logical enable switch,
+or a list with `enabled` and `cadence` (`"pressure"` or `"always"`).
+Context editing requires the session journal and a supported history shape.}
 }
 \value{
 An environment holding the session state.

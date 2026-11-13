@@ -232,13 +232,29 @@ run_memory_flush <- function(ctx) {
                                  max_turns = 20L
     )
     flush_session$config <- config
+    .audit_safe({
+        flush_session$audit_enabled <- session$audit_enabled
+        flush_session$config$audit <- session$config$audit %||% config$audit
+        flush_session$audit_dir <- .audit_root(session)
+        flush_session$.audit_stream <- .audit_state(session)
+        flush_session$job_owner <- session$job_owner
+        flush_session$job_key <- job_worker_key(session)
+    })
+    # The parent compactor already chose a safe threshold boundary. Preserve
+    # the complete pre-compaction history while the flush extracts durable
+    # facts; only a real provider overflow may invoke emergency recovery.
+    flush_session$config$context_compact_pct <- Inf
     flush_session$cwd <- ctx$cwd
     flush_session$dry_run <- isTRUE(session$dry_run) ||
     isTRUE(config$dry_run)
 
     tryCatch({
-        r <- turn(prompt = flush_prompt, session = flush_session)
-        list(content = r$reply, history = flush_session$history)
+        r <- .audit_with_origin(flush_session,
+                                list(kind = "memory_flush", role = "summarizer",
+                                     parent_turn = session$.audit_turn$ref %||% session$last_turn_audit),
+                                turn(prompt = flush_prompt, session = flush_session))
+        list(content = r$reply, history = flush_session$history,
+             usage = r$usage, audit = r$audit, usage_source = "derived")
     }, corteza_user_deny = function(c) {
         message("Memory flush denied -- skipping.")
         NULL
@@ -262,9 +278,11 @@ chat_help_text <- function() {
           "  /clear, /reset, /new          Clear conversation, keep transcript",
           "  /help                         Show this help",
           "  /tools                        List active tools",
-          "  /model <name>                 Switch model",
+          "  /model [name [provider] | N]  List models or switch by name/number",
+          "  /effort [level | default]    Show or set reasoning effort",
           "  /provider <name>              Switch provider (anthropic, openai, moonshot, openai_codex, ollama, openai_compatible)",
           "  /context, /status             Session + context meter (model, dir, tokens by component)",
+          "  /context-edit on|off|status    Control conversation context editing",
           "  /spent, /cost                 Approximate USD spent this run (main-agent turns)",
           "  /doctor                       Diagnostics: provider/git/context health",
           "  /config                       Active runtime configuration",
@@ -272,9 +290,15 @@ chat_help_text <- function() {
           "  /review [ref]                 Review local changes with the current model",
           "  /last [N]                     Show tool output (1=most recent)",
           "  /outputs                      List recent tool outputs",
+          "  /refine [list|rollback <id>|promote <id>]  Review the conversation into one-line lessons (continual harness)",
           "  /sessions                     List sessions for this directory",
           "  /trace [N]                    Show last N tool executions (default 20)",
-          "  /permissions                  Show tool approval and sandbox settings",
+          "  /permissions [allow|ask|deny] Show, or switch, tool approval for this session",
+          "  /auto [--exec] [goal]         Continue the current task unattended, or start a new goal",
+          "  /auto status|resume           Inspect or resume a stopped unattended run",
+          "  /max-tokens [N|default]        Show or change the response output budget",
+          "  /remote-control [--bot ID] [room]  Control this CLI session from Matrix",
+          "  /rc [--bot ID] [room]         Alias for /remote-control",
           "  /dryrun                       Toggle dry-run mode (preview tools)",
           "  /plan [task]                  Toggle plan mode (reads only, LLM proposes plan)",
           "  /compact                      Summarize conversation to free context",
@@ -282,6 +306,9 @@ chat_help_text <- function() {
           "  /paste [text]                 Multi-line input. Collects every line verbatim until `/end` (or Ctrl+D).",
           "  /copy                         Copy the last assistant response to the system clipboard.",
           "  /tasks [clear]                Show (or clear) the current task list.",
+          "  /jobs [id]                    List delegated jobs (talker mode), or show one",
+          "  /job resume <id>              Continue an incomplete job as a new attempt",
+          "  /cancel <id>                  Cancel a delegated job",
           "  /r <expr>                     Eval R expression locally (skips policy/dryrun); output staged for next prompt",
           "  ! <cmd>                       Run a shell command locally (skips policy/dryrun); output staged for next prompt",
           "",
@@ -291,7 +318,7 @@ chat_help_text <- function() {
           "  /spawn <task> --preset <name> investigate (default), work, minimal",
           "  /spawn <task> --tools <a,b,c> Explicit tool filter",
           "  /agents                       List active subagents",
-          "  /ask <id> <prompt>            Query a subagent (blocks for reply)",
+          "  /ask <id> <prompt>            Query a subagent (waits up to 60 s; then /collect)",
           "  /queue <id> <prompt>          Fire a query and return; collect later",
           "  /collect <id>                 Collect a pending reply (NULL if still running)",
           "  /kill <id>                    Terminate a subagent",

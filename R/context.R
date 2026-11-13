@@ -1,101 +1,211 @@
 # Context loading for corteza
-# Loads project context for the system prompt. Project briefings are
-# delegated to saber::briefing(). Custom user-specified files and
-# skill docs are layered on top.
+# Builds a saber context manifest, then renders it for the system prompt.
 
 #' Load context for the system prompt
 #'
 #' Assembles a system prompt for the LLM by combining:
 #' \enumerate{
-#'   \item corteza's preamble
+#'   \item corteza's preamble and runtime guidance
 #'   \item \code{saber::briefing()} project metadata (if available)
-#'   \item Any custom \code{context_files} from \code{.corteza/config.json}
-#'   \item Loaded skill docs and package tool docs
+#'   \item Shared and project instructions discovered by saber
+#'   \item Workspace identity, configured context files, skill docs,
+#'     harness lessons, and live-subagent state
 #' }
 #'
 #' @param cwd Working directory.
 #' @return Character string with assembled context, or NULL if empty.
 #' @noRd
 load_context <- function(cwd = getwd()) {
+    load_context_bundle(cwd)$system
+}
+
+#' Assemble rendered context and its source manifest
+#'
+#' The character-returning load_context() contract stays small for callers
+#' that only need a system prompt. Session constructors retain the manifest
+#' from this bundle for /context diagnostics.
+#' @param cwd Working directory.
+#' @param prefix_sources Optional consumer-owned source descriptors rendered
+#'   before corteza's normal preamble (used by the Matrix adapter).
+#' @param instruction_catalog Optional prebuilt session catalog.
+#' @param include_instruction_catalog Whether to render its compact header.
+#' @param instructions_only Render only `prefix_sources` and what the
+#'   manifest discovers by itself: the shared instructions file and the
+#'   project's AGENTS.md or CLAUDE.md. For a reader that has to know the
+#'   rules without being told how to work (a job's reviewer): no corteza
+#'   preamble or runtime guidance, no briefing, no workspace identity.
+#' @return List with system, manifest, and instruction catalog.
+#' @noRd
+load_context_bundle <- function(cwd = getwd(), prefix_sources = list(),
+                                instruction_catalog = NULL,
+                                include_instruction_catalog = TRUE,
+                                instructions_only = FALSE) {
     config <- load_config(cwd)
-
-    b <- new_context_builder()
-    b <- add_context(b, paste(
-                              "You are an AI assistant with access to tools for working with R and the file system.",
-                              "Use the bash tool to run shell commands. Below is context about the current project",
-                              "and available skills.",
-                              "run_r and subagents may return a .h_NNN handle instead of inlining a large result;",
-                              "reference it by name when present, and don't re-read it. To get a structured value",
-                              "back from a subagent, give it run_r (the 'work' preset), have it leave the result",
-                              "bound to a name, and pass that name as query_subagent's return_name.",
-                              sep = "\n"
-        ))
-
-    # Runtime guidance: how corteza's live session and tools behave
-    b <- add_context(b, corteza_runtime_guidance())
-
-    # Project briefing (DESCRIPTION, downstream deps, git log)
-    b <- add_context(b, load_saber_briefing(cwd))
-
-    # Agent context files. We call saber's agent_context() when the
-    # installed version exports it (saber >= 0.4.0) AND our inlined
-    # copy. Duplicate output gets deduped at the builder level, so
-    # double-calling is benign whether the two produce identical or
-    # divergent text.
-    b <- add_context(b, load_saber_agent_context(cwd, config))
-    b <- add_context(b, load_local_agent_context(cwd, config))
-
-    # Custom user-specified context files (default: empty)
-    custom_files <- config$context_files %||% character(0)
-    for (name in custom_files) {
-        path <- file.path(cwd, name)
-        if (file.exists(path)) {
-            content <- paste(readLines(path, warn = FALSE), collapse = "\n")
-            if (nchar(content) > 0L) {
-                b <- add_context(b, paste(sprintf("## %s", basename(path)),
-                        "", content, sep = "\n"))
-            }
-        }
+    if (is.null(instruction_catalog) && !isTRUE(instructions_only)) {
+        instruction_catalog <- build_instruction_catalog(cwd)
     }
-
-    # Skill docs
-    skill_docs_text <- format_skill_docs()
-    if (nchar(skill_docs_text) > 0) {
-        b <- add_context(b, paste(
-                                  "# Available Skills", "",
-                                  "The following skills describe how to accomplish common tasks using shell commands.",
-                                  "Use the bash tool to execute the commands shown.", "",
-                                  skill_docs_text,
-                                  sep = "\n"
+    if (isTRUE(instructions_only)) {
+        sources <- prefix_sources
+    } else {
+        sources <- c(prefix_sources, context_base_sources(cwd),
+                     context_workspace_sources(config),
+                     context_custom_sources(cwd, config),
+                     context_dynamic_sources(
+                cwd, config, instruction_catalog,
+                include_instruction_catalog = include_instruction_catalog
             ))
     }
-
-    # Package tool documentation
-    pkg_docs <- format_pkg_skill_docs(config)
-    if (nchar(pkg_docs %||% "") > 0) {
-        b <- add_context(b, paste(
-                                  "# Package Tools", "",
-                                  "Documentation for R package functions available as tools.", "",
-                                  pkg_docs,
-                                  sep = "\n"
-            ))
+    manifest <- saber::context_manifest(
+                                        agent = "corteza",
+                                        project_dir = cwd,
+                                        workspace_dir = NULL,
+                                        shared_path = if (isFALSE(config$context_include_user)) FALSE else NULL,
+                                        extra_sources = sources
+    )
+    system <- saber::context_render(manifest)
+    if (!nzchar(trimws(system))) {
+        system <- NULL
     }
+    list(system = system, manifest = manifest,
+         prefix_sources = prefix_sources,
+         instruction_catalog = instruction_catalog)
+}
 
-    # Live subagents block: surfaced when archival has produced one or
-    # more holder subagents in this process. The LLM sees ids + tasks
-    # and chooses query_subagent vs spawn_subagent as a normal tool
-    # decision (no router).
-    sub_text <- format_live_subagents()
-    if (nzchar(sub_text)) {
-        b <- add_context(b, sub_text)
-    }
-
-    # If only the preamble made it in, there's nothing project-specific
-    # to ship back.
-    if (length(b$parts) <= 1L) {
+#' Build a generated manifest source
+#' @noRd
+context_text_source <- function(id, kind, text, order, origin, scope = "",
+                                config_path = "") {
+    if (is.null(text)) {
         return(NULL)
     }
-    paste(b$parts, collapse = "\n\n")
+    if (length(text) != 1L) {
+        text <- paste(text, collapse = "\n")
+    }
+    text <- trimws(text, which = "right")
+    if (!nzchar(text)) {
+        return(NULL)
+    }
+    list(id = id, kind = kind, text = text, order = order, origin = origin,
+         scope = scope, config_path = config_path)
+}
+
+#' Static and project-generated context sources
+#' @noRd
+context_base_sources <- function(cwd) {
+    Filter(Negate(is.null), list(
+                                 context_text_source("corteza_preamble", "runtime",
+                corteza_preamble(), -300,
+                "corteza::load_context", "session"),
+                                 context_text_source(
+                "corteza_runtime", "runtime", corteza_runtime_guidance(), -200,
+                "corteza::corteza_runtime_guidance", "session"
+            ),
+                                 context_text_source(
+                "project_briefing", "briefing", load_saber_briefing(cwd), -100,
+                "saber::briefing", cwd
+            )
+        ))
+}
+
+#' Optional workspace identity sources
+#' @noRd
+context_workspace_sources <- function(config) {
+    workspace <- get_workspace_dir()
+    sources <- list()
+    if (!isFALSE(config$context_include_user)) {
+        sources <- c(sources, list(list(id = "workspace_user",
+                                        kind = "shared",
+                                        path = file.path(workspace, "USER.md"),
+                                        order = 10,
+                                        origin = "corteza workspace",
+                                        scope = workspace)))
+    }
+    if (!isFALSE(config$context_include_soul)) {
+        sources <- c(sources, list(list(
+                                        id = "workspace_soul", kind = "identity",
+                                        path = file.path(workspace, "SOUL.md"), order = 11,
+                                        origin = "corteza workspace", scope = workspace
+                )))
+    }
+    sources
+}
+
+#' Configured project context sources
+#' @noRd
+context_custom_sources <- function(cwd, config) {
+    files <- config$context_files %||% character()
+    if (!length(files)) {
+        return(list())
+    }
+    config_path <- context_config_origin(cwd, "context_files")
+    lapply(seq_along(files), function(i) {
+        list(id = sprintf("configured_context_%03d", i), kind = "context",
+             path = files[[i]], order = 100 + i,
+             origin = "corteza context_files", scope = cwd,
+             config_path = config_path)
+    })
+}
+
+#' Locate the configuration file that supplied a merged value
+#'
+#' Project configuration wins only when it defines the requested key. Merely
+#' having a project config file must not misattribute an inherited global value.
+#' @noRd
+context_config_origin <- function(cwd, key) {
+    project_path <- file.path(cwd, ".corteza", "config.json")
+    project <- load_config_file(project_path)
+    if (key %in% names(project)) {
+        return(project_path)
+    }
+
+    global_path <- corteza_config_path("config.json")
+    global <- load_config_file(global_path)
+    if (key %in% names(global)) {
+        return(global_path)
+    }
+
+    ""
+}
+
+#' Dynamic runtime context sources
+#' @noRd
+context_dynamic_sources <- function(cwd, config, instruction_catalog = NULL,
+                                    include_instruction_catalog = TRUE) {
+    skill_text <- ""
+    if (isTRUE(include_instruction_catalog) && !is.null(instruction_catalog)) {
+        skill_text <- format_instruction_catalog(instruction_catalog)
+    }
+    harness_text <- tryCatch(harness_context_block(cwd, config),
+                             error = function(e) "")
+    Filter(Negate(is.null), list(
+                                 context_text_source(
+                "instruction_catalog", "skill", skill_text, 200,
+                "corteza::format_instruction_catalog", "session"
+            ),
+                                 context_text_source(
+                "harness_lessons", "memory", harness_text, 300,
+                "corteza::harness_context_block", cwd
+            ),
+                                 context_text_source(
+                "live_subagents", "subagents", format_live_subagents(), 400,
+                "corteza::format_live_subagents", "session"
+            )
+        ))
+}
+
+#' Base system instructions owned by corteza
+#' @noRd
+corteza_preamble <- function() {
+    paste(
+          "You are an AI assistant with access to tools for working with R and the file system.",
+          "Use the bash tool to run shell commands. Below is context about the current project",
+          "and available skills.",
+          "run_r and subagents may return a .h_NNN handle instead of inlining a large result;",
+          "reference it by name when present, and don't re-read it. To get a structured value",
+          "back from a subagent, give it run_r (the 'work' preset), have it leave the result",
+          "bound to a name, and pass that name as query_subagent's return_name.",
+          sep = "\n"
+    )
 }
 
 #' Runtime guidance block for the system prompt
@@ -113,6 +223,16 @@ corteza_runtime_guidance <- function() {
           "tool evaluates code in that session, and the workspace survives across turns:",
           "objects you create stick around, attached packages stay attached, the working",
           "directory persists. You are not shelling out to `Rscript` for each call.",
+          "Treat your conversation history and R workspace as persistent scratch state",
+          "for the current agent session. Treat the workspace as a small evolving program:",
+          "retain concise notes, helper functions, hypotheses, and intermediate analysis",
+          "there. When an operation recurs, define and reuse a helper instead of emitting",
+          "the same inline code again.",
+          "Tool execution may have a host-enforced wall-clock limit. If a computation",
+          "times out, do not immediately repeat the same call. Inspect any retained state,",
+          "then reuse or improve a helper, reduce or split the work, vectorize or parallelize",
+          "only independent work, or approximate when exact work is unnecessary. Ask for a",
+          "larger permitted timeout only when the exact computation genuinely requires it.",
           "",
           "Guidelines:",
           "",
@@ -133,15 +253,23 @@ corteza_runtime_guidance <- function() {
           "",
           "## Communicating while you work",
           "",
-          "Narrate as you go. Before a tool call or a batch of related calls, say in",
-          "one line what you're about to do and why; after they return, say what you",
-          "found and how it changes the plan. The user should never watch a silent",
-          "streak of tool calls and have to guess what you're doing.",
+          "Narrate your belief state, not your keystrokes. The user wants to know",
+          "what you have learned and what you intend to do next, not a transcript of",
+          "individual commands. Send a brief update when you finish a meaningful",
+          "chunk of work, when new evidence changes your working hypothesis, when you",
+          "are about to try a substantially different approach, or when you have run",
+          "several tool calls without saying anything.",
           "",
-          "- Give a short update between the steps of a multi-step task, not just at",
-          "  the end. Don't go more than a couple of tool calls without a word.",
-          "- If the user asks what you're doing, answer in plain prose first, before",
-          "  any further tool calls.",
+          "- Keep working after an update. It is informational; do not stop for",
+          "  acknowledgement.",
+          "- Group related calls under one update. Sometimes one or two calls reveal",
+          "  something worth reporting; sometimes four or five routine calls belong",
+          "  together under a single line. A call that only confirms what you already",
+          "  expected needs no narration, and never repeat what the user already",
+          "  knows.",
+          "- A question is not an update. Ask only when you genuinely need the",
+          "  user's input to proceed. If the user asks what you're doing, answer in",
+          "  plain prose first, before any further tool calls.",
           "- Stop and check in before anything destructive, ambiguous, or expensive,",
           "  and whenever the task could reasonably go more than one way.",
           "- When the plan changes mid-task, say so and why before continuing.",
@@ -176,61 +304,6 @@ format_live_subagents <- function() {
         ), collapse = "\n")
 }
 
-# ---- Context builder (dedupes exact-match blocks) ----
-#
-# Every producer of context (saber briefing, agent_context variants,
-# custom files, skill docs, package docs) pushes into this builder.
-# If two producers emit identical blocks, only the first is kept.
-# Deliberately conservative: no fuzzy matching, no normalization
-# beyond what the source produces. That's enough to handle the case
-# where saber::agent_context() and our inlined fallback both run and
-# produce the same text, or where two sources happen to load the
-# same file.
-#
-# @noRd
-new_context_builder <- function() {
-    list(parts = character())
-}
-
-#' @noRd
-add_context <- function(builder, text) {
-    if (is.null(text)) {
-        return(builder)
-    }
-    if (length(text) != 1L) {
-        text <- paste(text, collapse = "\n")
-    }
-    text <- trimws(text, which = "right")
-    if (!nzchar(text)) {
-        return(builder)
-    }
-    if (text %in% builder$parts) {
-        return(builder)
-    }
-    builder$parts <- c(builder$parts, text)
-    builder
-}
-
-#' Load agent context via our inlined fallback copy
-#'
-#' Mirrors \code{load_saber_agent_context()} but always calls the
-#' local \code{agent_context()} defined in \code{R/agent_context.R}.
-#' Used alongside the saber call in \code{load_context()}; the
-#' context builder dedupes identical output. Delete this function
-#' and the corresponding call in \code{load_context()} once saber
-#' >= 0.4.0 is required in DESCRIPTION.
-#' @noRd
-load_local_agent_context <- function(cwd, config) {
-    workspace_dir <- get_workspace_dir()
-    tryCatch({
-        text <- agent_context(agent = "corteza", project_dir = cwd,
-                              workspace_dir = workspace_dir,
-                              include_soul = config$context_include_soul,
-                              include_global = config$context_include_user)
-        if (is.null(text) || nchar(trimws(text)) == 0L) NULL else text
-    }, error = function(e) NULL)
-}
-
 #' Call saber::briefing() for project metadata
 #'
 #' Returns the briefing text or NULL on failure.
@@ -256,40 +329,10 @@ load_saber_briefing <- function(cwd) {
     }, error = function(e) NULL)
 }
 
-#' Call saber::agent_context() for runtime context files
-#'
-#' Returns the assembled context or NULL on failure / when saber is unavailable.
-#' @noRd
-load_saber_agent_context <- function(cwd, config) {
-    # Call saber::agent_context() via dynamic lookup so R CMD check's
-    # static ::-scan doesn't flag a symbol that isn't in saber's CRAN
-    # namespace yet. When saber doesn't export it (0.3.0 and earlier),
-    # this returns NULL and load_local_agent_context() covers the feature
-    # via the inlined copy in R/agent_context.R.
-    saber_fn <- tryCatch(getExportedValue("saber", "agent_context"),
-                         error = function(e) NULL)
-    if (is.null(saber_fn)) {
-        return(NULL)
-    }
-
-    workspace_dir <- get_workspace_dir()
-    tryCatch({
-        text <- saber_fn(
-                         agent = "corteza",
-                         project_dir = cwd,
-                         workspace_dir = workspace_dir,
-                         include_soul = config$context_include_soul,
-                         include_global = config$context_include_user
-        )
-        if (is.null(text) || nchar(trimws(text)) == 0L) NULL else text
-    }, error = function(e) NULL)
-}
-
 #' List custom context files that would be loaded
 #'
-#' Returns the configured \code{context_files} that exist in the project
-#' directory. Standard files (memory, SOUL.md, USER.md, CLAUDE.md,
-#' AGENTS.md) are loaded via saber and not included here.
+#' Returns configured \code{context_files} that exist. Relative paths are
+#' resolved from the project; absolute and tilde paths are preserved.
 #'
 #' @param cwd Working directory.
 #' @return Character vector of existing custom context file paths.
@@ -300,6 +343,13 @@ list_context_files <- function(cwd = getwd()) {
     if (length(file_names) == 0L) {
         return(character(0))
     }
-    paths <- file.path(cwd, file_names)
+    paths <- vapply(file_names, function(path) {
+        expanded <- path.expand(path)
+        if (grepl("^(/|[A-Za-z]:[/\\\\])", expanded)) {
+            expanded
+        } else {
+            file.path(cwd, expanded)
+        }
+    }, character(1L), USE.NAMES = FALSE)
     paths[file.exists(paths)]
 }

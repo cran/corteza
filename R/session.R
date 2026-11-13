@@ -377,13 +377,9 @@ session_add_message <- function(session, role, content) {
 #' @param agent_id Agent ID
 #' @return Invisible path to transcript file
 #' @noRd
-transcript_write_header <- function(id, cwd, agent_id = DEFAULT_AGENT_ID) {
+transcript_write_header <- function(id, cwd, agent_id = DEFAULT_AGENT_ID,
+                                    extra = NULL) {
     path <- session_transcript_path(id, agent_id)
-
-    dir <- dirname(path)
-    if (!dir.exists(dir)) {
-        dir.create(dir, recursive = TRUE, mode = "0700")
-    }
 
     # Only write if file doesn't exist
     if (file.exists(path)) {
@@ -397,9 +393,16 @@ transcript_write_header <- function(id, cwd, agent_id = DEFAULT_AGENT_ID) {
                    timestamp = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC"),
                    cwd = normalizePath(cwd, mustWork = FALSE)
     )
+    # Optional caller-supplied fields (e.g. the auto_run_id a monitor
+    # subagent was spawned for). NULLs are dropped so the attended
+    # header format is byte-for-byte what it always was.
+    if (is.list(extra)) {
+        extra <- extra[!vapply(extra, is.null, logical(1))]
+        header[names(extra)] <- extra
+    }
 
     json <- jsonlite::toJSON(header, auto_unbox = TRUE)
-    cat(json, "\n", file = path, append = FALSE)
+    .private_record_write(path, json, append = FALSE)
 
     invisible(path)
 }
@@ -411,12 +414,18 @@ transcript_write_header <- function(id, cwd, agent_id = DEFAULT_AGENT_ID) {
 #' @param provider LLM provider (for assistant messages)
 #' @param model Model name (for assistant messages)
 #' @param usage Token usage list (for assistant messages)
+#' @param audit Canonical turn reference for copied usage, or NULL.
 #' @param agent_id Agent ID
 #' @return Invisible path to transcript file
+#' @param auto_run_id Auto-run id when this message belongs to an auto
+#'   run; NULL (the attended default) writes no field, so the attended
+#'   message format is unchanged. This is what lets two runs with the
+#'   same goal in one session be partitioned from the transcript alone.
 #' @noRd
 transcript_append <- function(session, role, content, provider = NULL,
                               model = NULL, usage = NULL,
-                              agent_id = DEFAULT_AGENT_ID) {
+                              agent_id = DEFAULT_AGENT_ID,
+                              auto_run_id = NULL, audit = NULL) {
     path <- session_transcript_path(session$sessionId, agent_id)
 
     # Ensure header exists
@@ -430,31 +439,28 @@ transcript_append <- function(session, role, content, provider = NULL,
                 role = role,
                 content = list(list(type = "text", text = content))
     )
+    if (!is.null(auto_run_id)) {
+        msg$auto_run_id <- auto_run_id
+    }
 
     if (role == "assistant") {
         msg$stopReason <- "stop"
         msg$api <- "openai-responses"
         msg$provider <- provider %||% session$provider %||% "corteza"
         msg$model <- model %||% session$model %||% "unknown"
-        msg$usage <- usage %||% list(
-                                     input = 0L,
-                                     output = 0L,
-                                     cacheRead = 0L,
-                                     cacheWrite = 0L,
-                                     totalTokens = 0L,
-                                     cost = list(
-                input = 0,
-                output = 0,
-                cacheRead = 0,
-                cacheWrite = 0,
-                total = 0
-            )
-        )
+        msg["usage"] <- list(usage)
+        msg$usage_format <- "llm.api"
+        msg$usage_source <- "derived"
+        if (is.null(audit)) {
+            msg$usage_turns <- list()
+        } else {
+            msg$usage_turns <- list(audit)
+        }
         msg$timestamp <- as.numeric(Sys.time()) * 1000
     }
 
-    json <- jsonlite::toJSON(msg, auto_unbox = TRUE)
-    cat(json, "\n", file = path, append = TRUE)
+    json <- jsonlite::toJSON(msg, auto_unbox = TRUE, null = "null")
+    .private_record_write(path, json)
 
     invisible(path)
 }
@@ -600,32 +606,24 @@ trace_path <- function(session_id, agent_id = DEFAULT_AGENT_ID) {
 #' @param approved_by How tool was approved
 #' @param turn Conversation turn number
 #' @param agent_id Agent ID
+#' @param auto_run_id Auto-run id when this call executed inside an
+#'   auto run; NULL (the attended default) writes no field at all, so
+#'   the format of attended traces is unchanged.
+#' @param call_id Per-call id minted at the auto gate; NULL outside
+#'   auto runs. This is what joins one trace row to one gate record
+#'   when the same tool is called twice with the same arguments.
 #' @return Invisible path to trace file
 #' @noRd
 trace_add <- function(session_id, tool, args, result, success, elapsed_ms,
                       approved_by = NULL, turn = NULL,
-                      agent_id = DEFAULT_AGENT_ID) {
+                      agent_id = DEFAULT_AGENT_ID, auto_run_id = NULL,
+                      call_id = NULL, turn_id = NULL) {
     path <- trace_path(session_id, agent_id)
 
-    dir <- dirname(path)
-    if (!dir.exists(dir)) {
-        dir.create(dir, recursive = TRUE)
-    }
-
-    # Truncate large values
-    args_summary <- lapply(args, function(x) {
-        if (is.character(x) && nchar(x) > 200) {
-            paste0(substr(x, 1, 197), "...")
-        } else {
-            x
-        }
-    })
-
-    result_summary <- if (is.character(result) && nchar(result) > 500) {
-        paste0(substr(result, 1, 497), "...")
-    } else {
-        result
-    }
+    args_summary <- .trace_preview(args, 200L)
+    result_summary <- .trace_preview(result, 500L)
+    args_cut <- !identical(args, args_summary)
+    result_cut <- !identical(result, result_summary)
 
     entry <- list(
                   timestamp = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC"),
@@ -633,13 +631,25 @@ trace_add <- function(session_id, tool, args, result, success, elapsed_ms,
                   tool = tool,
                   args = args_summary,
                   result = result_summary,
+                  truncated = args_cut || result_cut,
+                  truncation = list(args = args_cut, result = result_cut,
+                      args_character_limit = 200L, result_character_limit = 500L),
                   success = success,
                   elapsed_ms = elapsed_ms,
                   approved_by = approved_by
     )
+    if (!is.null(auto_run_id)) {
+        entry$auto_run_id <- auto_run_id
+    }
+    if (!is.null(call_id)) {
+        entry$call_id <- call_id
+    }
+    if (!is.null(turn_id)) {
+        entry$turn_id <- turn_id
+    }
 
     json <- jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null")
-    cat(json, "\n", file = path, append = TRUE)
+    .private_record_write(path, json)
 
     invisible(path)
 }

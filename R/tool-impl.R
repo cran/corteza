@@ -4,7 +4,18 @@
 # Shared helpers ----
 
 tool_config <- function() {
-    load_config(getwd())
+    config <- load_config(getwd())
+    # Process-level path confinement, used to pin a subagent to its
+    # project (see PRESET_ALLOWED_PATHS in R/subagent.R). Each subagent
+    # is its own R process, so the option cannot leak into the parent.
+    # This can only ever tighten: validate_path() treats a NULL
+    # allowed_paths as unrestricted, so setting one is strictly a
+    # narrowing. denied_paths is untouched either way.
+    confined <- getOption("corteza.allowed_paths", NULL)
+    if (!is.null(confined)) {
+        config$allowed_paths <- confined
+    }
+    config
 }
 
 tool_resolve_path <- function(path = ".") {
@@ -20,6 +31,19 @@ tool_check_path <- function(path, operation = "access") {
     validation <- validate_path(full_path, tool_config(), operation = operation)
 
     list(ok = validation$ok, message = validation$message, path = full_path)
+}
+
+# The subset of `paths` the session may read, each judged by where it
+# resolves (symlinks followed). The config is loaded once for the batch.
+tool_readable_paths <- function(paths) {
+    if (!length(paths)) {
+        return(paths)
+    }
+    cfg <- tool_config()
+    keep <- vapply(paths, function(p) {
+        isTRUE(validate_path(tool_resolve_path(p), cfg, operation = "read")$ok)
+    }, logical(1))
+    paths[keep]
 }
 
 tool_read_text <- function(path) {
@@ -58,20 +82,223 @@ format_numbered_lines <- function(lines, start = 1L) {
     paste(numbered, collapse = "\n")
 }
 
-git_run <- function(args, path = ".") {
+# Run git with `args` in `path`. No shell is involved: each element of
+# `args` reaches git as one argument, whatever it contains. This used to
+# go through system2(), which builds a shell command line, so a ref of
+# "HEAD; touch x" ran `touch` -- command execution through tools that
+# policy classes as reads.
+#
+# Nor does git run a program of the repository's choosing. A repository's
+# own config (.git/config, which anything with write access can edit)
+# can name programs that git starts during an ordinary status, diff, or
+# add: an fsmonitor hook, clean/smudge filters, the post-index-change
+# hook, gpg for signatures, a transport for a lazy fetch. Tools that
+# policy classes as reads, and the job snapshot, must not be a way to
+# run them, so every call here turns them off (GIT_SAFE_CONFIG,
+# GIT_SAFE_ENV, git_programs_off()). The cost: a file under a clean
+# filter (git-lfs) is compared and snapshotted as its raw content, a
+# partial clone does not fetch missing objects, and a submodule is
+# compared by its commit, not by the state of its working tree.
+#
+# Pathspecs are literal: ":(top)x" and "*.R" name files, they are not
+# pathspec magic or globs. `stdin` is a file to feed git; `bytes = TRUE`
+# returns stdout as a raw vector in `bytes` (for NUL-separated output)
+# instead of `text`.
+#
+# The filters are turned off for every command, not only the ones that
+# look like they read file content. Git re-hashes a recently modified
+# file whenever it writes an index, so `write-tree` runs a clean filter
+# as readily as `add` does.
+git_run <- function(args, path = ".", env = NULL, stdin = NULL, bytes = FALSE) {
     repo_path <- tool_resolve_path(path)
-    output <- tryCatch(
-                       system2("git", c("-C", repo_path, args), stdout = TRUE, stderr = TRUE),
-                       error = function(e) structure(paste("Error:", e$message), status = 1L)
-    )
+    off <- git_programs_off(repo_path)
+    if (is.null(off)) {
+        return(list(status = 1L, bytes = raw(), text = GIT_CONFIG_ERROR))
+    }
+    git_exec(c(rbind("-c", c(GIT_SAFE_CONFIG, off)), "--no-pager",
+               "--literal-pathspecs", "-C", repo_path, args), env = env,
+             stdin = stdin, bytes = bytes)
+}
 
-    list(status = attr(output, "status") %||% 0L,
-         text = paste(output, collapse = "\n"))
+# No fsmonitor hook, no hooks directory, no gpg, no transport.
+GIT_SAFE_CONFIG <- c("core.fsmonitor=", "core.hooksPath=/dev/null",
+                     "log.showSignature=false", "protocol.allow=never")
+
+GIT_CONFIG_ERROR <- paste("Error: git was not run, because the programs",
+                          "this repository's configuration names could not",
+                          "be turned off (unreadable git configuration, or",
+                          "a filter driver or protocol with \"=\" in its",
+                          "name)")
+
+# No index refresh written back (which would fire post-index-change), no
+# fetch of objects a partial clone lacks, no credential prompt.
+GIT_SAFE_ENV <- c(GIT_OPTIONAL_LOCKS = "0", GIT_NO_LAZY_FETCH = "1",
+                  GIT_TERMINAL_PROMPT = "0")
+
+# Start git with exactly `args`. With `bytes`, stdout goes through a
+# file, since an R string cannot hold the NUL bytes in `-z` output.
+git_exec <- function(args, env = NULL, stdin = NULL, bytes = FALSE) {
+    out <- "|"
+    if (bytes) {
+        out <- tempfile("corteza-git-")
+        on.exit(unlink(out), add = TRUE)
+    }
+    res <- tryCatch(
+                    processx::run("git", args, error_on_status = FALSE, stdout = out,
+                                  stderr = if (bytes) NULL else "|",
+                                  stderr_to_stdout = !bytes, stdin = stdin,
+                                  env = c("current", GIT_SAFE_ENV, env)),
+                    error = function(e) {
+        list(status = 1L, stdout = paste("Error:", conditionMessage(e)))
+    })
+    status <- as.integer(res$status %||% 1L)
+    if (bytes) {
+        got <- if (file.exists(out)) {
+            readBin(out, "raw", file.size(out))
+        } else {
+            raw()
+        }
+        return(list(status = status, bytes = got, text = ""))
+    }
+    list(status = status, text = sub("\r?\n$", "", res$stdout %||% ""))
+}
+
+# NUL-separated git output as a character vector. Names are kept as the
+# bytes git printed: a tab, a newline, or a quote in a filename arrives
+# as itself, where git's default output would quote and escape it.
+git_split_nul <- function(bytes) {
+    n <- sum(bytes == as.raw(0L))
+    if (n == 0L) {
+        return(character())
+    }
+    readBin(bytes, "character", n = n)
+}
+
+# `-c` settings for what GIT_SAFE_CONFIG cannot name in advance, because
+# the names are the configuration's own:
+# - every filter driver is emptied, so no clean, smudge, or process
+#   command runs. Git has no switch for this;
+# - every protocol allowed by name is refused. `protocol.allow=never`
+#   only sets the default, and `protocol.ext.allow=always` with a remote
+#   of "ext::<command>" is a program a lazy fetch would start.
+# NULL when that cannot be done: the configuration is unreadable, or a
+# name holds "=", which `-c name=value` cannot express.
+git_programs_off <- function(repo_path) {
+    if (!dir.exists(repo_path)) {
+        # Git will not start there either; let it say so itself.
+        return(character())
+    }
+    res <- git_exec(c("-C", repo_path, "config", "-z", "--name-only",
+                      "--get-regexp",
+                      paste0("^(filter\\..*\\.(clean|smudge|process|required)",
+                             "|protocol\\..*\\.allow)$")),
+                    bytes = TRUE)
+    # Exit 1 is git's "nothing matched".
+    if (res$status == 1L) {
+        return(character())
+    }
+    if (res$status != 0L) {
+        return(NULL)
+    }
+    keys <- unique(git_split_nul(res$bytes))
+    if (any(grepl("=", keys, fixed = TRUE, useBytes = TRUE))) {
+        return(NULL)
+    }
+    is_filter <- startsWith(keys, "filter.")
+    drivers <- unique(sub("^filter\\.(.*)\\.[^.]*$", "\\1", keys[is_filter],
+                          useBytes = TRUE))
+    c(unlist(lapply(drivers, function(d) {
+        c(paste0("filter.", d, c(".clean=", ".smudge=", ".process=")),
+            paste0("filter.", d, ".required=false"))
+    })), paste0(keys[!is_filter], rep("=never", sum(!is_filter))))
 }
 
 git_repo_available <- function(path = ".") {
     result <- git_run(c("rev-parse", "--is-inside-work-tree"), path = path)
+    if (identical(result$text, GIT_CONFIG_ERROR)) {
+        # Not the same as "no repository here": say why git did not run.
+        return(structure(FALSE, reason = GIT_CONFIG_ERROR))
+    }
     identical(trimws(result$text), "true") && result$status == 0L
+}
+
+# Path confinement for the git tools, which used to apply none: with a
+# `path` argument they read any repository on the machine, whatever
+# allowed_paths said. Returns list(ok, message, path, scope). `scope` is
+# a pathspec limiting git to the directory when the repository's root
+# lies outside what the session may read (a session confined to a
+# subdirectory of a repo), and NULL otherwise.
+git_tool_repo <- function(path = ".") {
+    checked <- tool_check_path(path %||% ".", operation = "read")
+    if (!checked$ok) {
+        return(list(ok = FALSE, message = checked$message))
+    }
+    available <- git_repo_available(checked$path)
+    if (!available) {
+        return(list(ok = FALSE, message = attr(available, "reason") %||%
+                    "Not inside a git repository"))
+    }
+    top <- git_run(c("rev-parse", "--show-toplevel"), path = checked$path)
+    scope <- NULL
+    if (top$status != 0L ||
+        !validate_path(tool_resolve_path(top$text), tool_config(),
+                       operation = "read")$ok) {
+        scope <- c("--", ".")
+    }
+    list(ok = TRUE, message = NULL, path = checked$path, scope = scope)
+}
+
+# A ref from the model must be a ref, not an option. Without a shell an
+# argument can no longer run a command, but one starting with "-" would
+# still be read by git as a flag: --output=<file> makes `git diff` write
+# a file, --no-index makes it read paths outside the repository.
+#
+# Nor may it name a path. "HEAD:b/secret.R" is a file's content at a
+# commit, and `git diff HEAD:b/secret.R -- a/x.R` prints it, from
+# anywhere in the repository, whatever directory the session is
+# confined to. No commit, branch, tag, or range needs a colon.
+git_ref_ok <- function(ref) {
+    !startsWith(ref, "-") && !grepl(":", ref, fixed = TRUE)
+}
+
+GIT_REF_MESSAGE <- paste("ref must be a commit, branch, tag, or range,",
+                         "not an option or a <rev>:<path>")
+
+# Why `ref` may not be used, or NULL when it may.
+#
+# The spelling rules of git_ref_ok() are not enough. A file's content
+# has an object id of its own, and a tag can point at one, so
+# `git diff <blob> -- a/x.R` prints a file from anywhere in the
+# repository with no colon in sight. What counts is what the ref
+# resolves to: git expands it (a name, a range, "^A", "A^!") into object
+# ids, and every one of them has to be a commit, or a tag of one. A
+# diff or log between commits is limited by its pathspec; a blob or a
+# tree is not.
+git_ref_problem <- function(ref, repo_path) {
+    if (!nzchar(ref)) {
+        return(NULL)
+    }
+    if (!git_ref_ok(ref)) {
+        return(GIT_REF_MESSAGE)
+    }
+    parsed <- git_run(c("rev-parse", "--revs-only", ref), path = repo_path)
+    ids <- sub("^\\^", "", strsplit(parsed$text, "\n", fixed = TRUE)[[1L]])
+    if (parsed$status != 0L || !length(ids) ||
+        !all(grepl("^[0-9a-f]{40,64}$", ids))) {
+        return(sprintf("'%s' is not a revision in this repository", ref))
+    }
+    feed <- tempfile("corteza-refs-")
+    on.exit(unlink(feed), add = TRUE)
+    writeLines(paste0(ids, "^{commit}"), feed)
+    types <- git_run(c("cat-file", "--batch-check=%(objecttype)"),
+                     path = repo_path, stdin = feed)
+    found <- strsplit(types$text, "\n", fixed = TRUE)[[1L]]
+    if (types$status != 0L || length(found) != length(ids) ||
+        !all(found == "commit")) {
+        return(paste("ref must name commits (a commit, branch, tag of a",
+                     "commit, or range of them), not a file or a tree"))
+    }
+    NULL
 }
 
 # File tools ----
@@ -108,7 +335,19 @@ tool_list_files <- function(path = ".", pattern = NULL, recursive = FALSE,
     entries <- list.files(path = path, pattern = pattern %||% NULL,
                           all.files = all_files, recursive = recursive,
                           full.names = TRUE, include.dirs = TRUE, no.. = TRUE)
+    # A recursive listing follows symlinked directories; entries that
+    # resolve outside what the session may read are not listed. Checked
+    # in sorted order and only until the display limit is passed, so a
+    # huge tree costs no more checks than it shows.
     entries <- sort(entries)
+    kept <- character()
+    i <- 0L
+    while (length(kept) <= limit && i < length(entries)) {
+        chunk <- entries[seq.int(i + 1L, min(i + limit + 1L, length(entries)))]
+        kept <- c(kept, tool_readable_paths(chunk))
+        i <- i + length(chunk)
+    }
+    entries <- kept
 
     if (length(entries) == 0) {
         return(ok(paste("No files found in", path)))
@@ -389,6 +628,12 @@ tool_grep_files <- function(pattern, path = ".", file_pattern = "*.R") {
     file_pattern <- file_pattern %||% "*.R"
 
     files <- Sys.glob(file.path(path, file_pattern))
+    # Checking `path` is not enough: the glob is the model's too, and
+    # "../other/*.R" or a symlink walks out of it. Every file the glob
+    # produced is checked where it really resolves; one outside what the
+    # session may read is dropped without being opened.
+    files <- tool_readable_paths(files)
+    files <- files[!dir.exists(files)]
     if (length(files) == 0) {
         return(ok("No files to search"))
     }
@@ -416,75 +661,141 @@ tool_grep_files <- function(pattern, path = ".", file_pattern = "*.R") {
 
 # Code execution ----
 
-#' Execute R code in the session's global environment.
+#' Execute R code in a persistent environment.
 #'
-#' New bindings are auto-captured into the workspace cache. Large
-#' result values (data frames, matrices, long vectors, objects over
-#' ~10 KB) are stashed via `with_handle()` and returned as a `str()`
-#' summary plus a short `.h_NNN` handle the LLM can reference in a
-#' later `run_r` call or inspect with `read_handle`.
+#' By default, code runs in the host's global environment, preserving the
+#' original \code{run_r} contract. Pass a private persistent environment to
+#' give an agent or capability its own R scope. Scoped evaluation retains
+#' assignments and handles but does not copy bindings into the host workspace
+#' cache.
 #'
 #' @param code (character) R code to execute.
+#' @param envir (environment) Persistent environment in which assignments
+#'   should land. Defaults to \code{globalenv()} for backwards compatibility.
 #' @return An MCP tool-result list.
 #' @keywords internal
 #' @export
-tool_run_r <- function(code) {
-    # Snapshot globalenv before eval for workspace auto-capture
-    before <- ls(globalenv())
-
+tool_run_r <- function(code, envir = globalenv()) {
+    stopifnot(is.environment(envir))
+    capture_workspace <- identical(envir, globalenv())
+    if (isTRUE(capture_workspace)) {
+        before <- ls(envir)
+    } else {
+        before <- character()
+    }
+    handle_store <- handle_store_for(envir)
     # Active handles are visible in `code` as regular R names.
-    eval_env <- handle_eval_env(parent = globalenv())
+    eval_env <- handle_eval_env(parent = envir, store = handle_store)
 
-    # Evaluate in a two-step dance: get the withVisible() result first
-    # (so we have the value, not just its printed representation), then
-    # separately capture what the print of that value would look like.
-    # Using <<- inside nested capture.output/tryCatch frames is fragile.
-    outcome <- tryCatch({
-        r <- withVisible(eval(parse(text = code), envir = eval_env))
-        printed <- if (isTRUE(r$visible)) {
-            utils::capture.output(print(r$value))
-        } else {
-            character(0)
+    # Evaluate like a console: stdout, messages, and warnings interleave
+    # in the order the code emits them, then the print of a visible final
+    # value. Everything streams to one connection so a `message()` before
+    # a `cat()` prints before it, not after. A warning is muffled only
+    # under the default `warn < 2`; with `options(warn = 2)` it is left to
+    # become an error, and code after it does not run. Output written
+    # before an error survives, ahead of the `Error:` line.
+    stream_file <- tempfile("run_r_stream")
+    stream_con <- file(stream_file, open = "wt")
+    sink(stream_con)
+    sink_open <- TRUE
+    con_open <- TRUE
+    close_stream <- function() {
+        if (sink_open) {
+            sink()
+            sink_open <<- FALSE
         }
-        list(ok = TRUE, value = r$value, visible = r$visible,
-             printed = paste(printed, collapse = "\n"))
-    }, error = function(e) {
-        list(ok = FALSE, message = paste("Error:", e$message))
-    })
+        if (con_open) {
+            close(stream_con)
+            con_open <<- FALSE
+        }
+    }
+    # Release the sink, connection, and temp file however this call exits.
+    # The supervised worker aborts an over-deadline call with an interrupt,
+    # which unwinds past the explicit close_stream() below without running
+    # it -- leaking a sink and connection into the persistent worker on every
+    # timeout. on.exit fires on interrupts as well as errors and normal
+    # returns; the flags keep it idempotent with the normal-path close.
+    on.exit({
+        close_stream()
+        unlink(stream_file)
+    }, add = TRUE)
+    eval_error <- NULL
+    r <- tryCatch(
+                  withCallingHandlers(
+                                      withVisible(eval(parse(text = code), envir = eval_env)),
+                                      message = function(m) {
+        cat(conditionMessage(m), file = stream_con, sep = "")
+        invokeRestart("muffleMessage")
+    },
+                                      warning = function(w) {
+        if (getOption("warn") < 2) {
+            cat("Warning: ", conditionMessage(w), "\n", file = stream_con,
+                sep = "")
+            invokeRestart("muffleWarning")
+        }
+    }
+        ),
+                  error = function(e) {
+        eval_error <<- e
+        NULL
+    }
+    )
+    close_stream()
+    streams <- suppressWarnings(readLines(stream_file))
 
-    if (!isTRUE(outcome$ok)) {
-        return(ok(outcome$message))
+    if (!is.null(eval_error)) {
+        text <- paste(c(streams, paste("Error:", conditionMessage(eval_error))),
+                      collapse = "\n")
+        result <- ok(admit_tool_result(text, tool = "run_r", store = handle_store))
+        result$r_error <- TRUE
+        return(result)
+    }
+    outcome <- list(value = r$value, visible = isTRUE(r$visible))
+    outcome$printed <- if (outcome$visible) {
+        paste(utils::capture.output(print(outcome$value)), collapse = "\n")
+    } else {
+        character(0)
     }
 
     # Large visible results get stashed as handles so the LLM sees a
     # summary instead of the full print.
-    text <- if (isTRUE(outcome$visible) && .is_large_result(outcome$value)) {
-        stashed <- with_handle(outcome$value)
+    text <- if (outcome$visible && .is_large_result(outcome$value)) {
+        stashed <- with_handle(outcome$value, store = handle_store)
         sprintf("%s\n\n[stored as %s]", stashed$summary, stashed$handle)
     } else {
         outcome$printed
     }
+    text <- paste(c(streams, text), collapse = "\n")
+    .audit_safe(.audit_tool_payload(.audit_runtime$active,
+        paste(c(streams, outcome$printed), collapse = "\n"), text, "run_r", stage = "render"))
 
-    # Auto-capture new globalenv bindings into the workspace. As of
-    # the handle_eval_env() fix that restored eval in globalenv,
-    # ordinary `<-` assignments land here, so any new visible name
-    # gets captured. Hidden names (`.foo`, `.h_NNN`) are excluded by
-    # default ls() rules.
-    new_names <- setdiff(ls(globalenv()), before)
-    origin <- list(tool = "run_r", args = list(code = code))
-    for (nm in new_names) {
-        val <- get(nm, envir = globalenv())
-        if (object.size(val) < 10e6) {
-            deps <- tryCatch({
-                fn <- eval(parse(text = paste0("function() {", code, "}")))
-                referenced <- codetools::findGlobals(fn)
-                intersect(referenced, ws_names())
-            }, error = function(e) character())
-            ws_put(nm, val, origin = origin, deps = deps)
+    if (isTRUE(capture_workspace)) {
+        # Auto-capture new bindings into the workspace. Hidden names
+        # (`.foo`, `.h_NNN`) are excluded by default ls() rules.
+        new_names <- setdiff(ls(envir), before)
+        origin <- list(tool = "run_r", args = list(code = code))
+        for (nm in new_names) {
+            val <- get(nm, envir = envir)
+            if (object.size(val) < 10e6) {
+                deps <- tryCatch({
+                    fn <- eval(parse(text = paste0("function() {", code, "}")))
+                    referenced <- codetools::findGlobals(fn)
+                    intersect(referenced, ws_names())
+                }, error = function(e) character())
+                ws_put(nm, val, origin = origin, deps = deps)
+            }
         }
     }
 
-    ok(text)
+    # The outer tool handler applies the same universal cap, but it does not
+    # know which private evaluator produced this result. Admit it here first
+    # so any overflow handle belongs to this R scope rather than the process.
+    # `r_error` lets a caller (e.g. an audit log) tell a failed evaluation
+    # from a successful one; the model-facing text and `isError` are
+    # unchanged, since an R error is a normal, non-transport tool result.
+    result <- ok(admit_tool_result(text, tool = "run_r", store = handle_store))
+    result$r_error <- FALSE
+    result
 }
 
 #' Execute R code in a clean subprocess via littler.
@@ -934,12 +1245,17 @@ tool_fetch_url <- function(url, max_chars = 8000L) {
 #' @keywords internal
 #' @export
 tool_git_status <- function(path = ".") {
-    repo_path <- path %||% "."
-    if (!git_repo_available(repo_path)) {
-        return(err("Not inside a git repository"))
+    repo <- git_tool_repo(path)
+    if (!repo$ok) {
+        return(err(repo$message))
     }
+    repo_path <- repo$path
 
-    result <- git_run(c("status", "--short", "--branch"), path = repo_path)
+    # A submodule's commit is compared, its working tree is not: that
+    # takes a second git inside the submodule, under its configuration.
+    result <- git_run(c("status", "--short", "--branch",
+                        "--ignore-submodules=dirty", repo$scope),
+                      path = repo_path)
     if (result$status != 0L) {
         return(err(result$text))
     }
@@ -959,12 +1275,17 @@ tool_git_status <- function(path = ".") {
 #' @export
 tool_git_diff <- function(ref = "HEAD", path = ".", file_path = "",
                           staged = FALSE, context_lines = 3L) {
-    repo_path <- path %||% "."
-    if (!git_repo_available(repo_path)) {
-        return(err("Not inside a git repository"))
+    repo <- git_tool_repo(path)
+    if (!repo$ok) {
+        return(err(repo$message))
     }
+    repo_path <- repo$path
 
     ref <- trimws(ref %||% "HEAD")
+    problem <- git_ref_problem(ref, repo_path)
+    if (!is.null(problem)) {
+        return(err(problem))
+    }
     file_path <- trimws(file_path %||% "")
     staged <- isTRUE(staged)
     context_lines <- as.integer(context_lines %||% 3L)
@@ -972,7 +1293,10 @@ tool_git_diff <- function(ref = "HEAD", path = ".", file_path = "",
         context_lines <- 3L
     }
 
-    cmd <- c("diff", "--no-ext-diff", "--find-renames",
+    # --no-textconv with --no-ext-diff: neither a configured external
+    # diff nor a textconv filter runs a program on behalf of a read.
+    cmd <- c("diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+             "--ignore-submodules=dirty",
              sprintf("--unified=%d", context_lines))
     if (staged) {
         cmd <- c(cmd, "--cached")
@@ -980,8 +1304,24 @@ tool_git_diff <- function(ref = "HEAD", path = ".", file_path = "",
     if (nchar(ref) > 0) {
         cmd <- c(cmd, ref)
     }
+    # "--" always: what precedes it is a revision, never a path.
     if (nchar(file_path) > 0) {
+        # The filter is a path like any other: it has to resolve inside
+        # what the session may read. git_run() passes it to git as a
+        # literal name, so git reads it the way this check does and
+        # ":(top)b/x.R" cannot reach out of the directory.
+        target <- if (grepl("^(/|~|[A-Za-z]:)", file_path)) {
+            file_path
+        } else {
+            file.path(repo_path, file_path)
+        }
+        checked <- tool_check_path(target, operation = "read")
+        if (!checked$ok) {
+            return(err(checked$message))
+        }
         cmd <- c(cmd, "--", file_path)
+    } else {
+        cmd <- c(cmd, repo$scope %||% "--")
     }
 
     result <- git_run(cmd, path = repo_path)
@@ -1004,21 +1344,27 @@ tool_git_diff <- function(ref = "HEAD", path = ".", file_path = "",
 #' @keywords internal
 #' @export
 tool_git_log <- function(n = 10L, ref = "HEAD", path = ".") {
-    repo_path <- path %||% "."
-    if (!git_repo_available(repo_path)) {
-        return(err("Not inside a git repository"))
+    repo <- git_tool_repo(path)
+    if (!repo$ok) {
+        return(err(repo$message))
     }
+    repo_path <- repo$path
 
     n <- as.integer(n %||% 10L)
     if (is.na(n) || n < 1L) {
         n <- 10L
     }
     ref <- trimws(ref %||% "HEAD")
+    problem <- git_ref_problem(ref, repo_path)
+    if (!is.null(problem)) {
+        return(err(problem))
+    }
 
     cmd <- c("log", "--oneline", "--decorate", sprintf("-n%d", n))
     if (nchar(ref) > 0) {
         cmd <- c(cmd, ref)
     }
+    cmd <- c(cmd, repo$scope %||% "--")
 
     result <- git_run(cmd, path = repo_path)
     if (result$status != 0L) {
@@ -1055,30 +1401,59 @@ tool_spawn_subagent <- function(task, model = NULL, tools = NULL,
     })
 }
 
-#' Send a prompt to a running subagent and get the response.
+#' Preserve an optional machine-readable subagent handoff on a tool result.
+#' @noRd
+.subagent_tool_result <- function(result) {
+    report <- attr(result, "corteza_report", exact = TRUE)
+    out <- ok(as.character(result))
+    if (!is.null(report)) {
+        # MCP clients that understand structuredContent can consume this
+        # directly; existing clients continue to read the same text block.
+        out$structuredContent <- list(report = report)
+    }
+    out
+}
+
+#' Send a prompt to a running subagent.
+#'
+#' Fires the prompt and returns at once; collect the reply later with
+#' collect_subagent, so several subagents can run in parallel. wait =
+#' TRUE for a quick answer.
 #'
 #' @param id (character) Subagent ID.
 #' @param prompt (character) Prompt to send.
-#' @param wait (logical) If TRUE (default), block until the child
-#'   replies and return the reply. If FALSE, fire the prompt and
-#'   return immediately; caller collects via `collect_subagent`.
+#' @param wait (logical) If FALSE (default), fire the prompt and return
+#'   immediately; collect the reply with `collect_subagent`. If TRUE,
+#'   block up to `timeout` seconds for the reply; on timeout the query
+#'   stays pending and `collect_subagent` fetches it later.
 #' @param return_name (string) Optional name or `.h_NNN` handle for a
 #'   value the subagent should hand back. Tell the subagent to leave
 #'   its result bound under this name (it needs `run_r`); the value is
 #'   returned as a handle you can reference in a later `run_r`, instead
 #'   of being inlined into the reply text.
+#' @param timeout (numeric) Maximum seconds to block when `wait = TRUE`.
+#'   Default 60.
+#' @param report (logical) Request a structured completion handoff containing
+#'   findings, concerns, deviations, open questions, and feedback. Default
+#'   FALSE preserves the plain-reply behavior.
 #' @return An MCP tool-result list.
 #' @keywords internal
 #' @export
-tool_query_subagent <- function(id, prompt, wait = TRUE, return_name = NULL) {
+tool_query_subagent <- function(id, prompt, wait = FALSE, return_name = NULL,
+                                timeout = 60, report = FALSE) {
     tryCatch({
-        result <- subagent_query(id, prompt, wait = wait,
-                                 return_name = return_name)
-        if (isTRUE(wait)) {
-            ok(result)
-        } else {
+        result <- subagent_query(id, prompt, wait = wait, timeout = timeout,
+                                 return_name = return_name, report = report)
+        if (!isTRUE(wait)) {
             ok(sprintf("Queued for subagent %s; collect with collect_subagent.",
                        result))
+        } else if (is.null(result)) {
+            ok(sprintf(
+                       "Subagent %s still working after %s s; collect with collect_subagent.",
+                       id, format(timeout)
+                ))
+        } else {
+            .subagent_tool_result(result)
         }
     }, error = function(e) {
         err(paste("Query failed:", e$message))
@@ -1103,7 +1478,7 @@ tool_collect_subagent <- function(id, wait = TRUE, timeout = 60) {
             ok(sprintf("Subagent %s still working; try collect_subagent again.",
                        id))
         } else {
-            ok(result)
+            .subagent_tool_result(result)
         }
     }, error = function(e) {
         err(paste("Collect failed:", e$message))
@@ -1147,6 +1522,31 @@ tool_kill_subagent <- function(id) {
 register_builtin_skills <- function() {
     # File tools
     register_skill_from_fn("read_file", tool_read_file)
+    register_skill(skill_spec(
+                              "skill_instructions",
+                              paste(
+                                    "Read one instruction document from this session's immutable",
+                                    "catalog, or a snapshotted relative supporting resource."
+            ),
+                              params = list(
+                id = list(
+                          type = "string",
+                          description = "Exact instruction id shown in the catalog.",
+                          required = TRUE
+                ),
+                resource = list(
+                                type = "string",
+                                description = paste(
+                        "Optional relative supporting-file path.",
+                        "Omit to read SKILL.md."
+                    ),
+                                required = FALSE
+                )
+            ),
+                              handler = function(args, ctx) {
+        tool_skill_instructions(args$id, args$resource %||% NULL, ctx = ctx)
+    }
+        ))
     register_skill_from_fn("write_file", tool_write_file)
     register_skill_from_fn("replace_in_file", tool_replace_in_file)
     register_skill_from_fn("list_files", tool_list_files)
@@ -1155,8 +1555,67 @@ register_builtin_skills <- function() {
     register_skill_from_fn("grep_files", tool_grep_files)
 
     # Code execution
-    register_skill_from_fn("run_r", tool_run_r)
-    register_skill_from_fn("read_handle", tool_read_handle)
+    # `envir` remains a host-owned capability boundary on tool_run_r(). The
+    # model may request a timeout, but the session dispatcher validates it
+    # against a host-owned maximum and only supervised worker mode can enforce
+    # it safely.
+    register_skill(skill_spec(
+                              "run_r",
+                              paste("Execute R code in the persistent host session.",
+                                    "Returns what the code prints (cat, print, messages,",
+                                    "warnings) followed by the value of the last expression.",
+                                    "Assignments survive subsequent run_r calls; large results",
+                                    "are returned as reusable handles."),
+                              params = list(code = list(
+                    type = "string",
+                    description = "R code to execute.",
+                    required = TRUE
+                ), timeout = list(
+                                  type = "number",
+                                  description = paste(
+                        "Optional wall-clock seconds for supervised execution.",
+                        "The host may impose a lower maximum."
+                    ),
+                                  required = FALSE
+                )),
+                              handler = function(args, ctx) {
+        .tool_run_r_session(args$code, args$timeout %||% NULL, ctx)
+    }
+        ))
+    register_skill(skill_spec(
+                              "read_handle",
+                              paste("Inspect a large value previously returned as a handle,",
+                                    "or a tool result that was cut for length.",
+                                    "Search it with op = \"grep\", page through it with",
+                                    "op = \"lines\"."),
+                              params = list(
+                handle = list(type = "string",
+                              description = "Handle id, e.g. .h_001 or .o_001.",
+                              required = TRUE),
+                op = list(type = "string",
+                          description = paste("Inspection: str, head, summary, print,",
+                        "grep (lines matching `pattern`), or lines (`start` to `end`)."),
+                          enum = c("str", "head", "summary", "print", "grep",
+                                   "lines"),
+                          required = FALSE),
+                pattern = list(type = "string",
+                               description = paste("For op = \"grep\": a regular expression,",
+                        "matched without regard to case."),
+                               required = FALSE),
+                start = list(type = "number",
+                             description = "For op = \"lines\": first line wanted. Default 1.",
+                             required = FALSE),
+                end = list(type = "number",
+                           description = paste("For op = \"lines\": last line wanted.",
+                        "At most 40 lines come back."),
+                           required = FALSE)
+            ),
+                              handler = function(args, ctx) {
+        .tool_read_handle_session(args$handle, args$op %||% "str", ctx,
+                                  pattern = args$pattern, start = args$start,
+                                  end = args$end)
+    }
+        ))
     register_skill_from_fn("run_r_script", tool_run_r_script)
 
     # Shell tool: prefer bash everywhere for cross-OS consistency. On
@@ -1207,12 +1666,23 @@ register_builtin_skills <- function() {
     register_skill_from_fn("git_diff", tool_git_diff, available = .in_git_repo)
     register_skill_from_fn("git_log", tool_git_log, available = .in_git_repo)
 
+    # Continual harness: one-line lesson capture, approval-gated via
+    # the per-tool permissions default ("ask") in load_config().
+    register_skill_from_fn("harness_note", tool_harness_note)
+
     # Subagent tools
     register_skill_from_fn("spawn_subagent", tool_spawn_subagent)
     register_skill_from_fn("query_subagent", tool_query_subagent)
     register_skill_from_fn("collect_subagent", tool_collect_subagent)
     register_skill_from_fn("list_subagents", tool_list_subagents)
     register_skill_from_fn("kill_subagent", tool_kill_subagent)
+
+    # Talker job tools: exposed only to talker-mode sessions
+    # (see .talker_filter_tools).
+    register_skill_from_fn("delegate", tool_delegate)
+    register_skill_from_fn("job_status", tool_job_status)
+    register_skill_from_fn("job_cancel", tool_job_cancel)
+    register_skill_from_fn("job_resume", tool_job_resume)
 
     # Plan mode: exit_plan_mode is registered always but exposed in the
     # tool list only when session$plan_mode is TRUE

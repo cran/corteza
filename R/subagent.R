@@ -31,6 +31,39 @@
 .subagent_spend_retired$query_count <- 0L
 .subagent_spend_retired$n_agents <- 0L
 .subagent_spend_retired$cost_missing <- FALSE
+# Carried through retirement like every other total. Without it, killing
+# a subagent would make the process-wide unpriced-token count go *down*,
+# and any consumer differencing it across a window would read the drop
+# as "this window's spend was priced". Auto runs kill their monitor on
+# the way out, so this fires on every single run.
+.subagent_spend_retired$missing_tokens <- 0
+
+#' Clear the subagent registry and the retired-spend accumulator.
+#'
+#' Test-support only; nothing in the runtime resets spend, which is
+#' reported per process run. It lives here rather than in each test file
+#' because three of them had hand-rolled their own copy, and when
+#' `missing_tokens` was added none of the three learned about it -- so
+#' the field leaked across tests while every local reset still looked
+#' complete. One definition next to the fields it clears cannot drift
+#' that way.
+#'
+#' @return Invisible TRUE.
+#' @noRd
+subagent_spend_reset <- function() {
+    reg <- .subagent_registry
+    rm(list = ls(reg), envir = reg)
+    r <- .subagent_spend_retired
+    r$cost <- 0
+    r$input_tokens <- 0L
+    r$output_tokens <- 0L
+    r$total_tokens <- 0L
+    r$query_count <- 0L
+    r$n_agents <- 0L
+    r$cost_missing <- FALSE
+    r$missing_tokens <- 0
+    invisible(TRUE)
+}
 
 #' Per-process monotonic counter for short subagent ids.
 #'
@@ -131,16 +164,72 @@ resolve_subagent_id <- function(input) {
 #'   child of the CLI parent). Used by recursion in
 #'   [subagent_turn_prompt()] to avoid archiving past the configured
 #'   depth_cap.
+#' @param web_search Logical or NULL. Provider-native (server-side) web
+#'   search for the child. NULL (default) preserves the historical
+#'   behavior: [new_session()] leaves it unset and [turn()] enables it
+#'   for providers that support it. Pass FALSE for a child that must
+#'   have no outbound channel -- dropping `web_search` from
+#'   `tools_filter` does not achieve that on its own, because the
+#'   provider's own search tool is injected by `llm.api::agent`, not
+#'   drawn from the skill registry.
+#' @param allowed_paths Character or NULL. Confines this child's file
+#'   tools to the given roots for the life of the process. NULL (default)
+#'   leaves it unrestricted, as before. A read-only `tools_filter` is not
+#'   a filesystem sandbox on its own -- `read_file` reaches anything the
+#'   process can -- so a child that should only see its project needs
+#'   this as well.
+#' @param channel Policy channel for the child's tool calls: "console"
+#'   (default, the historical behavior), "cli", or "matrix". A job worker
+#'   passes its originating session's channel so work delegated from a
+#'   Matrix room is judged by the Matrix column of the policy tensor, not
+#'   the looser console one.
+#' @param reasoning_effort,thinking_budget_tokens Reasoning settings for
+#'   the child's session, as in [new_session()]. NULL (default) leaves
+#'   them to the child's config and the provider's defaults, as before.
+#'   A job worker passes the ones configured for its model.
+#' @param thinking Character or NULL. The Anthropic `thinking.type` the
+#'   child's requests carry, such as `"adaptive"` or `"between_tools"`.
+#'   NULL (default) sends no `thinking` field.
+#' @param context_edit Context editing override, as in [new_session()].
 #' @return Invisible TRUE.
 #' @keywords internal
 #' @export
 subagent_turn_init <- function(provider = "anthropic", model = NULL,
                                tools_filter = NULL, system = NULL,
-                               max_turns = 10L, depth = 0L, plan_mode = FALSE) {
-    session <- new_session(channel = "console", provider = provider,
+                               max_turns = 10L, depth = 0L,
+                               plan_mode = FALSE, web_search = NULL,
+                               allowed_paths = NULL, channel = "console",
+                               reasoning_effort = NULL,
+                               thinking_budget_tokens = NULL,
+                               thinking = NULL, context_edit = NULL) {
+    if (!is.null(allowed_paths)) {
+        # Process-level and read by tool_config() (R/tool-impl.R). Safe
+        # to set globally here: this runs inside the child's own R
+        # process, which exists only to serve this one subagent.
+        options(corteza.allowed_paths = as.character(allowed_paths))
+    }
+    instruction_catalog <- build_instruction_catalog(getwd())
+    instruction_header <- if (instruction_reader_selected(tools_filter)) {
+        format_instruction_catalog(instruction_catalog)
+    } else {
+        ""
+    }
+    if (nzchar(instruction_header)) {
+        system <- paste(c(system, instruction_header), collapse = "\n\n")
+    }
+    session <- new_session(channel = channel, provider = provider,
                            tools_filter = tools_filter, system = system,
                            max_turns = as.integer(max_turns),
-                           plan_mode = isTRUE(plan_mode))
+                           plan_mode = isTRUE(plan_mode),
+                           web_search = web_search,
+                           reasoning_effort = reasoning_effort,
+                           thinking_budget_tokens = thinking_budget_tokens,
+                           context_edit = context_edit)
+    session$thinking <- .check_thinking(thinking,
+                                        "subagent_turn_init(thinking=)")
+    session$is_subagent <- TRUE
+    session$config <- load_config(getwd())
+    session$instruction_catalog <- instruction_catalog
     if (!is.null(model)) {
         session$model_map$cloud <- model
     }
@@ -160,7 +249,16 @@ subagent_turn_init <- function(provider = "anthropic", model = NULL,
 #' @keywords internal
 #' @export
 subagent_turn_set_id <- function(id) {
-    .subagent_state$subagent_id <- as.character(id)
+    id <- as.character(id)
+    .subagent_state$subagent_id <- id
+    # The child's journal (R/journal.R) lives beside its transcript in
+    # its own agent bucket. Installed here because the id names it;
+    # seeding and turns come after.
+    if (!is.null(.subagent_state$session)) {
+        journal_install(.subagent_state$session,
+                        dir = file.path(sessions_dir(paste0("subagent-", id)),
+                                        paste0(id, ".journal")))
+    }
     invisible(TRUE)
 }
 
@@ -184,6 +282,7 @@ subagent_seed_history <- function(history) {
     # touch it.
     .subagent_state$kind <- "archive_holder"
     .subagent_state$protected_history_len <- length(history)
+    journal_snapshot(.subagent_state$session)
     invisible(TRUE)
 }
 
@@ -204,7 +303,10 @@ subagent_seed_history <- function(history) {
 #' name only, no expression evaluation.
 #' @return list(found = logical, value = resolved object or NULL)
 #' @noRd
-.resolve_return_value <- function(name) {
+.resolve_return_value <- function(name, session = NULL) {
+    if (identical(.run_r_mode(list(session = session)), "worker")) {
+        return(.run_r_worker_return_value(session, name))
+    }
     if (name %in% list_handles()) {
         return(list(found = TRUE, value = get_handle(name)))
     }
@@ -213,6 +315,99 @@ subagent_seed_history <- function(history) {
                     value = get(name, envir = globalenv(), inherits = FALSE)))
     }
     list(found = FALSE, value = NULL)
+}
+
+#' Structured handoff protocol requested from a subagent.
+#' @noRd
+.SUBAGENT_HANDOFF_INSTRUCTION <- paste(
+                                       "The parent requested a structured handoff. End your final reply with exactly",
+                                       "one <corteza_handoff> JSON object containing these keys:",
+                                       "status ('done', 'partial', or 'blocked'), notes, findings, concerns,",
+                                       "deviations, open_questions, and feedback. Every field after status is an",
+                                       "array of concise strings; use [] when empty. Put ordinary prose before the",
+                                       "trailer, and do not put Markdown fences around the JSON."
+)
+
+#' Normalize a structured subagent report without trusting its shape.
+#' @noRd
+.normalize_subagent_report <- function(x) {
+    if (!is.list(x)) {
+        stop("handoff must be a JSON object", call. = FALSE)
+    }
+    status <- x$status %||% ""
+    if (!is.character(status) || length(status) != 1L || is.na(status) ||
+        !status %in% c("done", "partial", "blocked")) {
+        stop("handoff status must be done, partial, or blocked", call. = FALSE)
+    }
+    fields <- c("notes", "findings", "concerns", "deviations",
+                "open_questions", "feedback")
+    out <- list(status = status)
+    for (field in fields) {
+        value <- x[[field]] %||% list()
+        if (is.list(value)) {
+            value <- unlist(value, recursive = FALSE, use.names = FALSE)
+        }
+        if (!is.atomic(value)) {
+            stop("handoff field '", field, "' must be an array of strings",
+                 call. = FALSE)
+        }
+        value <- as.character(value)
+        value <- value[!is.na(value) & nzchar(trimws(value))]
+        out[[field]] <- unname(value)
+    }
+    out
+}
+
+#' Extract an optional terminal <corteza_handoff> JSON trailer.
+#' @noRd
+.extract_subagent_report <- function(reply, requested = FALSE) {
+    reply <- paste(as.character(reply %||% ""), collapse = "\n")
+    if (!isTRUE(requested)) {
+        return(list(reply = reply, report = NULL, report_error = NULL))
+    }
+    pattern <- paste0("(?s)\\s*<corteza_handoff>\\s*(\\{.*\\})\\s*",
+                      "</corteza_handoff>\\s*$")
+    match <- regexec(pattern, reply, perl = TRUE)
+    parts <- regmatches(reply, match)[[1L]]
+    if (length(parts) != 2L) {
+        return(list(reply = reply, report = NULL,
+                    report_error = "The child omitted the requested structured handoff."))
+    }
+    parsed <- tryCatch(
+                       jsonlite::fromJSON(parts[2L], simplifyVector = FALSE),
+                       error = function(e) e
+    )
+    if (inherits(parsed, "error")) {
+        return(list(reply = reply, report = NULL,
+                    report_error = paste("Invalid structured handoff:",
+                    conditionMessage(parsed))))
+    }
+    report <- tryCatch(.normalize_subagent_report(parsed),
+                       error = function(e) e)
+    if (inherits(report, "error")) {
+        return(list(reply = reply, report = NULL,
+                    report_error = paste("Invalid structured handoff:",
+                    conditionMessage(report))))
+    }
+    clean <- sub(pattern, "", reply, perl = TRUE)
+    list(reply = trimws(clean), report = report, report_error = NULL)
+}
+
+#' Render a structured handoff for the parent model.
+#' @noRd
+.format_subagent_report <- function(report) {
+    lines <- c("Structured handoff", paste0("Status: ", report$status))
+    labels <- c(notes = "Notes", findings = "Findings",
+                concerns = "Concerns", deviations = "Deviations",
+                open_questions = "Open questions", feedback = "Feedback")
+    for (field in names(labels)) {
+        values <- report[[field]] %||% character()
+        if (length(values)) {
+            lines <- c(lines, paste0(labels[[field]], ":"),
+                       paste0("- ", values))
+        }
+    }
+    paste(lines, collapse = "\n")
 }
 
 #' Format a subagent turn result for the parent.
@@ -227,17 +422,25 @@ subagent_seed_history <- function(history) {
 #' @noRd
 .format_subagent_reply <- function(res) {
     reply <- as.character(res$reply %||% "")
+    blocks <- reply[nzchar(reply)]
     if (isTRUE(res$final_found)) {
         stashed <- with_handle(res$final)
         block <- sprintf("%s\n\n[stored as %s]", stashed$summary,
                          stashed$handle)
-        return(paste(c(reply[nzchar(reply)], block), collapse = "\n\n"))
+        blocks <- c(blocks, block)
     }
     if (!is.null(res$final_note)) {
-        return(paste(c(reply[nzchar(reply)], res$final_note),
-                     collapse = "\n\n"))
+        blocks <- c(blocks, res$final_note)
     }
-    reply
+    if (!is.null(res$report)) {
+        blocks <- c(blocks, .format_subagent_report(res$report))
+    } else if (!is.null(res$report_error)) {
+        blocks <- c(blocks, paste("Structured handoff warning:",
+                                  res$report_error))
+    }
+    out <- paste(blocks, collapse = "\n\n")
+    attr(out, "corteza_report") <- res$report
+    out
 }
 
 #' Forward a prompt to the child-side turn session.
@@ -251,34 +454,46 @@ subagent_seed_history <- function(history) {
 #'   set, after the turn the child resolves it (handle store, then
 #'   globalenv) and ships the value back as `$final` so the parent can
 #'   stash it by handle. A bad or unresolved name yields `$final_note`.
+#' @param report Logical. Ask the child for a structured completion handoff
+#'   containing status, findings, concerns, deviations, questions, and feedback.
 #' @return A list with `$reply` (character, the LLM reply text),
 #'   `$usage` (list with `input_tokens`, `output_tokens`, `total_tokens`,
-#'   and optionally `cost` -- provider-dependent), and, when
+#'   and optionally `cost` -- provider-dependent). `$termination` records
+#'   whether the turn finished, stopped incomplete, or was cancelled, with
+#'   a machine-readable reason. When
 #'   `return_name` is set, `$final` (the resolved value) or
-#'   `$final_note` (why nothing was returned). Callers extract the
+#'   `$final_note` (why nothing was returned). When `report = TRUE`,
+#'   `$report` is the validated structured handoff or `$report_error`
+#'   explains why the child did not provide one. Callers extract the
 #'   reply and accumulate usage into the parent-side registry.
 #' @keywords internal
 #' @export
-subagent_turn_prompt <- function(prompt, return_name = NULL) {
+subagent_turn_prompt <- function(prompt, return_name = NULL, report = FALSE) {
     if (is.null(.subagent_state$session)) {
         stop("Subagent turn session not initialized", call. = FALSE)
     }
     pre_len <- length(.subagent_state$session$history %||% list())
-    result <- turn(prompt, .subagent_state$session)
+    mark <- journal_mark(.subagent_state$session)
+    query <- if (isTRUE(report)) {
+        paste(prompt, .SUBAGENT_HANDOFF_INSTRUCTION, sep = "\n\n")
+    } else {
+        prompt
+    }
+    result <- turn(query, .subagent_state$session)
+    extracted <- .extract_subagent_report(result$reply, requested = report)
 
-    # Persist this turn's history slice to disk. The transcript is the
-    # durable record (disk space is cheap); the in-memory history will
-    # be compacted later. Each entry is appended as a separate line so
-    # tool calls and results stay distinguishable.
-    post_len_disk <- length(.subagent_state$session$history %||% list())
-    if (post_len_disk > pre_len && !is.null(.subagent_state$subagent_id)) {
+    # Append this turn's entries to the child's readable transcript, one
+    # line each so tool calls and results stay distinguishable. The
+    # journal (R/journal.R) is the durable record, and it knows what the
+    # turn added even when a compaction inside it rewrote the live
+    # history; before/after lengths do not.
+    disk_slice <- journal_turn_slice(.subagent_state$session, mark, pre_len)
+    if (length(disk_slice) > 0L && !is.null(.subagent_state$subagent_id)) {
         sub_id <- .subagent_state$subagent_id
         agent_id <- paste0("subagent-", sub_id)
         disk_sess <- list(sessionId = sub_id, cwd = getwd(),
                           provider = .subagent_state$session$provider,
                           model = .subagent_state$session$model_map$cloud)
-        disk_slice <- .subagent_state$session$history[
-            (pre_len + 1L):post_len_disk]
         for (entry in disk_slice) {
             role <- entry$role %||% "user"
             body <- archival_history_entry_to_text(entry)
@@ -286,6 +501,7 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
                      transcript_append(disk_sess, role, body,
                                        provider = disk_sess$provider,
                                        model = disk_sess$model,
+                                       audit = result$audit,
                                        agent_id = agent_id),
                      error = function(e) {
                 log_event("subagent_transcript_append_failed",
@@ -299,12 +515,15 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
     arc_cfg <- cfg$archival %||% list()
     depth <- .subagent_state$depth %||% 0L
     cap <- arc_cfg$trigger$depth_cap %||% 3L
-    if (isTRUE(arc_cfg$enabled) && depth < cap) {
-        post_len <- length(.subagent_state$session$history %||% list())
-        if (post_len > pre_len) {
-            slice <- .subagent_state$session$history[(pre_len + 1L):post_len]
-            max_turns_hit <- isTRUE(grepl("Max turns",
-                    as.character(result$reply %||% "")))
+    # Not after a compaction inside the turn: it already compressed the
+    # work, and pre_len no longer points into the live history.
+    if (!.context_edit_pure(.subagent_state$session) &&
+        isTRUE(arc_cfg$enabled) && depth < cap &&
+        !journal_rewritten_since(.subagent_state$session, mark,
+                                 ignore = c("context_index", "context_edit_rejected"))) {
+        slice <- journal_turn_slice(.subagent_state$session, mark, pre_len)
+        if (length(slice) > 0L) {
+            max_turns_hit <- identical(result$termination$reason, "max_turns")
             if (archival_should_trigger(arc_cfg, slice, depth = depth,
                                         max_turns_hit = max_turns_hit) &&
                 !archival_slice_has_unfinished_tool_use(slice)) {
@@ -319,7 +538,8 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
                     config = cfg
                 )
                 if (!is.null(archived)) {
-                    keep <- .subagent_state$session$history[seq_len(pre_len)]
+                    live <- .subagent_state$session$history
+                    keep <- live[seq_len(pre_len)]
                     user_msg <- slice[[1]]
                     if (!identical(user_msg$role %||% "", "user")) {
                         user_msg <- list(role = "user", content = prompt)
@@ -331,9 +551,25 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
                             archived$subagent_id, archived$summary
                         )
                     )
-                    .subagent_state$session$history <- c(
-                        keep, list(user_msg), list(archived_assistant)
-                    )
+                    collapsed <- c(keep, list(user_msg),
+                                   list(archived_assistant))
+                    # Journal first (R/journal.R). A failed write keeps
+                    # the turn and releases the holder nothing would
+                    # reference.
+                    journaled <- tryCatch({
+                        journal_rewrite(.subagent_state$session, live,
+                                        collapsed, reason = "archival",
+                                        summary = archived$summary)
+                        TRUE
+                    }, error = function(e) {
+                        log_event("archival_failed", phase = "journal",
+                                  error = conditionMessage(e), level = "warn")
+                        try(subagent_kill(archived$subagent_id), silent = TRUE)
+                        FALSE
+                    })
+                    if (journaled) {
+                        .subagent_state$session$history <- collapsed
+                    }
                 }
             }
         }
@@ -366,7 +602,7 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
                                   "return_name '%s' is not a simple name or .h_NNN handle; no value returned.",
                                   as.character(return_name)[1])
         } else {
-            resolved <- .resolve_return_value(return_name)
+            resolved <- .resolve_return_value(return_name, .subagent_state$session)
             if (resolved$found) {
                 final <- resolved$value
                 final_found <- TRUE
@@ -378,27 +614,65 @@ subagent_turn_prompt <- function(prompt, return_name = NULL) {
         }
     }
 
-    list(reply = as.character(result$reply %||% ""),
+    list(reply = extracted$reply,
          usage = result$usage %||% list(),
-         final = final, final_found = final_found, final_note = final_note)
+         audit = result$audit,
+         termination = result$termination,
+         final = final, final_found = final_found, final_note = final_note,
+         report = extracted$report, report_error = extracted$report_error)
 }
 
 SUBAGENT_DEFAULTS <- list(
                           max_concurrent = 3L,
                           timeout_minutes = 30L,
                           allow_nested = FALSE,
-                          default_tools = c("read_file", "grep_files", "r_help", "web_search",
-        "fetch_url")
+                          default_tools = c("read_file", "skill_instructions", "grep_files",
+        "r_help", "web_search", "fetch_url")
 )
 
 SUBAGENT_PRESETS <- list(
-                         investigate = c("read_file", "grep_files", "r_help", "web_search",
-        "fetch_url"),
-                         work = c("read_file", "grep_files", "r_help", "web_search", "fetch_url",
+                         investigate = c("read_file", "skill_instructions", "grep_files",
+        "r_help", "web_search", "fetch_url"),
+                         work = c("read_file", "skill_instructions", "grep_files",
+                                  "r_help", "web_search", "fetch_url",
                                   "bash", "write_file", "replace_in_file", "list_files",
                                   "git_status", "git_diff", "git_log", "run_r"),
-                         minimal = c("read_file", "grep_files")
+                         minimal = c("read_file", "skill_instructions", "grep_files"),
+                         # Hall monitor: supervises an unattended auto run. Read-only
+                         # by construction -- a supervisor that can act is not a
+                         # supervisor. No web_search/fetch_url either: it reads the
+                         # worker's transcript, which is attacker-influenceable text,
+                         # so it gets no outbound channel. See PRESET_WEB_SEARCH below;
+                         # the tool list alone does not deliver that. `read_handle`
+                         # reads the rest of one of its own results that was cut for
+                         # length, from its own process's store.
+                         monitor = c("read_file", "skill_instructions", "grep_files", "list_files",
+                                     "git_status", "git_diff", "git_log", "read_handle")
 )
+
+# Provider-native (server-side) web search per preset.
+#
+# Dropping "web_search" from a preset's tool list does NOT take web
+# access away. subagent_turn_init() builds its session without a
+# web_search argument, so .session_web_search() (R/turn.R) falls through
+# to TRUE and llm.api::agent injects the provider's own search tool.
+# Every subagent spawned before this table existed had web search on
+# regardless of its preset.
+#
+# NULL (the default for a preset not listed here) keeps that behavior:
+# investigate and work want search. The monitor is the one grant where
+# "read-only" has to mean no network, so it is pinned FALSE.
+PRESET_WEB_SEARCH <- list(monitor = FALSE)
+
+# Presets confined to the project directory.
+#
+# A read-only tool list is not a filesystem sandbox: read_file will
+# happily read any path the process can reach. Presets named here get
+# `allowed_paths` pinned to the parent's cwd inside the child process,
+# so the monitor can inspect the work it is supervising and nothing
+# else. TRUE means "confine to cwd"; absent means unconfined, which is
+# the historical behavior for every other preset.
+PRESET_CONFINED <- list(monitor = TRUE)
 
 #' Get subagent configuration.
 #' @param config Config list from load_config().
@@ -474,7 +748,10 @@ subagent_session_key <- function(parent_key) {
 #'   `web_search`, `fetch_url`. `"work"`: investigate + `bash`,
 #'   `write_file`, `replace_in_file`, `list_files`, `git_status`,
 #'   `git_diff`, `git_log`, `run_r`. `"minimal"`: `read_file`,
-#'   `grep_files`.
+#'   `grep_files`. `"monitor"`: the read-only hall monitor used to
+#'   supervise unattended auto runs -- `read_file`, `grep_files`,
+#'   `list_files`, `git_status`, `git_diff`, `git_log`, and
+#'   provider-native web search explicitly off.
 #' @param parent_session Parent session object; read for
 #'   nested-spawning control and session-key derivation.
 #' @param config Config list.
@@ -555,6 +832,7 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
                             "- Do not initiate new conversations\n",
                             "- Be concise in responses\n",
                             "- Report completion clearly\n",
+                            "- Follow the structured handoff protocol when a query requests it\n",
         if (!isTRUE(subcfg$allow_nested))
                             "- You cannot spawn additional subagents\n" else "",
                             "\n## Task\n", task
@@ -563,6 +841,22 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
         preset = preset, tools = tools,
         default_tools = subcfg$default_tools
     )
+    # Provider-native web search is a separate grant from the tool list
+    # (see PRESET_WEB_SEARCH). NULL for every preset but "monitor", which
+    # keeps the historical default for existing presets.
+    child_web_search <- if (is.null(preset)) {
+        NULL
+    } else {
+        PRESET_WEB_SEARCH[[preset]]
+    }
+    # Confined presets get allowed_paths pinned to the project inside the
+    # child. NULL leaves the child unrestricted, as before.
+    child_allowed_paths <- if (!is.null(preset) &&
+        isTRUE(PRESET_CONFINED[[preset]])) {
+        cwd
+    } else {
+        NULL
+    }
     # Default provider/model from parent session when available, else config/env.
     spawn_provider <- parent_session$provider %||%
     getOption("corteza.provider", "anthropic")
@@ -583,7 +877,8 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
     tryCatch(
              session$run(
                          function(cwd, provider, model, tools_filter, system, max_turns,
-                                  depth, id, plan_mode) {
+                                  depth, id, plan_mode, web_search, allowed_paths,
+                                  context_edit) {
         library(corteza)
         corteza::worker_init(cwd = cwd)
         corteza::subagent_turn_init(
@@ -593,14 +888,21 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
                                     system = system,
                                     max_turns = max_turns,
                                     depth = depth,
-                                    plan_mode = plan_mode
+                                    plan_mode = plan_mode,
+                                    web_search = web_search,
+                                    allowed_paths = allowed_paths,
+                                    context_edit = context_edit
         )
         corteza::subagent_turn_set_id(id)
     },
                          list(cwd = cwd, provider = spawn_provider, model = spawn_model,
                               tools_filter = effective_tools, system = system_prompt,
                               max_turns = 10L, depth = child_depth, id = id,
-                              plan_mode = child_plan_mode)
+                              plan_mode = child_plan_mode,
+                              web_search = child_web_search,
+                              allowed_paths = child_allowed_paths,
+                              context_edit = .context_edit_config(config,
+                    parent_session$context_edit %||% parent_session$config$context_edit))
         ),
              error = function(e) {
         try(session$close(), silent = TRUE)
@@ -618,6 +920,11 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
                                      session_key = session_key,
                                      session = session,
                                      task = task,
+                                     audit_role = if (identical(preset, "monitor")) {
+            "monitor"
+        } else {
+            "subagent"
+        },
                                      tools = tools,
                                      model = spawn_model,
                                      provider = spawn_provider,
@@ -638,9 +945,13 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
     # Initialize the durable transcript file. Disk space is cheap;
     # context is expensive -- the in-memory child history may later be
     # compacted, but the on-disk transcript is append-only and never
-    # rewritten. Header writes are idempotent.
+    # rewritten. Header writes are idempotent. A child spawned inside an
+    # auto run (the hall monitor above all) carries that run's id in its
+    # header, so the monitor's transcript joins the run log without any
+    # change to the spawn API.
     tryCatch(
-             transcript_write_header(id, cwd, agent_id = paste0("subagent-", id)),
+             transcript_write_header(id, cwd, agent_id = paste0("subagent-", id),
+                                     extra = list(auto_run_id = parent_session$auto_run_id %||% NULL)),
              error = function(e) {
         log_event("subagent_transcript_init_failed", subagent_id = id,
                   error = conditionMessage(e), level = "warn")
@@ -658,21 +969,28 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
 #' replies, any tool calls it makes resolve against the child's
 #' in-process skill registry, and history accumulates across queries.
 #'
-#' With `wait = FALSE` the call returns immediately after firing the
-#' prompt; the parent collects the reply later with [subagent_collect()].
-#' A subagent can only carry one in-flight async query at a time:
-#' firing a second one while the first is pending raises an error.
+#' Both paths fire the prompt the same way, as a one-shot call on the
+#' child's `callr::r_session`. With `wait = FALSE` the call returns
+#' immediately and the parent collects the reply later with
+#' [subagent_collect()]. With `wait = TRUE` the call collects on the
+#' parent's behalf, but only up to `timeout` seconds: a child that has
+#' not replied by then is left running with the query pending, and the
+#' call returns NULL, so the wait is bounded by default (`Inf` opts out).
+#' A subagent can only carry one in-flight query at a time: firing a
+#' second one while the first is pending raises an error.
 #'
 #' @param id Subagent identifier. Accepts the canonical UUID, a unique
 #'   UUID prefix, or the per-session sequence number printed by
 #'   `subagent_list()` / `/agents`.
 #' @param prompt Prompt to send.
-#' @param wait If TRUE (default), block until the child replies and
-#'   return the reply text. If FALSE, fire the prompt and return the
-#'   canonical id invisibly; caller must collect via
+#' @param wait If TRUE (default), block up to `timeout` seconds for the
+#'   child's reply and return the reply text. If FALSE, fire the prompt
+#'   and return the canonical id invisibly; caller must collect via
 #'   [subagent_collect()].
-#' @param timeout Timeout in seconds (currently advisory; callr-level
-#'   hard timeouts are future work).
+#' @param timeout Maximum seconds to block when `wait = TRUE`; `Inf`
+#'   waits until the child replies. On timeout the query stays pending:
+#'   collect it later with [subagent_collect()] or end it with
+#'   [subagent_kill()].
 #' @param return_name Optional single name or `.h_NNN` handle for a
 #'   value the child should hand back. When set, the child must have
 #'   left the result bound under that name (e.g. via `run_r`); the
@@ -680,9 +998,16 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
 #'   gains a `[stored as .h_NNN]` block referencing it. Requires a
 #'   subagent with `run_r` (the `work` preset). For `wait = FALSE` the
 #'   name is captured now and applied when collected.
-#' @return Reply text (character) when `wait = TRUE`, with a handle
-#'   block appended when `return_name` resolved. Canonical id
-#'   (character, invisibly) when `wait = FALSE`.
+#' @param report Logical. When TRUE, require a structured handoff with
+#'   status, notes, findings, concerns, deviations, open questions, and
+#'   feedback. The ordinary character reply remains the return value;
+#'   the report is rendered into it for model callers and retained in
+#'   its `corteza_report` attribute for R callers.
+#' @return Reply text (character) when `wait = TRUE` and the child
+#'   replied within `timeout`, with a handle block appended when
+#'   `return_name` resolved; NULL (invisibly) when the timeout elapsed
+#'   and the query is still pending. Canonical id (character,
+#'   invisibly) when `wait = FALSE`.
 #' @examples
 #' \dontrun{
 #' # Requires LLM credentials in the child's environment.
@@ -692,7 +1017,7 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
 #' }
 #' @export
 subagent_query <- function(id, prompt, wait = TRUE, timeout = 60L,
-                           return_name = NULL) {
+                           return_name = NULL, report = FALSE) {
     canonical <- resolve_subagent_id(id)
     if (is.null(canonical)) {
         stop("Subagent not found: ", id, call. = FALSE)
@@ -716,38 +1041,55 @@ subagent_query <- function(id, prompt, wait = TRUE, timeout = 60L,
              call. = FALSE)
     }
 
+    if (!is.logical(report) || length(report) != 1L || is.na(report)) {
+        stop("report must be TRUE or FALSE", call. = FALSE)
+    }
+
+    # Refuse a bad timeout before anything is fired: once the call is
+    # in flight the slot is taken, and an NA that slipped through to
+    # poll_process() used to read as "wait forever".
+    .subagent_poll_ms(timeout, wait)
+
+    # Both paths fire the same one-shot call. session$run() has no
+    # timeout, so a sync query used to hold the parent's turn for as
+    # long as the child took; firing with call() and collecting with a
+    # deadline degrades a slow child into a pending query instead.
+    tryCatch(
+             info$session$call(
+                               function(p, rn, rp, origin) {
+        ns <- asNamespace("corteza")
+        get(".audit_with_origin", ns)(get(".subagent_state", ns)$session, origin,
+                               corteza::subagent_turn_prompt(p, rn, rp))
+    },
+                               list(p = prompt, rn = return_name, rp = report,
+                                    origin = list(kind = "subagent", subagent_id = canonical,
+                    role = info$audit_role %||% "subagent",
+                    parent_turn = .audit_runtime$active$ref))
+        ),
+             error = function(e) {
+        stop("Subagent query failed to start: ",
+             conditionMessage(e), call. = FALSE)
+    }
+    )
+    info$pending <- prompt
+    info$pending_started_at <- Sys.time()
+    .subagent_registry[[canonical]] <- info
+
     if (!isTRUE(wait)) {
-        tryCatch(
-                 info$session$call(
-                                   function(p, rn) corteza::subagent_turn_prompt(p, rn),
-                                   list(p = prompt, rn = return_name)
-            ),
-                 error = function(e) {
-            stop("Subagent query failed to start: ",
-                 conditionMessage(e), call. = FALSE)
-        }
-        )
-        info$pending <- prompt
-        info$pending_started_at <- Sys.time()
-        .subagent_registry[[canonical]] <- info
         log_event("subagent_query_async", subagent_id = canonical,
                   prompt_length = nchar(prompt))
         return(invisible(canonical))
     }
 
-    turn_result <- tryCatch(
-                            info$session$run(
-            function(p, rn) corteza::subagent_turn_prompt(p, rn),
-            list(p = prompt, rn = return_name)
-        ),
-                            error = function(e) {
-        stop("Subagent query failed: ", conditionMessage(e), call. = FALSE)
-    })
-    info <- subagent_accumulate_usage(info, turn_result$usage)
-    .subagent_registry[[canonical]] <- info
     log_event("subagent_query", subagent_id = canonical,
               prompt_length = nchar(prompt))
-    .format_subagent_reply(turn_result)
+    reply <- subagent_collect(canonical, wait = TRUE, timeout = timeout)
+    if (is.null(reply)) {
+        log_event("subagent_query_timeout", subagent_id = canonical,
+                  timeout = timeout, level = "warn")
+        return(invisible(NULL))
+    }
+    reply
 }
 
 #' Collect the result of a previously-fired async subagent query.
@@ -762,9 +1104,9 @@ subagent_query <- function(id, prompt, wait = TRUE, timeout = 60L,
 #' @param wait If TRUE (default), block up to `timeout` seconds waiting
 #'   for the child to finish. If FALSE, poll once and return
 #'   immediately.
-#' @param timeout Maximum seconds to block when `wait = TRUE`. On
-#'   timeout the child is left running; caller may collect again later
-#'   or kill explicitly.
+#' @param timeout Maximum seconds to block when `wait = TRUE`; `Inf`
+#'   waits until the child replies. On timeout the child is left
+#'   running; caller may collect again later or kill explicitly.
 #' @return Reply text (character) when ready; NULL when still running.
 #' @examples
 #' \dontrun{
@@ -784,11 +1126,7 @@ subagent_collect <- function(id, wait = TRUE, timeout = 60L) {
     if (is.null(info[["pending"]])) {
         stop("No pending query for subagent ", canonical, call. = FALSE)
     }
-    if (isTRUE(wait)) {
-        timeout_ms <- as.integer(timeout * 1000L)
-    } else {
-        timeout_ms <- 0L
-    }
+    timeout_ms <- .subagent_poll_ms(timeout, wait)
     state <- info$session$poll_process(timeout_ms)
     if (state != "ready") {
         return(invisible(NULL))
@@ -801,6 +1139,11 @@ subagent_collect <- function(id, wait = TRUE, timeout = 60L) {
     info$pending_started_at <- NULL
     if (is.null(msg$error)) {
         info <- subagent_accumulate_usage(info, msg$result$usage)
+        info$usage_source <- "derived"
+        if (!is.null(msg$result$audit)) {
+            info$usage_turns <- c(info$usage_turns %||% list(),
+                                  list(msg$result$audit))
+        }
     }
     .subagent_registry[[canonical]] <- info
     if (!is.null(msg$error)) {
@@ -809,6 +1152,42 @@ subagent_collect <- function(id, wait = TRUE, timeout = 60L) {
     }
     log_event("subagent_collect", subagent_id = canonical)
     .format_subagent_reply(msg$result)
+}
+
+#' Milliseconds for `poll_process()` from a wait/timeout pair.
+#'
+#' Validates first. `timeout` must be one non-negative number of
+#' seconds or `Inf`; anything else (NA, NaN, a string, a negative
+#' value, a vector) is an error rather than a silent fall-through to
+#' processx's `-1` sentinel, which means wait forever. Only `Inf` maps
+#' to that sentinel. A finite value has to fit an integer millisecond
+#' count (about 24.8 days), and one that does not is an error too,
+#' since quietly waiting forever would contradict the bound the caller
+#' asked for. `wait = FALSE` polls once (0 ms).
+#' @param timeout Seconds.
+#' @param wait Logical.
+#' @return Integer milliseconds: 0, a positive count, or -1.
+#' @noRd
+.subagent_poll_ms <- function(timeout, wait = TRUE) {
+    if (!is.numeric(timeout) || length(timeout) != 1L || is.na(timeout) ||
+        timeout < 0) {
+        stop("timeout must be a single non-negative number of seconds, or Inf",
+             call. = FALSE)
+    }
+    max_seconds <- .Machine$integer.max / 1000
+    if (is.finite(timeout) && timeout > max_seconds) {
+        stop(sprintf(
+                     "timeout must be at most %.0f seconds; use Inf to wait without a bound",
+                     floor(max_seconds)
+            ), call. = FALSE)
+    }
+    if (!isTRUE(wait)) {
+        return(0L)
+    }
+    if (!is.finite(timeout)) {
+        return(-1L)
+    }
+    as.integer(timeout * 1000)
 }
 
 #' Kill a subagent.
@@ -869,10 +1248,17 @@ subagent_accumulate_usage <- function(info, usage) {
         usage$input_tokens)
     info$cumulative_output_tokens <- add_int(info$cumulative_output_tokens %||% 0L,
         usage$output_tokens)
+    # Normalized, not the raw field, for the same reason as the main
+    # segment tally in R/spend.R: a provider reporting input and output
+    # without a total would record a priced query as zero tokens and
+    # slip past any token cap reading this.
     info$cumulative_total_tokens <- add_int(info$cumulative_total_tokens %||% 0L,
-        usage$total_tokens)
+        .spend_normalized_tokens(usage))
     if (!is.null(usage$cost) && !is.na(usage$cost)) {
-        prev <- info$cumulative_cost
+        # %||%: every other counter here tolerates an absent field, and
+        # a bare NULL would make is.na() return logical(0) and the `if`
+        # error out rather than treating it as "no cost yet".
+        prev <- info$cumulative_cost %||% NA_real_
         info$cumulative_cost <- if (is.na(prev)) {
             as.numeric(usage$cost)
         } else {
@@ -883,6 +1269,11 @@ subagent_accumulate_usage <- function(info, usage) {
         # (cost-blind provider) makes the running cost a floor, not a
         # precise figure. A zero-token query leaves the flag alone.
         info$cost_missing <- TRUE
+        # Also accumulate the unpriced tokens. The flag is sticky and
+        # process-wide once aggregated, so it cannot answer "was the
+        # spend in *this* window priced" -- a counter can.
+        info$cumulative_missing_tokens <- (info$cumulative_missing_tokens %||%
+            0) + .spend_normalized_tokens(usage)
     }
     info$query_count <- (info$query_count %||% 0L) + 1L
     info
@@ -903,6 +1294,8 @@ subagent_retire_spend <- function(info) {
     r$total_tokens <- r$total_tokens + (info$cumulative_total_tokens %||% 0L)
     r$query_count <- r$query_count + (info$query_count %||% 0L)
     r$n_agents <- r$n_agents + 1L
+    r$missing_tokens <- r$missing_tokens +
+    (info$cumulative_missing_tokens %||% 0)
     cc <- info$cumulative_cost
     if (is.null(cc) || is.na(cc)) {
         if ((info$cumulative_total_tokens %||% 0L) > 0L) {
@@ -930,9 +1323,11 @@ subagent_retire_spend <- function(info) {
 subagent_spend_total <- function() {
     acc <- list(cost = 0, input_tokens = 0L, output_tokens = 0L,
                 total_tokens = 0L, query_count = 0L, n_agents = 0L,
-                cost_missing = FALSE)
+                cost_missing = FALSE, missing_tokens = 0)
     for (id in ls(.subagent_registry)) {
         e <- .subagent_registry[[id]]
+        acc$missing_tokens <- acc$missing_tokens +
+        (e$cumulative_missing_tokens %||% 0)
         acc$input_tokens <- acc$input_tokens + (e$cumulative_input_tokens %||% 0L)
         acc$output_tokens <- acc$output_tokens + (e$cumulative_output_tokens %||% 0L)
         acc$total_tokens <- acc$total_tokens + (e$cumulative_total_tokens %||% 0L)
@@ -957,6 +1352,7 @@ subagent_spend_total <- function() {
     acc$query_count <- acc$query_count + r$query_count
     acc$n_agents <- acc$n_agents + r$n_agents
     acc$cost <- acc$cost + r$cost
+    acc$missing_tokens <- acc$missing_tokens + (r$missing_tokens %||% 0)
     if (isTRUE(r$cost_missing)) {
         acc$cost_missing <- TRUE
     }
@@ -998,7 +1394,10 @@ subagent_live_token_count <- function(info) {
                 list(history = sess$history %||% list()),
                 system_prompt = sess$system, tools = tools),
              limit = if (is.null(model)) NA_integer_ else
-             corteza::context_limit_for_model(model),
+             corteza::context_limit_for_model(
+                model,
+                provider = .subagent_state$session$provider
+            ),
              model = model)
     }),
                        error = function(e) list(tokens = NA_integer_, limit = NA_integer_,

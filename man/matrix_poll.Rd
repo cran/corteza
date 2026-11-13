@@ -1,10 +1,18 @@
 % tinyrox says don't edit this manually, but it can't stop you!
 \name{matrix_poll}
 \alias{matrix_poll}
-\title{One iteration of sync-and-reply}
+\title{Deprecated: use bot_poll()}
 \usage{
-matrix_poll(system = NULL, model = NULL, provider = NULL, tools_filter = NULL,
-            timeout = 0L, sessions = NULL, crypto = NULL)
+matrix_poll(
+  system = NULL,
+  model = NULL,
+  provider = NULL,
+  tools_filter = NULL,
+  timeout = 0L,
+  sessions = NULL,
+  crypto = NULL,
+  hooks = NULL
+)
 }
 \arguments{
 \item{system}{Character or NULL. System prompt override.}
@@ -18,33 +26,27 @@ matrix_poll(system = NULL, model = NULL, provider = NULL, tools_filter = NULL,
 \item{timeout}{Integer. Long-poll timeout in milliseconds. 0 returns
 immediately.}
 
-\item{sessions}{Environment from \code{matrix_new_session_registry()}
+\item{sessions}{Environment from \code{bot_new_session_registry()}
 keyed by room_id, or NULL to build fresh sessions each call.}
 
-\item{crypto}{Optional Matrix crypto context. NULL disables encrypted-event
-handling; matrix_run() supplies a context when E2EE is configured.}
+\item{crypto}{Ignored. Kept so calls written for corteza 0.7.1 still
+run; the chat transport handles encryption now.}
+
+\item{hooks}{Named list of functions or NULL, as validated by
+\code{\link{bot_run_init}}; see its Hooks section. NULL asks the
+host nothing.}
 }
 \value{
-An integer count of messages replied to, invisibly.
+See \code{\link{bot_poll}}.
 }
 \description{
-Fetches new messages across all joined rooms and runs \code{\link{turn}}
-against each. Auto-joins any pending invites the bot has received.
-Replies are sent back to the originating room. On first run there is
-no saved sync token, so this call establishes a baseline and returns
-without processing history.
-}
-\details{
-Pass \code{sessions = NULL} (the default) for a stateless one-shot —
-each incoming message builds a fresh session. Pass a registry created
-by \code{matrix_new_session_registry()} so a long-running
-\code{matrix_run} keeps a separate history per room (conversations
-in different rooms don't cross-contaminate).
-
+Deprecated: use bot_poll()
 }
 \examples{
 \dontrun{
-# Single poll cycle against the configured Matrix homeserver.
-matrix_poll(timeout = 5000L)
+matrix_poll()  # use bot_poll()
 }
+}
+\seealso{
+\code{\link{bot_poll}}
 }

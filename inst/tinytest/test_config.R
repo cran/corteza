@@ -23,7 +23,12 @@ expect_true(isTRUE(config$memory_flush_enabled))
 expect_false(isTRUE(config$legacy_memory_tools_enabled))
 expect_true("write_file" %in% config$dangerous_tools)
 expect_equal(config$port, 7850L)
+expect_equal(config$context_compact_bytes, 900000L)
+expect_equal(config$context_request_buffer_retries, 3L)
 expect_true(grepl("Pre-compaction memory flush", config$memory_flush_prompt))
+expect_equal(config$skill_timeout, 30L)
+expect_equal(config$skill_timeout_max, 1800L)
+expect_equal(config$run_r_mode, "in_process")
 
 # Subagent MCP-exposure defaults: opt-in off, USD cap $5, token cap unset.
 expect_false(isTRUE(config$subagents$expose_over_mcp))

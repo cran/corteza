@@ -78,8 +78,40 @@ normalize_path_for_check <- function(path) {
     # to the base, so the comparison silently fails on Windows.
     # mustWork = FALSE so denied_paths entries that don't exist on the
     # current machine (e.g. ~/.ssh on a fresh VM) still compare cleanly.
+    #
+    # normalizePath() can only resolve symlinks in a path that exists,
+    # and it returns a non-existent path unchanged. That asymmetry breaks
+    # containment wherever an ancestor is a symlink: on macOS /var links
+    # to /private/var, so a check on a not-yet-created file compared an
+    # unresolved path against a resolved base and quietly never matched.
+    # A containment check that stops matching is exactly the silent
+    # failure to avoid -- for allowed_paths it spuriously denies, and for
+    # denied_paths it spuriously permits.
+    #
+    # So resolve against the deepest ancestor that does exist, then
+    # re-attach the part that doesn't. Same technique as .resolve_real()
+    # in R/monitor.R, which needs it for the same reason.
     tryCatch({
-        normalizePath(path, winslash = "/", mustWork = FALSE)
+        cur <- path
+        tail <- character()
+        # Bounded: dirname() reaches "/" (or a drive root) and fixpoints.
+        while (nzchar(cur) && !file.exists(cur)) {
+            tail <- c(basename(cur), tail)
+            parent <- dirname(cur)
+            if (identical(parent, cur)) {
+                break
+            }
+            cur <- parent
+        }
+        if (!nzchar(cur) || !file.exists(cur)) {
+            return(normalizePath(path, winslash = "/", mustWork = FALSE))
+        }
+        base <- normalizePath(cur, winslash = "/", mustWork = FALSE)
+        if (length(tail) > 0L) {
+            paste(c(base, tail), collapse = "/")
+        } else {
+            base
+        }
     }, error = function(e) {
         path
     })
@@ -203,6 +235,89 @@ validate_command <- function(command) {
     }
 
     list(ok = TRUE, message = NULL)
+}
+
+#' Valid approval modes, in order of increasing restriction.
+#' @noRd
+.approval_modes <- c("allow", "ask", "deny")
+
+#' Handle the `/permissions` slash command for both surfaces.
+#'
+#' Bare `/permissions` renders the current settings. `/permissions
+#' <mode>` switches the session's approval mode live, which is the
+#' answer to "I am sitting here and tired of pressing Enter" -- the
+#' alternative was editing JSON and restarting.
+#'
+#' Session-scoped on purpose, same as `/dryrun`: a mode you flipped once
+#' to get through an afternoon should not quietly become the default for
+#' every future run in every repo. The reply names the config file for
+#' anyone who does want it permanent.
+#'
+#' What `allow` does NOT do is worth printing rather than leaving for
+#' someone to discover: [check_safety()] short-circuits before the
+#' config overlay, so credential paths keep prompting whatever this is
+#' set to. A user relaxing approvals should be told exactly what they
+#' kept.
+#'
+#' @param config Config list (read for the current mode and display).
+#' @param arg Character or NULL. Requested mode.
+#' @param cwd Project directory, for the approvals-file line.
+#' @return List with `changed` (logical), `mode` (new mode or NULL), and
+#'   `text` (what to print).
+#' @noRd
+permissions_command <- function(config, arg = NULL, cwd = getwd()) {
+    current <- config$approval_mode %||% "ask"
+    arg <- tolower(trimws(as.character(arg %||% "")[1]))
+    if (is.na(arg)) {
+        arg <- ""
+    }
+
+    if (nzchar(arg) && !arg %in% .approval_modes) {
+        return(list(
+                    changed = FALSE, mode = NULL,
+                    text = sprintf("Unknown approval mode '%s'. Use one of: %s",
+                                   arg, paste(.approval_modes, collapse = ", "))
+            ))
+    }
+
+    if (nzchar(arg)) {
+        detail <- switch(arg,
+                         allow = c(
+                                   "  Dangerous tools run without prompting for this session.",
+                                   "  Credential paths still prompt: safety rules short-circuit",
+                                   "  before config, so this can't waive them."),
+                         ask = "  Dangerous tools prompt before running.",
+                         deny = "  Dangerous tools are refused outright, no prompt.")
+        if (identical(arg, current)) {
+            head_line <- sprintf("Approval mode: %s (unchanged)", arg)
+        } else {
+            head_line <- sprintf("Approval mode: %s (was %s)", arg, current)
+        }
+        return(list(
+                    changed = TRUE, mode = arg,
+                    text = paste(c(
+                                   head_line, detail,
+                                   sprintf("  Permanent: set \"approval_mode\": \"%s\" in %s",
+                            arg, corteza_config_path("config.json"))
+                    ), collapse = "\n")
+            ))
+    }
+
+    approvals_path <- file.path(cwd, ".corteza", "approvals.json")
+    list(
+         changed = FALSE, mode = NULL,
+         text = paste(c(
+                        format_permissions(config),
+                        sprintf("Project approvals: %s",
+                    if (file.exists(approvals_path)) {
+                        approvals_path
+                    } else {
+                        "none"
+                    }),
+                        sprintf("Change for this session: /permissions %s",
+                                paste(.approval_modes, collapse = "|"))
+            ), collapse = "\n")
+    )
 }
 
 #' Format permissions for display

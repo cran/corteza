@@ -78,10 +78,11 @@ resolve_urls <- function(call) {
 
 # Classify the operation class of a tool.
 classify_op <- function(tool_name) {
-    read_tools <- c("read_file", "list_files", "grep_files", "git_log",
-                    "git_diff", "git_status", "web_search", "fetch_url",
-                    "r_help", "installed_packages")
-    write_tools <- c("write_file", "replace_in_file")
+    read_tools <- c("read_file", "read_handle", "skill_instructions",
+                    "list_files", "grep_files", "git_log", "git_diff",
+                    "git_status", "web_search", "fetch_url", "r_help",
+                    "installed_packages")
+    write_tools <- c("write_file", "replace_in_file", "send_room_file")
     exec_tools <- c("bash", "cmd", "run_r", "run_r_script")
 
     if (tool_name %in% read_tools) {
@@ -210,6 +211,16 @@ default_policy <- function(call) {
     data_class <- classify_data(call, call$context)
     op <- classify_op(call$tool %||% "")
     channel <- call$channel %||% "cli"
+
+    # Requester/operator and conversation checks live in job_resume(). This
+    # host operation queues an explicitly requested attempt, whose tool calls
+    # still pass their own policy and supervision. Do not ask to approve the
+    # same task again merely because this orchestration tool is unclassified.
+    # User policy and explicit per-tool ask/deny settings still take precedence.
+    if (identical(call$tool, "job_resume")) {
+        return(list(model = .default_model_route(data_class), approval = "allow",
+                    reason = "default: resume authorization is checked by the job host"))
+    }
 
     approval <- tryCatch(.default_tensor[[data_class]][[op]][[channel]],
                          error = function(e) NULL)

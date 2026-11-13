@@ -61,6 +61,9 @@ load_config <- function(cwd = getwd()) {
     for (name in names(project)) {
         config[[name]] <- project[[name]]
     }
+    if (is.list(global$context_edit) && is.list(project$context_edit)) {
+        config$context_edit <- utils::modifyList(global$context_edit, project$context_edit)
+    }
 
     # Apply defaults
     if (is.null(config$context_files)) {
@@ -86,6 +89,16 @@ load_config <- function(cwd = getwd()) {
     # Auto-compaction threshold (percentage)
     if (is.null(config$context_compact_pct)) {
         config$context_compact_pct <- 90L
+    }
+    # The Codex Responses transport can reject a provider-native history on
+    # serialized request size before the model's token window is full. This is
+    # a wire-size guard, not another token estimate; it is currently applied
+    # only to openai_codex histories by maybe_compact_turn_session().
+    if (is.null(config$context_compact_bytes)) {
+        config$context_compact_bytes <- 900000L
+    }
+    if (is.null(config$context_request_buffer_retries)) {
+        config$context_request_buffer_retries <- 3L
     }
 
     # SOUL.md and USER.md inclusion (passed to saber::agent_context).
@@ -136,11 +149,35 @@ load_config <- function(cwd = getwd()) {
     if (is.null(config$skill_timeout)) {
         config$skill_timeout <- 30L
     }
+    # Host ceiling for supervised run_r calls. A model may request a
+    # different timeout, but it cannot raise this bound. Long-running hosts
+    # with a shorter external lease (ARC, for example) can narrow it per call.
+    if (is.null(config$skill_timeout_max)) {
+        config$skill_timeout_max <- 1800L
+    }
+    # Preserve the historical embedded-globalenv contract by default.
+    # Durable/unattended hosts opt into a private persistent callr worker,
+    # which makes the timeout enforceable without leaking interrupts.
+    if (is.null(config$run_r_mode)) {
+        config$run_r_mode <- "in_process"
+    }
 
     # Dry-run mode (validate tools without executing)
     if (is.null(config$dry_run)) {
         config$dry_run <- FALSE
     }
+
+    # Session journal: the durable provider-native record of a session's
+    # history, kept through every compaction (R/journal.R). Off only
+    # when a config says so.
+    if (is.null(config$journal_enabled)) {
+        config$journal_enabled <- TRUE
+    }
+    config$context_edit <- tryCatch(.context_edit_config(config), error = function(e) {
+        warning(sprintf("Invalid context_edit configuration; disabling context editing: %s",
+                        conditionMessage(e)), call. = FALSE)
+        .context_edit_config()
+    })
 
     # Legacy memory tools (slash commands /remember /recall /flush)
     if (is.null(config$legacy_memory_tools_enabled)) {
@@ -162,6 +199,33 @@ load_config <- function(cwd = getwd()) {
     # Include daily memory logs in context
     if (is.null(config$context_include_memory_logs)) {
         config$context_include_memory_logs <- FALSE
+    }
+
+    # Continual harness: every harness_note write is approval-gated by
+    # default (propose-then-approve), through the same per-tool
+    # permissions overlay /permissions uses.
+    #
+    # harness_auto is the discoverable name for "record lessons
+    # without asking" -- the same thing as setting the harness_note
+    # permission to "allow", which is where it is implemented, so
+    # there is one enforcement path and not two. Notes still land in
+    # the refinements ledger and stay reversible via /refine rollback:
+    # auto means unprompted, not unaccountable. An explicit
+    # permissions entry wins, so a user who set the permission by hand
+    # keeps it.
+    if (is.null(config$harness_auto)) {
+        config$harness_auto <- FALSE
+    }
+    if (is.null(config$permissions)) {
+        config$permissions <- list()
+    }
+    if (is.null(config$permissions[["harness_note"]])) {
+        config$permissions[["harness_note"]] <-
+        if (isTRUE(config$harness_auto)) {
+            "allow"
+        } else {
+            "ask"
+        }
     }
 
     # Rate limits per provider
@@ -204,7 +268,7 @@ load_config <- function(cwd = getwd()) {
     }
     if (is.null(sub$default_tools)) {
         sub$default_tools <- c("base::readLines", "base::writeLines",
-                               "bash", "grep_files")
+                               "bash", "skill_instructions", "grep_files")
     }
     if (is.null(sub$base_port)) {
         sub$base_port <- 7851L

@@ -3,8 +3,22 @@
 \alias{subagent_turn_init}
 \title{Initialize the child-side turn session.}
 \usage{
-subagent_turn_init(provider = "anthropic", model = NULL, tools_filter = NULL,
-                   system = NULL, max_turns = 10L, depth = 0L, plan_mode = FALSE)
+subagent_turn_init(
+  provider = "anthropic",
+  model = NULL,
+  tools_filter = NULL,
+  system = NULL,
+  max_turns = 10L,
+  depth = 0L,
+  plan_mode = FALSE,
+  web_search = NULL,
+  allowed_paths = NULL,
+  channel = "console",
+  reasoning_effort = NULL,
+  thinking_budget_tokens = NULL,
+  thinking = NULL,
+  context_edit = NULL
+)
 }
 \arguments{
 \item{provider}{LLM provider name (see [new_session()]).}
@@ -22,6 +36,39 @@ expose. NULL uses the subagent config defaults.}
 child of the CLI parent). Used by recursion in
 [subagent_turn_prompt()] to avoid archiving past the configured
 depth_cap.}
+
+\item{web_search}{Logical or NULL. Provider-native (server-side) web
+search for the child. NULL (default) preserves the historical
+behavior: [new_session()] leaves it unset and [turn()] enables it
+for providers that support it. Pass FALSE for a child that must
+have no outbound channel -- dropping `web_search` from
+`tools_filter` does not achieve that on its own, because the
+provider's own search tool is injected by `llm.api::agent`, not
+drawn from the skill registry.}
+
+\item{allowed_paths}{Character or NULL. Confines this child's file
+tools to the given roots for the life of the process. NULL (default)
+leaves it unrestricted, as before. A read-only `tools_filter` is not
+a filesystem sandbox on its own -- `read_file` reaches anything the
+process can -- so a child that should only see its project needs
+this as well.}
+
+\item{channel}{Policy channel for the child's tool calls: "console"
+(default, the historical behavior), "cli", or "matrix". A job worker
+passes its originating session's channel so work delegated from a
+Matrix room is judged by the Matrix column of the policy tensor, not
+the looser console one.}
+
+\item{thinking}{Character or NULL. The Anthropic `thinking.type` the
+child's requests carry, such as `"adaptive"` or `"between_tools"`.
+NULL (default) sends no `thinking` field.}
+
+\item{context_edit}{Context editing override, as in [new_session()].}
+
+\item{reasoning_effort,thinking_budget_tokens}{Reasoning settings for
+the child's session, as in [new_session()]. NULL (default) leaves
+them to the child's config and the provider's defaults, as before.
+A job worker passes the ones configured for its model.}
 }
 \value{
 Invisible TRUE.
