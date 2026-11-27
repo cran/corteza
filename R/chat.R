@@ -9,31 +9,12 @@ llm_api_supported_providers <- function() {
     unique(as.character(providers %||% character()))
 }
 
-# Reload llm.api from disk so chat() can pick up newly installed providers
-# without requiring a full R restart.
-# @noRd
-reload_llm_api_namespace <- function() {
-    if ("package:llm.api" %in% search()) {
-        try(detach("package:llm.api", unload = TRUE, character.only = TRUE),
-            silent = TRUE)
-    }
-
-    if ("llm.api" %in% loadedNamespaces()) {
-        try(unloadNamespace("llm.api"), silent = TRUE)
-    }
-
-    requireNamespace("llm.api", quietly = TRUE)
-}
-
-# Ensure the active llm.api namespace supports the requested provider.
+# Ensure the loaded llm.api supports the requested provider. An llm.api
+# installed during the session cannot replace it: corteza imports
+# llm.api, so R will not unload it while corteza is loaded. The message
+# says to restart R.
 # @noRd
 ensure_llm_api_provider <- function(provider) {
-    supported <- llm_api_supported_providers()
-    if (provider %in% supported) {
-        return(invisible(supported))
-    }
-
-    reload_llm_api_namespace()
     supported <- llm_api_supported_providers()
     if (provider %in% supported) {
         return(invisible(supported))
@@ -139,6 +120,13 @@ tool_hint <- function(name, args) {
 #' Run a conversational agent inside your R session. Tools execute as direct
 #' function calls, no MCP server needed.
 #'
+#' A project's own files (its \code{.corteza/} folder, \code{AGENTS.md} or
+#' \code{CLAUDE.md}, and the briefing built from it) load only from a
+#' directory you have trusted. Where the working directory is not trusted
+#' and holds such files, \code{chat()} lists them and asks once before it
+#' starts; \code{/trust} shows the same later. See "Trusted projects" in
+#' \code{vignette("configuration")}.
+#'
 #' @param provider LLM provider: "anthropic", "openai", "moonshot", or
 #'   "ollama".
 #'   Defaults to the saved provider when resuming, otherwise the config value
@@ -149,8 +137,9 @@ tool_hint <- function(name, args) {
 #'   Categories: file, code, r, data, web, git, chat, memory.
 #'   Use "core" for file+code+git, "all" for everything (default).
 #' @param session Session resume control. NULL (default) starts fresh,
-#'   TRUE resumes the latest session, or a character session key to
-#'   resume a specific session.
+#'   TRUE resumes the latest session started in the current directory,
+#'   or a character session key to resume a specific session from any
+#'   directory.
 #' @param max_turns Integer or NULL. Maximum LLM turns per user prompt
 #'   before the loop stops with \code{[Max turns reached]}. NULL (default)
 #'   reads \code{getOption("corteza.max_turns")}, then falls back to the
@@ -192,6 +181,11 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
 
     cwd <- getwd()
 
+    # Trust is decided before anything of the project's is read. chat()
+    # runs only where a person is at the console, so it asks, once,
+    # where the directory holds something a session would load.
+    trust_at_start(cwd, ask = readline)
+
     # Resume / create the on-disk session record so we can persist the
     # transcript and workspace between R sessions.
     session_arg <- session
@@ -199,9 +193,12 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     route <- .session_model_pair(provider, model, config)
     disk_session <- resolve_disk_session(session_arg, route$provider,
         route$model, cwd)
+    resume_note <- NULL
     if (isTRUE(disk_session$resumed)) {
         route <- .session_model_pair(provider, model, config,
                                      saved = disk_session$session)
+        # Read before the resume writes to the session (R/retention.R).
+        resume_note <- retention_resume_note(disk_session$sessionId)
     }
     history <- disk_session$history %||% list()
     resumed_count <- length(history)
@@ -239,10 +236,6 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
         tolower(trimws(ans)) %in% c("", "y", "yes")
     }
 
-    # Workspace setup (session-scoped, resumed from disk when appropriate)
-    ws_enabled <- isTRUE(config$workspace$enabled %||% TRUE)
-    chat_workspace_init(disk_session, ws_enabled, config)
-
     # Register observers: progress printer + trace row per tool call.
     add_observer(turn_session, observer_progress())
     add_observer(turn_session, chat_trace_observer(turn_session))
@@ -254,22 +247,11 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     attr(tool_buf_obs, "kind") <- "tool_buffer"
     add_observer(turn_session, tool_buf_obs)
 
-    # Optional experimental layers -- off by default; opt in via options.
-    if (isTRUE(getOption("corteza.experimental_ce", FALSE))) {
-        ce_init(cwd, config)
-        for (i in seq_along(history)) {
-            ce_index_turn(i, history[[i]]$role, history[[i]]$content %||% "")
-        }
-        on.exit(ce_shutdown(), add = TRUE)
-    }
-    if (isTRUE(getOption("corteza.experimental_heartbeat", FALSE))) {
-        hb_init(config)
-    }
-
     set_log_enabled(FALSE)
     on.exit(set_log_enabled(TRUE), add = TRUE)
 
-    n_tools <- length(skills_as_api_tools(tools))
+    # The tools the session sends, composed now, once (R/request-prefix.R).
+    session_request_parts(turn_session)
     # Resolve a placeholder NULL model to the provider's default name
     # (from llm.api's table) so the banner shows the actual model the
     # agent is about to call, matching the CLI's display.
@@ -284,6 +266,17 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
         sprintf("  %ssession %s%s\n",
                 color$dim, disk_session$sessionId, color$reset)
     }
+    retention_line <- NULL
+    if (!is.null(resume_note)) {
+        retention_line <- sprintf("  %s%s%s\n", color$dim, resume_note,
+                                  color$reset)
+    }
+    # Why nothing was resumed, or where what was resumed comes from.
+    directory_line <- ""
+    if (!is.null(disk_session$note)) {
+        directory_line <- sprintf("  %s%s%s\n", color$dim, disk_session$note,
+                                  color$reset)
+    }
     cat(corteza_startup_banner(
                                version = as.character(utils::packageVersion("corteza")),
                                model = display_model,
@@ -291,6 +284,9 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
         ),
         "\n\n",
         session_line,
+        retention_line,
+        directory_line,
+        "  /guide introduces the settings.\n",
         "\n",
         sep = "")
 
@@ -309,7 +305,6 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
     ctx$disk_session <- disk_session
     ctx$config <- config
     ctx$cwd <- cwd
-    ctx$ws_enabled <- ws_enabled
     ctx$provider <- provider
     ctx$model <- model
     ctx$pending_r_context <- pending_r_context
@@ -322,7 +317,7 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
         # Read provider/model from ctx, not the original locals: /model
         # and /provider mutate ctx, so a later /clear must spin up the
         # fresh session with the current model/provider.
-        fresh <- session_new(ctx$provider, ctx$model, cwd)
+        fresh <- session_new(ctx$provider, ctx$model, cwd, surface = "console")
         list(session = fresh, sessionId = fresh$sessionId, resumed = FALSE)
     }
     ctx$handle_copy <- chat_handle_copy
@@ -341,15 +336,32 @@ chat <- function(provider = NULL, model = NULL, tools = NULL, session = NULL,
 chat_approval_cb <- function(cwd = getwd()) {
     approved <- new.env(parent = emptyenv())
     color <- ansi_colors()
+    # Has the person answered this call for good, "allow always" for its
+    # tool in this session? The credential rule's ask, and leaving plan
+    # mode, are answered each time: an "always" given for the tool does
+    # not answer them, and their prompt offers none. The reviewer
+    # (R/review.R) asks this first, so it never rules on an answer the
+    # person gave.
+    answered <- function(call, decision) {
+        !.person_rule(decision) &&
+        isTRUE(approved[[call$tool %||% ""]])
+    }
 
-    function(call, decision) {
+    cb <- function(call, decision) {
         key <- call$tool %||% ""
-        if (isTRUE(approved[[key]])) {
+        once_only <- .person_rule(decision)
+        if (answered(call, decision)) {
             return(TRUE)
         }
 
-        persistent_label <- "Allow always for this session"
-        lines <- cli_approval_lines(call, decision, cwd = cwd,
+        if (once_only) {
+            persistent_label <- NULL
+        } else {
+            persistent_label <- "Allow always for this session"
+        }
+        lines <- cli_approval_lines(call, decision,
+                                    gate_reason = decision$gate_reason,
+                                    cwd = cwd,
                                     persistent_label = persistent_label,
                                     deny_label = .console_deny_label())
         cat(paste(lines, collapse = "\n"), "\n")
@@ -359,7 +371,7 @@ chat_approval_cb <- function(cwd = getwd()) {
             ans <- ""
         }
         ans <- trimws(ans)
-        if (ans == "") {
+        if (ans == "" || (once_only && ans == "2")) {
             ans <- "1"
         }
         if (ans == "2") {
@@ -380,23 +392,39 @@ chat_approval_cb <- function(cwd = getwd()) {
         }
         ans %in% c("1", "2")
     }
+    attr(cb, "answered") <- answered
+    # A job's prompt keeps "always" the same way, for this session
+    # (R/repl-jobs.R), and prints what this returns.
+    attr(cb, "always") <- function(call) {
+        name <- call$tool %||% ""
+        approved[[name]] <- TRUE
+        sprintf("%s is allowed always in this session.", name)
+    }
+    cb
 }
 
-# Resolve the on-disk session, returning list(session, sessionId, history).
+# Resolve the on-disk session, returning list(session, sessionId, history,
+# resumed, note). `session = TRUE` resumes the latest session started in
+# `cwd`; a key resumes that session wherever it was started. `note` is a
+# line for the person, or NULL: that this directory has no session, or
+# that the one resumed was started somewhere else.
 resolve_disk_session <- function(session_arg, provider, model, cwd) {
     if (is.character(session_arg)) {
         resumed <- session_load(session_arg)
         if (!is.null(resumed)) {
             return(list(session = resumed, sessionId = resumed$sessionId,
                         history = disk_messages_to_history(resumed$messages),
-                        resumed = TRUE))
+                        resumed = TRUE,
+                        note = session_elsewhere_note(resumed, cwd)))
         }
-        fresh <- session_new(provider, model, cwd, session_key = session_arg)
+        fresh <- session_new(provider, model, cwd, session_key = session_arg,
+                             surface = "console")
         return(list(session = fresh, sessionId = fresh$sessionId,
                     history = list(), resumed = FALSE))
     }
+    note <- NULL
     if (isTRUE(session_arg)) {
-        latest <- session_latest()
+        latest <- session_latest(cwd = cwd)
         if (!is.null(latest)) {
             return(list(
                         session = latest,
@@ -405,10 +433,11 @@ resolve_disk_session <- function(session_arg, provider, model, cwd) {
                         resumed = TRUE
                 ))
         }
+        note <- session_none_note(cwd, how = "/sessions all")
     }
-    fresh <- session_new(provider, model, cwd)
+    fresh <- session_new(provider, model, cwd, surface = "console")
     list(session = fresh, sessionId = fresh$sessionId,
-         history = list(), resumed = FALSE)
+         history = list(), resumed = FALSE, note = note)
 }
 
 # Flatten on-disk message blocks into simple {role, content} pairs.
@@ -422,23 +451,6 @@ disk_messages_to_history <- function(messages) {
         }
         list(role = m$role, content = text)
     })
-}
-
-# Load or clear the workspace to match the (possibly resumed) disk session.
-chat_workspace_init <- function(disk_session, ws_enabled, config) {
-    if (isTRUE(disk_session$resumed)) {
-        ws_load(disk_session$sessionId)
-    } else {
-        ws_clear()
-        if (ws_enabled && isTRUE(config$workspace$scan_globalenv %||% TRUE)) {
-            scan_limit <- config$workspace$scan_max_bytes %||% 50e6
-            registered <- ws_scan_globalenv(max_bytes = scan_limit)
-            if (length(registered) > 0L) {
-                cat(sprintf("Workspace: registered %d objects from R session\n",
-                            length(registered)))
-            }
-        }
-    }
 }
 
 # Build a trace observer that records each tool call against the on-disk

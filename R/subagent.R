@@ -229,6 +229,10 @@ subagent_turn_init <- function(provider = "anthropic", model = NULL,
                                         "subagent_turn_init(thinking=)")
     session$is_subagent <- TRUE
     session$config <- load_config(getwd())
+    # The child's own tools (R/tool-table.R), from the same inputs as its
+    # parent's: built in, the user's skills, the config's package tools,
+    # and the project's skills in a trusted directory.
+    session$tool_table <- session_tool_table(getwd(), session$config)
     session$instruction_catalog <- instruction_catalog
     if (!is.null(model)) {
         session$model_map$cloud <- model
@@ -276,6 +280,10 @@ subagent_seed_history <- function(history) {
     if (is.null(.subagent_state$session)) {
         stop("Subagent turn session not initialized", call. = FALSE)
     }
+    # The slice was produced under the parent's system text and tools,
+    # so its thinking blocks would be refused in this conversation
+    # (R/history-replace.R). The entries keep their count.
+    history <- history_strip_thinking(history)$history
     .subagent_state$session$history <- history
     # Mark this child as an archive holder: its seeded history is the
     # whole point of the subagent, so context compaction must not
@@ -556,20 +564,15 @@ subagent_turn_prompt <- function(prompt, return_name = NULL, report = FALSE) {
                     # Journal first (R/journal.R). A failed write keeps
                     # the turn and releases the holder nothing would
                     # reference.
-                    journaled <- tryCatch({
-                        journal_rewrite(.subagent_state$session, live,
-                                        collapsed, reason = "archival",
+                    tryCatch({
+                        history_replace(.subagent_state$session, collapsed,
+                                        reason = "archival", before = live,
                                         summary = archived$summary)
-                        TRUE
                     }, error = function(e) {
                         log_event("archival_failed", phase = "journal",
                                   error = conditionMessage(e), level = "warn")
                         try(subagent_kill(archived$subagent_id), silent = TRUE)
-                        FALSE
                     })
-                    if (journaled) {
-                        .subagent_state$session$history <- collapsed
-                    }
                 }
             }
         }
@@ -768,7 +771,6 @@ subagent_session_key <- function(parent_key) {
 #'     subagent_kill(id)
 #' }
 #' }
-#' @importFrom callr r_session
 #' @export
 subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
                            parent_session = NULL, config = NULL) {
@@ -816,7 +818,8 @@ subagent_spawn <- function(task, model = NULL, tools = NULL, preset = NULL,
 
     # Spin up the child session and initialize corteza inside it.
     session <- tryCatch(
-                        callr::r_session$new(wait = TRUE),
+                        callr::r_session$new(options = callr::r_session_options(user_profile = FALSE),
+                                             wait = TRUE),
                         error = function(e) {
         store_update(session_key, list(status = "failed"))
         stop("Failed to start subagent session: ", conditionMessage(e),
@@ -1110,6 +1113,7 @@ subagent_query <- function(id, prompt, wait = TRUE, timeout = 60L,
 #' @return Reply text (character) when ready; NULL when still running.
 #' @examples
 #' \dontrun{
+#' # Requires LLM credentials in the child's environment.
 #' id <- subagent_spawn("background research")
 #' subagent_query(id, "what's in DESCRIPTION?", wait = FALSE)
 #' # ... do other work ...
@@ -1245,7 +1249,7 @@ subagent_accumulate_usage <- function(info, usage) {
         }
     }
     info$cumulative_input_tokens <- add_int(info$cumulative_input_tokens %||% 0L,
-        usage$input_tokens)
+        .spend_input_tokens(usage))
     info$cumulative_output_tokens <- add_int(info$cumulative_output_tokens %||% 0L,
         usage$output_tokens)
     # Normalized, not the raw field, for the same reason as the main
@@ -1373,8 +1377,8 @@ subagent_live_token_count <- function(info) {
     result <- tryCatch(
                        info$session$run(function() {
         subagent_state <- utils::getFromNamespace(".subagent_state", "corteza")
-        skills_as_api_tools <- utils::getFromNamespace("skills_as_api_tools",
-            "corteza")
+        request_parts <- utils::getFromNamespace("session_request_parts", "corteza")
+        trigger <- utils::getFromNamespace("context_trigger", "corteza")
         sess <- subagent_state$session
         if (is.null(sess)) {
             return(list(tokens = NA_integer_, limit = NA_integer_,
@@ -1385,19 +1389,16 @@ subagent_live_token_count <- function(info) {
         # Without this fallback, child sessions spawned with the
         # default model report `ctx ?` because there's no explicit
         # model name to look up a limit for.
-        model <- sess$model_map$cloud %||%
-        corteza::default_provider_model(sess$provider)
-        tools <- tryCatch(skills_as_api_tools(sess$tools_filter),
-                          error = function(e) NULL)
+        model <- sess$model_map$cloud
+        if (is.null(model)) model <- corteza::default_provider_model(sess$provider)
+        # What the child's next request carries (R/request-prefix.R).
+        parts <- request_parts(sess)
         list(
              tokens = corteza::estimate_live_context_tokens(
-                list(history = sess$history %||% list()),
-                system_prompt = sess$system, tools = tools),
+                list(history = sess$history),
+                system_prompt = parts$system, tools = parts$tools),
              limit = if (is.null(model)) NA_integer_ else
-             corteza::context_limit_for_model(
-                model,
-                provider = .subagent_state$session$provider
-            ),
+             trigger(sess, sess$config, model)$window,
              model = model)
     }),
                        error = function(e) list(tokens = NA_integer_, limit = NA_integer_,
@@ -1459,22 +1460,6 @@ subagent_list <- function() {
     # Sort by seq ascending so the user-visible numbering is stable.
     seqs <- vapply(out, function(a) a$seq %||% 0L, integer(1))
     out[order(seqs)]
-}
-
-#' Clean up expired subagents.
-#' @return Number of subagents cleaned up.
-#' @noRd
-subagent_cleanup <- function() {
-    ids <- ls(.subagent_registry)
-    cleaned <- 0L
-    for (id in ids) {
-        info <- .subagent_registry[[id]]
-        if (Sys.time() > info$timeout) {
-            subagent_kill(id)
-            cleaned <- cleaned + 1L
-        }
-    }
-    cleaned
 }
 
 #' Format subagent list for display.

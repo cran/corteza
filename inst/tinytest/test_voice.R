@@ -361,15 +361,15 @@ expect_error(corteza:::voice_validate_grant(bad), "tls.*insecure")
 # text; a session with no room system still gets the register.
 # ---------------------------------------------------------------
 
-sys <- corteza:::voice_speech_system("You are cornelius.")
-expect_true(startsWith(sys, "You are cornelius.\n\n"))
+sys <- corteza:::voice_speech_system("You are helper.")
+expect_true(startsWith(sys, "You are helper.\n\n"))
 expect_true(grepl("read aloud", sys, fixed = TRUE))
 expect_true(grepl("No markdown", sys, fixed = TRUE))
 # a configured override replaces the default instruction, not the room
 # system
-sys <- corteza:::voice_speech_system("You are cornelius.",
+sys <- corteza:::voice_speech_system("You are helper.",
                                      style = "Speak like a pirate.")
-expect_identical(sys, "You are cornelius.\n\nSpeak like a pirate.")
+expect_identical(sys, "You are helper.\n\nSpeak like a pirate.")
 expect_false(grepl("No markdown", sys, fixed = TRUE))
 # degenerate styles (empty, NA, non-string) fall back to the default
 expect_true(grepl("No markdown",
@@ -606,6 +606,11 @@ local({
     }))
     s1 <- corteza:::voice_room_session(state, "!room:h")
     expect_equal(length(s1$history), 1L)
+    # A call never waits on a summary made for an idle gap, whatever
+    # the config says.
+    expect_equal(s1$context_idle_minutes, 0)
+    expect_equal(corteza:::context_trigger(
+        s1, list(context_idle_minutes = 60L))$idle_minutes, 0)
     s2 <- corteza:::voice_room_session(state, "!room:h")
     # Same session, and the room history was fetched exactly once.
     expect_identical(s1, s2)
@@ -633,7 +638,7 @@ local({
 # cannot hold the synchronous server past the configured timeouts.
 # ---------------------------------------------------------------
 
-if (at_home()) {
+if (at_home() || identical(Sys.getenv("NOT_CRAN"), "true")) {
     local({
         t0 <- Sys.time()
         # 10.255.255.1 is non-routable: the connect stalls until the

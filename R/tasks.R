@@ -48,27 +48,6 @@
     idx >= 1L && idx <= length(tasks)
 }
 
-#' Apply task_create to a session. Replaces any existing task list.
-#' Each new task starts as `pending`.
-#'
-#' Mutates `session$tasks` in place (session is an environment).
-#' Returns the new list-of-list for the caller's logging.
-#' @noRd
-task_create_apply <- function(session, tasks) {
-    if (is.list(tasks)) {
-        tasks <- unlist(tasks, use.names = FALSE)
-    }
-    if (!is.character(tasks) || length(tasks) == 0L) {
-        stop("tasks must be a non-empty character vector", call. = FALSE)
-    }
-    new_list <- lapply(tasks, function(t) {
-        list(text = as.character(t), status = "pending")
-    })
-    session$tasks <- new_list
-    session$tasks_dirty <- TRUE
-    new_list
-}
-
 #' Apply task_update. When promoting a task to `in_progress`, any
 #' other `in_progress` task is auto-demoted to `pending` so the
 #' "exactly one active" invariant holds without rejecting valid
@@ -97,36 +76,17 @@ task_update_apply <- function(session, index, status) {
 }
 
 #' Static "how to use task tools" addendum for the system prompt.
-#' Shown on every turn (even when the list is empty) so the LLM
-#' knows when to bring up the tools in the first place.
+#' Part of the session's fixed system text (R/request-prefix.R), even
+#' when the list is empty, so the LLM knows when to bring up the tools
+#' in the first place.
 #'
-#' `auto = TRUE` swaps the attended ask-first / wait-for-approval flow
-#' for the unattended one: an auto run has no human to answer clarifying
-#' questions or approve a plan, so those steps would hang it. The plan is
-#' accepted automatically (see `.task_read_approval()`), and the model is
-#' told to assume rather than ask.
+#' It describes the attended flow. An /auto run has no human to answer
+#' clarifying questions or approve a plan, so those steps would hang it:
+#' the run's note (.auto_note()) tells the model to assume rather than
+#' ask, and the plan is accepted automatically (see
+#' `.task_read_approval()`).
 #' @noRd
-.task_tool_addendum <- function(auto = FALSE) {
-    if (isTRUE(auto)) {
-        return(paste(
-                     "",
-                     "# Multi-step requests",
-                     "",
-                     paste("For a request that takes more than a couple of",
-                           "steps, track it with a plan: call task_create with",
-                           "a numbered list of concrete steps, then mark each",
-                           "task in_progress when you start it and completed",
-                           "when done via task_update. Keep at most one task",
-                           "in_progress at a time."),
-                     "",
-                     paste("This is an unattended run. Do not stop to ask",
-                           "clarifying questions or to wait for plan approval:",
-                           "make reasonable assumptions and proceed. The plan you",
-                           "propose is accepted automatically. Skip the task list",
-                           "for one-shot or single-step work."),
-                     sep = "\n"
-            ))
-    }
+.task_tool_addendum <- function() {
     paste(
           "",
           "# Multi-step requests",
@@ -153,8 +113,8 @@ task_update_apply <- function(session, index, status) {
     )
 }
 
-#' Format the active task list for the system-prompt addendum the
-#' LLM sees each turn. Plain text; the LLM doesn't see ANSI.
+#' Format the active task list for the model. Plain text; the LLM
+#' doesn't see ANSI.
 #' @noRd
 format_task_list_prompt <- function(tasks) {
     if (length(tasks) == 0L) {
@@ -182,12 +142,31 @@ format_task_list_prompt <- function(tasks) {
     !is.null(channel) && (channel %in% .TASK_SUPPORTED_CHANNELS)
 }
 
-#' Strip task_create / task_update from the tool list on channels
-#' that don't support the approval flow, so the LLM never sees them
-#' in its tool payload.
+#' Whether a session has the task list. 2 things must hold: its channel
+#' has the approval prompt, and its config turns the list on
+#' (`task_list_enabled`, off by default). A session that carries no
+#' config has no task list.
 #' @noRd
-.task_filter_tools <- function(tools, channel) {
-    if (.task_channel_supports_tasks(channel)) {
+.task_list_on <- function(session) {
+    .task_channel_supports_tasks(session$channel) &&
+    isTRUE(session$config$task_list_enabled)
+}
+
+#' What `/tasks` adds for a session with no task list: how to turn it
+#' on. The config is read when a session starts.
+#' @noRd
+.task_list_off_note <- function() {
+    sprintf(paste("The task list is off. Set \"task_list_enabled\": true",
+                  "in %s and start a new session to turn it on."),
+            corteza_config_path("config.json"))
+}
+
+#' Strip task_create / task_update from the tool list of a session
+#' that has no task list, so the LLM never sees them in its tool
+#' payload. `on` is `.task_list_on()` of the session.
+#' @noRd
+.task_filter_tools <- function(tools, on) {
+    if (isTRUE(on)) {
         return(tools)
     }
     is_task <- vapply(tools, function(t) {
@@ -197,20 +176,32 @@ format_task_list_prompt <- function(tasks) {
     tools[!is_task]
 }
 
-#' Compose the system prompt for this turn. Appends the static "how
-#' to use task tools" addendum and any active task list only on
-#' channels that actually expose the task tools, so Matrix sessions
-#' aren't told to call tools that aren't there.
+#' Compose a system prompt with the task text. Appends the static "how
+#' to use task tools" addendum and any task list given only for a
+#' session that has the task list (`on`, `.task_list_on()` of the
+#' session), so no session is told to call tools that aren't there. A
+#' session's prefix passes no tasks: the live list reaches the model as
+#' a note (.task_list_note()).
 #' @noRd
-task_compose_system <- function(base_system, tasks, channel = NULL,
-                                auto = FALSE) {
-    if (!.task_channel_supports_tasks(channel)) {
+task_compose_system <- function(base_system, tasks, on = FALSE) {
+    if (!isTRUE(on)) {
         return(base_system)
     }
     parts <- c(if (!is.null(base_system) && nzchar(base_system)) base_system,
-               .task_tool_addendum(auto = auto),
+               .task_tool_addendum(),
         if (length(tasks) > 0L) format_task_list_prompt(tasks))
     paste(parts, collapse = "\n")
+}
+
+#' The note the next prompt opens with when the task list changed
+#' (R/request-prefix.R): the whole list, or that it is empty.
+#' @noRd
+.task_list_note <- function(tasks) {
+    if (!length(tasks)) {
+        return("[The task list is empty.]")
+    }
+    lines <- sub("^\n# Active tasks\n\n", "", format_task_list_prompt(tasks))
+    paste0("[Task list:\n", lines, "]")
 }
 
 #' Per-status ANSI color, used by both the full-list display and the
@@ -344,6 +335,12 @@ task_tool_intercept <- function(session, name, args) {
     if (!.task_channel_supports_tasks(session$channel)) {
         return(sprintf("[task error: %s is not available on the '%s' channel]",
                        name, session$channel %||% "<unknown>"))
+    }
+    # The same where the config leaves the task list off: a history from
+    # an earlier session may still hold calls the model repeats.
+    if (!.task_list_on(session)) {
+        return(sprintf("[task error: %s is not available: %s]", name,
+                       "the task list is off (task_list_enabled)"))
     }
     palette <- ansi_colors()
     tryCatch({

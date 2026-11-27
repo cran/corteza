@@ -11,7 +11,7 @@
         if (!length(operators)) stop("No configured operator may control this session.")
         managed <- is.null(request$room)
         room <- if (managed) .remote_room(request, cfg, chat, operators) else
-            chat.api::chat_resolve(chat, request$room)
+        chat.api::chat_resolve(chat, request$room)
         if (!is.character(room) || length(room) != 1L ||
                        !nzchar(room)) stop("Room not found.")
         others <- Filter(function(x) !identical(x$id, request$id),
@@ -164,7 +164,12 @@
         body <- bot_ingest_body(m$sender, m$body, attribute_sender = TRUE)
     }
 
-    bot_transcript_add(session, m$id, role, body)
+    # The room's record (R/room-record.R) takes the sender from the event.
+    event <- NULL
+    if (!isTRUE(m$is_self)) {
+        event <- m
+    }
+    bot_transcript_add(session, m$id, role, body, event = event)
     session$seen_event_ids <- bot_remember_event(session$seen_event_ids, m$id)
     .context_room_snapshot(session)
     invisible(NULL)

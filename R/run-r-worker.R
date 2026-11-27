@@ -310,10 +310,12 @@
     if (is.null(extra)) {
         extra <- list()
     } else if (!is.list(extra) || is.null(names(extra)) ||
-               any(!nzchar(names(extra)))) {
+        any(!nzchar(names(extra)))) {
         stop("config$", field, " must be a named list of ",
              "callr::r_session_options() arguments", call. = FALSE)
     }
+    # Worker startup precedes tool approval, even in an untrusted directory.
+    extra$user_profile <- extra$user_profile %||% FALSE
     opts <- do.call(callr::r_session_options, extra)
     # A bare callr worker starts R with only `base` plus callr's own tools on
     # the search path, so common helpers from utils/stats/methods (str, tail,
@@ -415,7 +417,29 @@
                                        "error", timeout, generation, alive
             ))
     }
-    state <- worker$poll_process(as.integer(ceiling(timeout * 1000)))
+    # Wait in slices, asking between them whether the session's turn
+    # should stop (R/tool-stop.R).
+    deadline <- Sys.time() + timeout
+    stopped <- FALSE
+    repeat {
+        left <- as.numeric(difftime(deadline, Sys.time(), units = "secs"))
+        if (left <= 0) {
+            state <- "timeout"
+            break
+        }
+        state <- worker$poll_process(as.integer(min(.TOOL_STOP_POLL_MS,
+                    ceiling(left * 1000))))
+        if (identical(state, "ready")) {
+            break
+        }
+        if (.tool_stop_requested()) {
+            stopped <- TRUE
+            break
+        }
+    }
+    if (stopped) {
+        return(.run_r_worker_stopped(session, worker, timeout, generation))
+    }
     timed_out <- !identical(state, "ready")
     if (timed_out) {
         tryCatch(worker$interrupt(), error = function(e) NULL)
@@ -447,7 +471,7 @@
         if (!is.null(audit) && !is.null(payload$audit_capture)) {
             audit$payload_bytes <- (audit$payload_bytes %||% 0) + payload$audit_capture$bytes
             .audit_append(audit$state, "tool_capture_child", turn_id = audit$id,
-                call_id = audit$current_call, capture = payload$audit_capture)
+                          call_id = audit$current_call, capture = payload$audit_capture)
         }
     })
     if (timed_out || isTRUE(payload$interrupted)) {
@@ -471,6 +495,34 @@
     )
 }
 
+# How long a stopped run_r's worker has to come back from its interrupt.
+.RUN_R_STOP_GRACE_MS <- 5000L
+
+# A stop while run_r ran: the worker is interrupted, as its deadline
+# interrupts it, and keeps its R objects. One that does not come back
+# within .RUN_R_STOP_GRACE_MS (code in C that never checks for an
+# interrupt) is ended, and the objects go with it. The result says which;
+# files the code wrote stay either way.
+.run_r_worker_stopped <- function(session, worker, timeout, generation) {
+    tryCatch(worker$interrupt(), error = function(e) NULL)
+    state <- tryCatch(worker$poll_process(.RUN_R_STOP_GRACE_MS),
+                      error = function(e) "error")
+    if (identical(state, "ready")) {
+        tryCatch(worker$read(), error = function(e) NULL)
+        text <- paste("run_r was cancelled. The worker and its R objects remain;",
+                      "assignments completed before the cancel may persist.")
+        return(.run_r_execution_result(err(text), "cancelled", timeout,
+                                       generation, TRUE))
+    }
+    .run_r_worker_close(session)
+    text <- sprintf(paste("run_r was cancelled and did not stop within %d seconds",
+                          "of the interrupt. The worker was ended, so this",
+                          "session's R objects are lost; files the code wrote",
+                          "stay. The next run_r starts a new worker."),
+                    .RUN_R_STOP_GRACE_MS %/% 1000L)
+    .run_r_execution_result(err(text), "killed", timeout, generation, FALSE)
+}
+
 #' Model-facing run_r dispatcher. Direct tool_run_r() callers retain the
 #' historical in-process contract; sessions may opt into worker mode.
 #' @noRd
@@ -480,6 +532,9 @@
             return(err(paste("A run_r timeout requires run_r_mode = 'worker';",
                              "the in-process compatibility mode cannot enforce it safely.")))
         }
+        # What was there before the session's first call is not its own
+        # to list after a compaction (R/r-objects.R).
+        r_objects_mark(ctx$session)
         return(tool_run_r(code))
     }
     effective <- tryCatch(.run_r_timeout(timeout, ctx), error = function(e) e)

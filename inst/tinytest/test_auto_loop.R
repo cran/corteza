@@ -1,3 +1,11 @@
+# Slow. Skipped on CRAN for check time; CI sets NOT_CRAN.
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
+    exit_file("slow; runs at home and in CI")
+}
+
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 library(tinytest)
 
 # Drive run_auto_loop() end to end with no network: the turn function is
@@ -20,6 +28,16 @@ reset_wt <- function() {
     writeLines("start", file.path(wt, "a.txt"))
 }
 
+# The worktree's own config is read where the directory is trusted
+# (R/trust.R). The list of those is the user's, so this file gets a
+# config directory of its own before it adds to it. Trust goes by path,
+# so it holds across reset_wt().
+old_config <- Sys.getenv("R_USER_CONFIG_DIR", unset = NA)
+tmp_config <- file.path(tempdir(), "corteza-auto-loop-config")
+Sys.setenv(R_USER_CONFIG_DIR = tmp_config)
+reset_wt()
+corteza:::project_trust_add(wt)
+
 empty_palette <- list(dim = "", reset = "", cyan = "", bold = "",
                       yellow = "", green = "", bright_magenta = "",
                       red = "", magenta = "")
@@ -27,7 +45,6 @@ empty_palette <- list(dim = "", reset = "", cyan = "", bold = "",
 # A ctx shaped like chat()'s, with the turn function stubbed.
 auto_ctx <- function(turn_fn) {
     ctx <- new.env(parent = emptyenv())
-    ctx$ws_enabled <- FALSE
     ctx$palette <- empty_palette
     ctx$help_text <- function() "HELP"
     ctx$handle_copy <- function(x) invisible(NULL)
@@ -105,6 +122,19 @@ expect_equal(turns, 3L)
 # being broken rather than a run having ended.
 expect_null(ctx$session$auto_gate)
 expect_null(ctx$auto_halt)
+
+# The transcript keeps the goal as what the person typed of each prompt
+# the driver wrote, and the reviewer (R/review.R) shows it once. The
+# goal leaves the session with the run.
+rec <- corteza:::transcript_load_strict(ctx$disk_session$session$sessionId)
+prompts <- Filter(function(e) identical(e$role, "user"), rec$entries)
+expect_equal(length(prompts), 3L)
+expect_true(all(vapply(prompts, function(e) {
+    isTRUE(e$staged) && identical(e$typed, "do a thing") && !is.null(e$auto_run_id)
+}, logical(1))))
+expect_identical(corteza:::review_conversation(ctx$disk_session$session$sessionId)$lines,
+                 "Person: /auto do a thing")
+expect_null(ctx$session$auto_typed)
 
 # ---- stops when the monitor says stop ----
 
@@ -248,6 +278,16 @@ res <- with_stubs(stub_monitor(character()),
 expect_equal(turns, 2L)
 expect_true(any(grepl("turn errored", res)))
 expect_true(any(grepl("the model exploded", res)))
+# The failed turn's prompt gets a line after it, as every other prompt
+# does, so the reviewer reads no reply as lost (review_conversation()).
+entries <- corteza:::transcript_load_strict(
+    ctx$disk_session$session$sessionId)$entries
+expect_identical(vapply(entries, function(e) e$role, ""),
+                 rep(c("user", "assistant"), 2L))
+expect_identical(entries[[4L]]$content[[1L]]$text, "Error: the model exploded")
+expect_identical(entries[[4L]]$auto_run_id, entries[[3L]]$auto_run_id)
+expect_null(corteza:::review_conversation(
+    ctx$disk_session$session$sessionId)$why)
 
 # ---- an interrupted turn is terminal ----
 #
@@ -721,6 +761,16 @@ expect_true(any(grepl("Continue the current task", out)))
 expect_true(any(grepl("Auto is off. Last run:", out, fixed = TRUE)))
 expect_true(isTRUE(ctx$last_auto_request$allow_exec))
 expect_null(ctx$session$auto_config)
+# The transcript keeps what the person typed to start each run, not the
+# goal corteza wrote for the bare one, and the reviewer reads that.
+rec <- corteza:::transcript_load_strict(ctx$disk_session$session$sessionId)
+started <- Filter(function(e) identical(e$role, "user"), rec$entries)
+expect_identical(vapply(started, function(e) {
+    if (is.character(e$typed)) e$typed else NA_character_
+}, character(1)), c("", "resume"))
+expect_identical(corteza:::review_conversation(ctx$disk_session$session$sessionId)$lines,
+                 c("Person: /auto", "Worker: working", "Person: /auto resume"))
+expect_null(ctx$session$auto_typed)
 
 # An unrecovered cutoff stops before the monitor can mistake it for progress.
 reset_wt()
@@ -738,9 +788,14 @@ expect_equal(turns, 1L)
 expect_equal(ctx$last_turn_status, "truncated")
 expect_true(any(grepl("output incomplete: max_tokens", out, fixed = TRUE)))
 
-unlink(c(wt, tmp_data), recursive = TRUE)
+unlink(c(wt, tmp_data, tmp_config), recursive = TRUE)
 if (is.na(old_home)) {
     Sys.unsetenv("R_USER_DATA_DIR")
 } else {
     Sys.setenv(R_USER_DATA_DIR = old_home)
+}
+if (is.na(old_config)) {
+    Sys.unsetenv("R_USER_CONFIG_DIR")
+} else {
+    Sys.setenv(R_USER_CONFIG_DIR = old_config)
 }

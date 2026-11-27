@@ -8,7 +8,9 @@ bot_run(
   system = NULL,
   model = NULL,
   provider = NULL,
-  tools_filter = NULL
+  tools_filter = NULL,
+  cwd = NULL,
+  project_roots = NULL
 )
 }
 \arguments{
@@ -21,6 +23,13 @@ bot_run(
 \item{provider}{Character or NULL. Provider override.}
 
 \item{tools_filter}{Character vector or NULL. Tool filter override.}
+
+\item{cwd}{Character or NULL. The directory a room works in when no
+operator has bound it to one; see \code{\link{bot_run_init}}.}
+
+\item{project_roots}{Character vector or NULL. The directories inside
+which an operator may bind a room with \code{/cd}; see
+\code{\link{bot_run_init}}.}
 }
 \value{
 Never returns under normal operation. Crashes on fatal error

@@ -3,11 +3,15 @@
 # corteza - An open-source interactive CLI agent in R
 #
 # Usage: corteza [options]
+#        corteza acp [--provider P] [--model M] [--tools T]
+#   acp          Serve an Agent Client Protocol client on stdin and stdout
 #   --provider   anthropic|openai|moonshot|openai_codex|ollama (default: anthropic)
 #   --model      model name (default: provider-specific)
 #   --port       MCP server port (default: 7850)
 #   --session    Session key (resume if exists, create if not)
-#   --list       List sessions
+#   --resume     Resume the latest session started in this directory
+#   --list       List the sessions started in this directory
+#   --all        With --resume or --list: every directory
 #
 
 # Load .Renviron explicitly (littler may not load it automatically)
@@ -46,7 +50,10 @@ parse_args <- function() {
     dry_run = config$dry_run,  # Dry-run mode
     context_edit = NULL,
     trace = isTRUE(config$trace) || isTRUE(getOption("corteza.trace", FALSE)),
-    web_search = config$web_search  # Provider-native search (NULL = default on)
+    web_search = config$web_search,  # Provider-native search (NULL = default on)
+    # The config keys a flag on this command line set; /clear keeps
+    # these over the config file (ctx$config_set).
+    config_set = character()
   )
 
   i <- 1
@@ -60,6 +67,7 @@ parse_args <- function() {
       i <- i + 2
     } else if (arg == "--base-url" && i < length(args)) {
       opts$base_url <- args[i + 1]
+      opts$config_set <- union(opts$config_set, "base_url")
       i <- i + 2
     } else if (arg == "--port" && i < length(args)) {
       opts$port <- as.integer(args[i + 1])
@@ -73,11 +81,15 @@ parse_args <- function() {
     } else if (arg == "--list") {
       opts$list <- TRUE
       i <- i + 1
+    } else if (arg == "--all") {
+      opts$all <- TRUE
+      i <- i + 1
     } else if (arg == "--tools" && i < length(args)) {
       opts$tools <- strsplit(args[i + 1], ",")[[1]]
       i <- i + 2
     } else if (arg == "--dry-run") {
       opts$dry_run <- TRUE
+      opts$config_set <- union(opts$config_set, "dry_run")
       i <- i + 1
     } else if (arg == "--context-edit") {
       opts$context_edit <- TRUE
@@ -96,6 +108,11 @@ parse_args <- function() {
 corteza - An open-source interactive CLI agent
 
 Usage: corteza [options]
+       corteza guide [topic]
+       corteza acp [--provider P] [--model M] [--tools T]
+
+  acp             Serve an editor or another Agent Client Protocol client
+                  on standard input and output (vignette(\"configuration\"))
 
 Options:
   --provider      LLM provider: anthropic, openai, moonshot, openai_codex, ollama, openai_compatible (default: anthropic)
@@ -111,8 +128,10 @@ Options:
   --web-search    Provider-native web search, on by default for hosted providers
   --no-web-search Disable provider-native web search (e.g. to rely on the Tavily tool)
   --session, -s   Session key (resume if exists, create if not)
-  --resume, -r    Resume the most recent session (including its provider/model)
-  --list          List sessions
+  --resume, -r    Resume the latest session started in this directory
+                  (including its provider/model)
+  --list          List the sessions started in this directory
+  --all           With --resume or --list: every directory
   --help, -h      Show this help
 
 Commands (in chat):
@@ -125,6 +144,7 @@ Commands (in chat):
   /review [ref]  Review local changes with the current model
   /config        Show active runtime configuration
   /permissions   Show tool approval and sandbox settings
+  /trust [yes]   Show whether this directory is trusted, or trust it
   /plan [task]   Toggle plan mode (reads only, LLM proposes plan)
   /auto [--exec] [goal]  Continue the current task unattended, or start a goal
   /auto status|resume   Inspect or resume the last unattended run
@@ -140,7 +160,7 @@ Commands (in chat):
   /cancel <id>   Cancel a delegated job.
   /r <expr>      Eval R locally (skips policy/dryrun); output staged for next prompt.
   ! <cmd>        Run shell locally (skips policy/dryrun); output staged for next prompt.
-  /sessions      List sessions
+  /sessions [all]  List this directory's sessions, or every directory's
   /model [name]  List models or switch by name/number
   /effort [level | default]  Show or set reasoning effort
   /provider <p>  Switch provider
@@ -157,6 +177,11 @@ Additional files can be loaded via the `context_files` config key.
 Config files:
   tools::R_user_dir('corteza', 'config')/config.json   Global defaults
   .corteza/config.json                                 Project overrides
+
+A project's own files (its config, skills, instructions, lessons, saved
+approvals and briefing) load only from a directory you have trusted:
+answer the question at start, send /trust yes, or list the directory under
+`trusted_projects` in the global config.
 
 ")
       quit(save = "no", status = 0)
@@ -189,7 +214,7 @@ Commands:
   /auto [--exec] [goal]  Continue the current task unattended, or start a goal
   /auto status|resume   Inspect or resume the last unattended run
   /max-tokens [N|default]  Show or change the response output budget
-  /quit, /exit   Exit corteza
+  /quit, /exit, /q  Exit corteza
   /status        Alias for /context
   /doctor        Check provider, git, MCP, and context health
   /tools         List available tools
@@ -197,18 +222,21 @@ Commands:
   /review [ref]  Review local changes with the current model
   /config        Show active runtime configuration
   /permissions   Show tool approval and sandbox settings
+  /trust [yes]   Show whether this directory is trusted, or trust it
   /plan [task]   Toggle plan mode (reads only, LLM proposes plan)
-  /clear         Clear conversation (keeps session)
+  /clear, /reset, /new  Clear conversation (keeps session)
   /compact       Summarize conversation to free context
   /flush         Write durable memories from the conversation
+  /refine [list|rollback <id>|promote <id>]  Review the conversation into one-line lessons
   /paste [text]  Multi-line. Collects every line verbatim until /end.
   /copy          Copy the last assistant response to the system clipboard.
   /tasks [clear] Show (or clear) the current task list.
   /jobs [id]     List delegated jobs (talker mode), or show one.
+  /job resume <id>  Continue an incomplete job as a new attempt.
   /cancel <id>   Cancel a delegated job.
   /r <expr>      Eval R locally (skips policy/dryrun); output staged for next prompt.
   ! <cmd>        Run shell locally (skips policy/dryrun); output staged for next prompt.
-  /sessions      List sessions for this directory
+  /sessions [all]  List this directory's sessions, or every directory's
   /context       Show live context usage and loaded context files
   /context-edit on|off|status  Control conversation context editing
   /spent, /cost  Approximate USD spent this run (main-agent turns)
@@ -234,11 +262,13 @@ Skills:
   /skill install <path|url>   Install a skill
   /skill remove <name>        Remove a skill
   /skill test <path>          Run skill tests
+  /skills ...                 Same as /skill
 
 Tool output:
   /last [N]      Show tool output (1=most recent)
   /outputs       List recent tool outputs
   /help          Show this help
+  /guide [topic] Explore settings and alternatives
 
 "
 }
@@ -273,33 +303,6 @@ print_banner <- function(session_id = NULL, model = NULL,
         ""
       },
       "\n", sep = "")
-}
-
-print_tool <- function(name, args) {
-  # Function-style: tool_name("arg1", "arg2")
-  if (length(args) > 0) {
-    args_str <- paste(sapply(args, function(x) {
-      if (is.character(x)) {
-        s <- if (nchar(x) > 40) paste0(substr(x, 1, 37), "...") else x
-        sprintf('"%s"', s)
-      } else {
-        as.character(x)
-      }
-    }), collapse = ", ")
-    cat(sprintf("%s%s(%s)%s\n", color$dim, name, args_str, color$reset))
-  } else {
-    cat(sprintf("%s%s()%s\n", color$dim, name, color$reset))
-  }
-}
-
-print_result <- function(text) {
-  # Minimal output - just show line count, model will summarize
-  lines <- strsplit(text, "\n")[[1]]
-  n <- length(lines)
-  if (n > 1) {
-    cat(sprintf("%s(%d lines)%s\n", color$dim, n, color$reset))
-  }
-  # Single line results shown inline with tool call
 }
 
 print_response <- function(text) {
@@ -358,35 +361,6 @@ print_context_indicator <- function(used, limit, warn_pct = 75, high_pct = 90, c
 # approval_cb hand-off in corteza::new_session() so this local copy is
 # no longer needed.
 
-# Load approvals from project-local file
-load_approvals <- function(cwd) {
-  path <- file.path(cwd, ".corteza", "approvals.json")
-  if (file.exists(path)) {
-    tryCatch(
-      jsonlite::fromJSON(path, simplifyVector = FALSE),
-      error = function(e) list()
-    )
-  } else {
-    list()
-  }
-}
-
-# Save approval to project-local file
-save_approval <- function(cwd, tool_name) {
-  approvals <- load_approvals(cwd)
-  approvals[[tool_name]] <- TRUE
-
-  path <- file.path(cwd, ".corteza", "approvals.json")
-  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
-  jsonlite::write_json(approvals, path, auto_unbox = TRUE, pretty = TRUE)
-}
-
-# Check if tool is already approved for this project
-is_approved <- function(cwd, tool_name) {
-  approvals <- load_approvals(cwd)
-  isTRUE(approvals[[tool_name]])
-}
-
 # The CLI's memory-flush helper moved into package R code as
 # corteza:::run_memory_flush(ctx) (R/chat-slash.R) so chat() and the
 # CLI share one /flush implementation through run_repl_loop(). The
@@ -401,23 +375,54 @@ is_approved <- function(cwd, tool_name) {
 # in chat() and CLI alike, including per-tool overrides like
 # permissions = list(read_file = "ask") or list(bash = "allow").
 #
-# The callback persists "Allow always for this project" choices to
-# .corteza/approvals.json via save_approval(), and short-circuits
-# subsequent prompts via is_approved().
+# "Allow always for this project" is kept in the user's config
+# directory, by directory (corteza:::approval_save(), R/approvals.R),
+# trusted or not: a repository brings no answers along, and saving one
+# makes no folder in the project. The project's own
+# .corteza/approvals.json, where 0.8.0 kept them, is not read. An answer
+# that cannot be saved holds for this session.
 cli_approval_cb <- function(cwd) {
-  function(call, decision) {
+  for_session <- character()
+  # Has the person answered this call for good? "Allow always" for its
+  # tool, saved or held for the session. The credential rule's ask, and
+  # leaving plan mode, are answered each time: an "always" given for the
+  # tool does not answer them, and their prompt offers none. The
+  # reviewer (R/review.R) asks this first, so it never rules on an
+  # answer the person already gave.
+  answered <- function(call, decision) {
     name <- call$tool %||% ""
-    if (is_approved(cwd, name)) {
+    !corteza:::.person_rule(decision) &&
+      (name %in% for_session || name %in% corteza:::approvals_saved(cwd))
+  }
+  # "Allow always for this project": saved for the directory so that
+  # later sessions here skip the prompt for the tool, or, where it cannot
+  # be saved, held for this session. TRUE when it was saved.
+  keep_always <- function(name) {
+    if (corteza:::approval_save(cwd, name)) {
+      return(TRUE)
+    }
+    for_session <<- c(for_session, name)
+    FALSE
+  }
+  cb <- function(call, decision) {
+    name <- call$tool %||% ""
+    once_only <- corteza:::.person_rule(decision)
+    if (answered(call, decision)) {
       return(TRUE)
     }
 
-    persistent_label <- "Allow always for this project"
+    persistent_label <- if (once_only) {
+      NULL
+    } else {
+      "Allow always for this project"
+    }
     # Terminal CLI catches Ctrl+C as the interrupt that aborts the
     # turn -- same outcome as picking Deny. Surface the shortcut so
     # users don't have to type "3" + Enter.
     lines <- corteza:::cli_approval_lines(
       call,
       decision,
+      gate_reason = decision$gate_reason,
       cwd = cwd,
       persistent_label = persistent_label,
       deny_label = "Deny (Ctrl+C)"
@@ -428,12 +433,11 @@ cli_approval_cb <- function(cwd) {
                                       color$yellow, color$reset))
     if (length(response) == 0) response <- ""
     response <- trimws(response)
-    if (response == "") response <- "1"
+    if (response == "" || (once_only && response == "2")) response <- "1"
 
-    # "Allow always for this project" persists to .corteza/approvals.json
-    # so future runs skip the prompt for this tool.
-    if (response == "2") {
-      save_approval(cwd, name)
+    if (response == "2" && !keep_always(name)) {
+      cat(sprintf("%sCould not save it in %s; allowed for this session.%s\n",
+                  color$dim, corteza:::approvals_file(), color$reset))
     }
 
     # Replace the verbose approval block with a one-line `User replied:`
@@ -459,6 +463,20 @@ cli_approval_cb <- function(cwd) {
     }
     response %in% c("1", "2")
   }
+  attr(cb, "answered") <- answered
+  # A job's prompt keeps "always" the same way (R/repl-jobs.R) and prints
+  # what this returns.
+  attr(cb, "always") <- function(call) {
+    name <- call$tool %||% ""
+    if (keep_always(name)) {
+      sprintf("%s is allowed always in this project (kept in %s).", name,
+              corteza:::approvals_file())
+    } else {
+      sprintf("Could not save it in %s; %s is allowed for this session.",
+              corteza:::approvals_file(), name)
+    }
+  }
+  cb
 }
 
 # Construct the CLI's live turn session from the same context bundle used for
@@ -506,27 +524,34 @@ run_agent <- function(opts) {
   cwd <- getwd()
   config <- corteza:::load_config(cwd)
 
+  # --list and --resume look at the sessions started in this directory;
+  # --all lifts that.
+  every <- isTRUE(opts$all)
+
   # Handle --list (exit early)
   if (isTRUE(opts$list)) {
-    sessions <- corteza:::session_list()
-    cat(corteza:::format_session_list(sessions), "\n")
+    sessions <- corteza:::session_list(cwd = cwd, all = every)
+    cat(corteza:::format_session_list(sessions, how = "corteza --list --all"), "\n")
     return(invisible(NULL))
   }
 
   # Handle --resume: find latest session key
   if (isTRUE(opts$resume) && is.null(opts$session)) {
-    latest <- corteza:::session_latest()
+    latest <- corteza:::session_latest(cwd = cwd, all = every)
     if (!is.null(latest)) {
       opts$session <- latest$sessionKey
       cat(sprintf("%sResuming latest session: %s%s\n", color$dim, latest$sessionKey, color$reset))
     } else {
-      cat(sprintf("%sNo sessions to resume. Starting fresh.%s\n", color$dim, color$reset))
+      none <- "No sessions found."
+      if (!every) {
+        none <- corteza:::session_none_note(cwd, how = "corteza --resume --all")
+      }
+      cat(sprintf("%s%s Starting fresh.%s\n", color$dim, none, color$reset))
     }
   }
 
   # Load or create session
   session <- NULL
-  ws_enabled <- isTRUE(config$workspace$enabled)
   route <- corteza:::.session_model_pair(opts$provider, opts$model, config)
 
   if (!is.null(opts$session)) {
@@ -535,32 +560,27 @@ run_agent <- function(opts) {
     if (is.null(session)) {
       # Create new session with specified key
       cat(sprintf("%sCreating session: %s%s\n", color$dim, opts$session, color$reset))
-      session <- corteza:::session_new(route$provider, route$model, cwd, session_key = opts$session)
+      session <- corteza:::session_new(route$provider, route$model, cwd,
+                                       session_key = opts$session, surface = "cli")
     } else {
       # Resuming existing session
       cat(sprintf("%sResuming session: %s%s\n", color$dim, opts$session, color$reset))
+      # Read before the resume writes to the session (R/retention.R).
+      resume_note <- corteza:::retention_resume_note(session$sessionId)
+      if (!is.null(resume_note)) {
+        cat(color$dim, resume_note, color$reset, "\n", sep = "")
+      }
+      # The paths in its history belong to the directory it was started in.
+      elsewhere <- corteza:::session_elsewhere_note(session, cwd)
+      if (!is.null(elsewhere)) {
+        cat(color$dim, elsewhere, color$reset, "\n", sep = "")
+      }
       route <- corteza:::.session_model_pair(opts$provider, opts$model,
                                              config, saved = session)
-      # Restore workspace
-      if (ws_enabled) {
-        loaded <- corteza:::ws_load(session$sessionId)
-        if (loaded) {
-          cat(sprintf("%sWorkspace restored.%s\n", color$dim, color$reset))
-        }
-      }
     }
   } else {
     # No session key specified - create new session
-    session <- corteza:::session_new(route$provider, route$model, cwd)
-    # Scan globalenv for existing objects
-    if (ws_enabled && isTRUE(config$workspace$scan_globalenv)) {
-      registered <- corteza:::ws_scan_globalenv(
-        max_bytes = config$workspace$scan_max_bytes)
-      if (length(registered) > 0) {
-        cat(sprintf("%sWorkspace: registered %d objects%s\n",
-                    color$dim, length(registered), color$reset))
-      }
-    }
+    session <- corteza:::session_new(route$provider, route$model, cwd, surface = "cli")
   }
 
   opts$provider <- session$provider <- route$provider
@@ -574,23 +594,18 @@ run_agent <- function(opts) {
   # subprocess to spawn or connect for tool execution (CLI/chat
   # unification, Milestone 2).
 
-  # Register built-in skills, user-installed skills from the data
-  # dir + project's .corteza/skills, and any skill packages declared
-  # in config — matching chat()'s session_setup load order so both
-  # surfaces advertise the same tool set to the LLM. Without the
-  # user-skill loads the CLI tool count drifted below chat()'s.
-  corteza::ensure_skills()
-  corteza:::load_skills(corteza:::corteza_data_path("skills"))
-  corteza:::load_skills(file.path(cwd, ".corteza", "skills"))
-  corteza:::load_skill_packages(config)
-  tools <- corteza::schema_from_registry(opts$tools)
+  # The session's own tools, as session_setup() builds them for chat():
+  # built in, the user's skills from the data dir, the config's skill
+  # packages and, in a trusted directory, the project's .corteza/skills.
+  tool_table <- corteza:::session_tool_table(cwd, config)
+  tools <- corteza:::skills_as_api_tools(opts$tools, tool_table)
 
   cat(sprintf("%s%d tools available.%s\n\n",
               color$dim, length(tools), color$reset))
 
   # Load skill docs (SKILL.md files)
   corteza:::load_skill_docs(corteza:::corteza_data_path("skills"))
-  corteza:::load_skill_docs(file.path(cwd, ".corteza", "skills"))
+  corteza:::load_project_skills(cwd, code = FALSE)
   # Load context files
   context_files <- corteza:::list_context_files(cwd)
   context_bundle <- corteza:::load_context_bundle(
@@ -617,7 +632,7 @@ run_agent <- function(opts) {
     cat("\n")
   }
 
-  # `tools` already built in-process above via schema_from_registry().
+  # `tools` already built in-process above from the session's table.
 
   # CLI tool-progress observer. Tools now run IN-PROCESS via
   # corteza::turn()'s default call_skill dispatcher (no tool_executor,
@@ -715,20 +730,28 @@ run_agent <- function(opts) {
                model = display_model,
                provider = provider,
                tools_count = length(tools))
+  cat("  /guide introduces the settings.\n")
 
   # Track estimated live context, not cumulative billed API usage.
   session_tokens <- estimate_live_context_tokens(session, system_prompt, tools)
   session$tokens <- session_tokens
-  context_limit <- context_limit_for_model(display_model, provider = provider)
 
   # Show resumed message count
   if (length(session$messages) > 0) {
     cat(sprintf("%sResumed session with %d messages.%s\n",
                 color$dim, length(session$messages), color$reset))
     if (session_tokens > 0) {
+      context_limit <- corteza:::context_trigger(session, config, model = display_model)$window
       print_context_indicator(session_tokens, context_limit,
                               opts$context_warn_pct, opts$context_high_pct, opts$context_crit_pct)
     }
+  }
+
+  # Where the project holds the file 0.8.0 kept saved approvals in,
+  # say once that it is not read, and where answers are kept now.
+  approvals_notice <- corteza:::approvals_project_notice(cwd)
+  if (!is.null(approvals_notice)) {
+    cat(sprintf("%s%s%s\n", color$dim, approvals_notice, color$reset))
   }
 
   # Build the shared REPL context and hand off to corteza:::run_repl_loop
@@ -775,8 +798,10 @@ run_agent <- function(opts) {
     web_search = opts$web_search
   )
   turn_session$config <- config
+  turn_session$tool_table <- tool_table
   turn_session$context_edit <- opts$context_edit
   turn_session$cwd <- cwd
+  turn_session$project_trusted <- corteza:::project_trusted(cwd)
   turn_session$sessionId <- session$sessionId
   turn_session$disk_session <- session
   turn_session$tasks <- session$tasks %||% list()
@@ -818,8 +843,14 @@ run_agent <- function(opts) {
   ctx$disk_session <- list(session = session, sessionId = session$sessionId,
                            resumed = !is.null(opts$session))
   ctx$config <- config
+  # What the flags given set over the config file, kept when /clear
+  # builds the next conversation's config (corteza:::.repl_session_rebuild()).
+  # A key no flag set comes from the file again.
+  ctx$config_set <- opts$config_set
+  # Like chat(), the terminal runs tools directly unless talker mode
+  # is enabled in the config (corteza:::.repl_talker_default()).
+  ctx$talker_default <- FALSE
   ctx$cwd <- cwd
-  ctx$ws_enabled <- ws_enabled
   ctx$provider <- provider
   ctx$model <- model
   ctx$pending_r_context <- character(0)
@@ -832,7 +863,7 @@ run_agent <- function(opts) {
     # Read provider/model from ctx (not captured locals): /model and
     # /provider mutate ctx, so a later /clear must spin up the fresh
     # session with the current model/provider.
-    fresh <- corteza:::session_new(ctx$provider, ctx$model, cwd)
+    fresh <- corteza:::session_new(ctx$provider, ctx$model, cwd, surface = "cli")
     list(session = fresh, sessionId = fresh$sessionId, resumed = FALSE)
   }
   ctx$handle_copy <- corteza:::chat_handle_copy
@@ -857,6 +888,28 @@ run_agent <- function(opts) {
 # ============================================================================
 
 if (!interactive()) {
+  if (identical(commandArgs(trailingOnly = TRUE)[1L], "guide")) {
+    corteza:::start_guide(NULL, commandArgs(trailingOnly = TRUE)[-1L])
+    quit(save = "no", status = 0L)
+  }
+  # `corteza acp`: the agent an Agent Client Protocol client starts
+  # (R/acp.R). Standard input and output carry the protocol, so nothing
+  # is asked and nothing printed here; each session the client opens
+  # decides trust for its own directory.
+  if (identical(commandArgs(trailingOnly = TRUE)[1L], "acp")) {
+    acp <- corteza:::.acp_args(commandArgs(trailingOnly = TRUE)[-1L])
+    corteza:::.acp_main(provider = acp$provider, model = acp$model,
+                        tools = acp$tools)
+    quit(save = "no", status = 0L)
+  }
+  # Trust is decided before anything of the project's is read, and
+  # parse_args() takes its defaults from the config. A person at the
+  # terminal is asked once. --help and --list load nothing of the
+  # project's, so they ask nothing.
+  if (!any(commandArgs(trailingOnly = TRUE) %in% c("--help", "-h", "--list"))) {
+    at_terminal <- isTRUE(tryCatch(isatty(stdin()), error = function(e) FALSE))
+    corteza:::trust_at_start(getwd(), ask = if (at_terminal) cli_read_line)
+  }
   opts <- parse_args()
   run_agent(opts)
 }

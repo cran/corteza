@@ -240,10 +240,10 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 <p>corteza is provider-plural R-native agent tooling. It can run with
 Anthropic, OpenAI, Moonshot, Ollama, and ChatGPT-account-backed Codex
 access through <code>llm.api</code>.</p>
-<p>Codex support currently needs development builds of
-<code>tinyoauth</code> and <code>llm.api</code>, then corteza from
-CRAN:</p>
-<p><code>r eval=FALSE remotes::install_github(&quot;cornball-ai/tinyoauth&quot;) remotes::install_github(&quot;cornball-ai/llm.api&quot;) install.packages(&quot;corteza&quot;)</code></p>
+<p>Codex support comes with the CRAN releases: corteza needs
+<code>llm.api</code> 0.2.0 or later, which brings <code>tinyoauth</code>
+with it.</p>
+<p><code>r eval=FALSE install.packages(&quot;corteza&quot;)</code></p>
 <p>For most developers, subscription access via ChatGPT-account-backed
 Codex is dramatically more cost effective than metered API keys. Claude
 Code no longer offers this. A current ChatGPT subscription can drive the
@@ -253,12 +253,10 @@ changes, the R development loop stays portable.</p>
 <h2 id="prerequisites">Prerequisites</h2>
 <p>You need:</p>
 <ul>
-<li>corteza installed.</li>
-<li>The development build of <code>llm.api</code> with
-<code>openai_codex</code> support installed. corteza imports
-<code>llm.api</code>.</li>
-<li><code>tinyoauth</code> installed for ChatGPT-account-backed Codex
-login through <code>llm.api::openai_codex_login()</code>.</li>
+<li>corteza installed. It installs <code>llm.api</code>, whose
+<code>openai_codex</code> provider and
+<code>llm.api::openai_codex_login()</code> this vignette uses, and
+<code>tinyoauth</code>, which keeps the login.</li>
 <li>Access to the OpenAI or Codex model you plan to use.</li>
 </ul>
 <p>corteza talks to OpenAI and Codex through <code>llm.api</code>. It

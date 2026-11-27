@@ -1,3 +1,6 @@
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 library(tinytest)
 
 # The job worker: one persistent callr process per session, jobs run one
@@ -84,6 +87,13 @@ expect_identical(cp$identity$owner, "local")
 expect_identical(cp$identity$workspace, normalizePath(tempdir()))
 expect_identical(cp$job, b)
 expect_true("jobs_seen" %in% cp$objects)
+# The worker named its process in its folder when it started, so
+# retention leaves the folder while it lives (R/retention-state.R).
+held_by <- jsonlite::fromJSON(file.path(cp_dir, "worker.json"))
+expect_identical(held_by$host, Sys.info()[["nodename"]])
+expect_true(held_by$pid != Sys.getpid())
+expect_true(isTRUE(tools::pskill(as.integer(held_by$pid), signal = 0L)) ||
+            .Platform$OS.type == "windows")
 
 # --- Checkpoints are isolated by owner, workspace, key, and role ---
 # Each part alone gives a different directory: two bots in one room, two
@@ -161,10 +171,63 @@ ev <- corteza:::job_pump(slow)
 expect_identical(corteza:::job_read(q3)$status, "cancelled")
 expect_true(as.numeric(difftime(Sys.time(), t_cancel, units = "secs")) < 5)
 expect_false(corteza:::job_worker_alive(slow))
+# Its report names the checkpoint the next job starts from: the one the
+# job before it left.
+expect_true(grepl(sprintf("since job %s ended", q2),
+                  corteza:::job_read(q3)$outcome$reason, fixed = TRUE))
 # Cancelling an ended job reports FALSE.
 expect_false(corteza:::job_cancel(slow, q3))
 # A job from another session cannot be cancelled from this one.
 expect_error(corteza:::job_cancel(slow, a), "no job")
+
+# --- What a job stopped mid-run leaves ---
+# A file it wrote stays; an R object it made since the last checkpoint
+# is gone, and the next job starts from that checkpoint. Its report says
+# both (WP20a, rule 10).
+cancel_dir <- tempfile("job-cancel-")
+dir.create(cancel_dir)
+Sys.setenv(JOB_TEST_GATE = file.path(cancel_dir, "gate"),
+           JOB_TEST_FILE = file.path(cancel_dir, "written"))
+stopper <- make_session("room-stopper", function(task) {
+    if (identical(task, "keep")) {
+        assign("kept", 1, envir = globalenv())
+    }
+    if (identical(task, "lose")) {
+        assign("lost", 2, envir = globalenv())
+        writeLines("written", Sys.getenv("JOB_TEST_FILE"))
+        deadline <- Sys.time() + 30
+        while (!file.exists(Sys.getenv("JOB_TEST_GATE")) &&
+               Sys.time() < deadline) {
+            Sys.sleep(0.05)
+        }
+    }
+    list(reply = paste(task, exists("kept", envir = globalenv()),
+                       exists("lost", envir = globalenv())))
+})
+kept <- corteza:::job_submit(stopper, "keep")
+pump_until(stopper, kept)
+lost <- corteza:::job_submit(stopper, "lose")
+deadline <- Sys.time() + 30
+while (!file.exists(Sys.getenv("JOB_TEST_FILE")) && Sys.time() < deadline) {
+    corteza:::job_pump(stopper)
+    Sys.sleep(0.05)
+}
+expect_true(corteza:::job_cancel(stopper, lost))
+corteza:::job_pump(stopper)
+stopped_job <- corteza:::job_read(lost)
+expect_identical(stopped_job$status, "cancelled")
+expect_true(file.exists(Sys.getenv("JOB_TEST_FILE")))
+expect_true(grepl("Files it wrote stay", stopped_job$outcome$reason,
+                  fixed = TRUE))
+expect_true(grepl(sprintf("since job %s ended", kept),
+                  stopped_job$outcome$reason, fixed = TRUE))
+after_stop <- corteza:::job_submit(stopper, "next")
+pump_until(stopper, after_stop)
+expect_identical(corteza:::job_read(after_stop)$outcome$result,
+                 "next TRUE FALSE")
+corteza:::job_worker_close_all(stopper)
+Sys.unsetenv(c("JOB_TEST_GATE", "JOB_TEST_FILE"))
+unlink(cancel_dir, recursive = TRUE)
 
 # --- A turn error is the job's outcome, and still checkpoints ---
 failing <- make_session("room-fail", function(task) {
@@ -240,6 +303,48 @@ local({
     pump_until(stuck, nxt)
     expect_identical(corteza:::job_read(nxt)$status, "done")
     corteza:::job_worker_close(stuck)
+})
+
+# --- A worker that exits as the pump reads it ---
+# Alive when the pump checks, then ready, and its read is callr's crash
+# error, by when the process is gone: as macOS orders it. The job ends
+# indeterminate, as for a worker seen dead first, since it may have
+# acted; not failed, which would say it reported an error.
+local({
+    racing <- make_session("room-race", counting)
+    fake <- new.env()
+    fake$alive <- TRUE
+    fake$is_alive <- function() fake$alive
+    fake$get_pid <- function() 1L
+    fake$call <- function(...) invisible(NULL)
+    fake$poll_process <- function(timeout) "ready"
+    fake$read <- function() {
+        fake$alive <- FALSE
+        list(error = simpleError("R session crashed with exit code 1"))
+    }
+    fake$close <- function() invisible(NULL)
+    racing$.job_worker <- fake
+    racing$.job_worker_role <- "doer"
+    corteza:::job_worker_note(racing, "doer",
+                              dir = corteza:::job_worker_dir(racing))
+    r <- corteza:::job_submit(racing, "dies as it is read")
+    corteza:::job_pump(racing)
+    rj <- corteza:::job_read(r)
+    expect_identical(rj$status, "indeterminate")
+    expect_true(grepl("may have acted", rj$outcome$reason, fixed = TRUE))
+    expect_null(racing$.job_current)
+    expect_null(racing$.job_worker)
+    # One that is still alive after an error reported a failure.
+    fake$alive <- TRUE
+    fake$read <- function() list(error = simpleError("could not serialize"))
+    racing$.job_worker <- fake
+    corteza:::job_worker_note(racing, "doer",
+                              dir = corteza:::job_worker_dir(racing))
+    f <- corteza:::job_submit(racing, "fails")
+    corteza:::job_pump(racing)
+    expect_identical(corteza:::job_read(f)$status, "failed")
+    expect_true(grepl("could not serialize",
+                      corteza:::job_read(f)$outcome$error, fixed = TRUE))
 })
 
 # --- The approval bridge, end to end through a worker ---
@@ -330,6 +435,29 @@ proj <- tempfile("job-project")
 dir.create(proj)
 writeLines(c("# Agent Instructions", "", "doer-context-sentinel"),
            file.path(proj, "AGENTS.md"))
+# A project's rules load from a trusted directory only (R/trust.R). The
+# list of those is the user's, and a worker is another process that
+# finds it through the same config directory, so the directory is set
+# here, before any worker below starts. Untrusted first: the doer then
+# has its role and nothing of the project's.
+old_config <- Sys.getenv("R_USER_CONFIG_DIR", unset = NA)
+Sys.setenv(R_USER_CONFIG_DIR = tempfile("job-worker-config-"))
+stranger <- make_session("room-context-untrusted", function(task) {
+    st <- get(".subagent_state", envir = asNamespace("corteza"))
+    sys <- paste(st$session$system, collapse = "\n")
+    list(reply = paste(grepl("doer-context-sentinel", sys, fixed = TRUE),
+                       startsWith(sys, "You are the doer")))
+})
+stranger$job_worker_spec$init_fn <- NULL
+stranger$cwd <- proj
+sp <- corteza:::job_submit(stranger, "check")
+pump_until(stranger, sp)
+expect_identical(corteza:::job_read(sp)$outcome$result, "FALSE TRUE")
+corteza:::job_worker_close(stranger)
+expect_false(grepl("doer-context-sentinel",
+                   corteza:::job_worker_context("ROLE-LINE", cwd = proj),
+                   fixed = TRUE))
+corteza:::project_trust_add(proj)
 ctxprobe <- make_session("room-context", function(task) {
     st <- get(".subagent_state", envir = asNamespace("corteza"))
     sys <- paste(st$session$system, collapse = "\n")
@@ -463,11 +591,20 @@ for (i in 1:50) {
 expect_identical(corteza:::job_read(running)$status, "running")
 second <- make_session("room-replaced", waiter)
 worker_pid <- first$.job_worker$get_pid()
+# Starting checkpoints a /clear left for later go with the job in flight
+# (R/job-conversation.R). The running job's authority cache does not
+# (R/job-authority.R): only the conversation that dispatched it writes
+# its record.
+first$.job_starts <- list(list(conversation = "pending"))
 corteza:::job_state_move(first, second)
 expect_null(first$.job_worker)
 expect_null(first$.job_current)
+expect_null(first$.job_starts)
 expect_identical(second$.job_current, running)
 expect_identical(second$.job_worker$get_pid(), worker_pid)
+expect_identical(second$.job_starts, list(list(conversation = "pending")))
+expect_null(second$.job_authority)
+second$.job_starts <- NULL
 file.create(gate)
 seen <- pump_until(second, running)
 expect_identical(corteza:::job_read(running)$status, "done")
@@ -585,3 +722,9 @@ if (is.na(old_state)) {
     Sys.setenv(CORTEZA_STATE_DIR = old_state)
 }
 unlink(state, recursive = TRUE)
+unlink(Sys.getenv("R_USER_CONFIG_DIR"), recursive = TRUE)
+if (is.na(old_config)) {
+    Sys.unsetenv("R_USER_CONFIG_DIR")
+} else {
+    Sys.setenv(R_USER_CONFIG_DIR = old_config)
+}

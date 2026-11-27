@@ -612,6 +612,10 @@ tool_replace_in_file <- function(path, old_text, new_text, all = FALSE,
 
 #' Search file contents with regex pattern.
 #'
+#' Search the files the glob `file_pattern` matches in `path` (no
+#' recursion) for a regex. Skips binary files and files over 10 MB;
+#' stops at 500 matches or 20 s and says so.
+#'
 #' @param pattern (character) Regex pattern to search.
 #' @param path (character) Directory to search.
 #' @param file_pattern (character) File glob pattern.
@@ -638,25 +642,119 @@ tool_grep_files <- function(pattern, path = ".", file_pattern = "*.R") {
         return(ok("No files to search"))
     }
 
+    # A search reads text. A binary file or a very large one (a model's
+    # weights, a video) took longer to read than the tool may run, and
+    # grep() warned once for each of its lines; the search passes them
+    # by, and stops at a number of matches and at a time.
+    limits <- .grep_limits
+    started <- Sys.time()
+    skipped <- c(binary = 0L, large = 0L, unreadable = 0L)
     results <- character()
-    for (f in files) {
-        lines <- tryCatch(readLines(f, warn = FALSE), error = function(e) NULL)
-        if (is.null(lines)) {
+    stopped <- ""
+    for (k in seq_along(files)) {
+        f <- files[[k]]
+        spent <- as.numeric(difftime(Sys.time(), started, units = "secs"))
+        if (spent >= limits$seconds) {
+            stopped <- sprintf("Stopped after %d s, %d files not searched.",
+                               limits$seconds, length(files) - k + 1L)
+            break
+        }
+        kind <- .grep_file_kind(f, limits$file_bytes)
+        if (!identical(kind, "text")) {
+            skipped[[kind]] <- skipped[[kind]] + 1L
             next
         }
-
-        hits <- grep(pattern, lines)
-        if (length(hits) > 0) {
-            for (i in hits) {
-                results <- c(results, sprintf("%s:%d: %s", f, i, lines[i]))
-            }
+        lines <- tryCatch(readLines(f, warn = FALSE), error = function(e) NULL)
+        if (is.null(lines)) {
+            skipped[["unreadable"]] <- skipped[["unreadable"]] + 1L
+            next
+        }
+        hits <- .grep_lines(pattern, lines)
+        room <- limits$matches - length(results)
+        if (length(hits) > room) {
+            hits <- hits[seq_len(room)]
+            stopped <- sprintf("Stopped at %d matches.", limits$matches)
+        }
+        results <- c(results, sprintf("%s:%d: %s", f, hits,
+                                      .grep_shown(lines[hits], limits$line_chars)))
+        if (nzchar(stopped)) {
+            break
         }
     }
 
+    notes <- c(.grep_skipped_note(skipped, limits$file_bytes), stopped)
+    notes <- notes[nzchar(notes)]
     if (length(results) == 0) {
-        return(ok("No matches found"))
+        return(ok(paste(c("No matches found", notes), collapse = "\n")))
     }
-    ok(paste(results, collapse = "\n"))
+    ok(paste(c(results, notes), collapse = "\n"))
+}
+
+# What grep_files() reads: files up to `file_bytes`, `matches` matching
+# lines in all, each cut to `line_chars`, for up to `seconds`.
+.grep_limits <- list(file_bytes = 10 * 1024 ^ 2, matches = 500L,
+                     line_chars = 500L, seconds = 20L)
+
+# "text", "binary" (a NUL byte in its first 8000, as git decides),
+# "large" or "unreadable".
+.grep_file_kind <- function(f, file_bytes) {
+    size <- file.size(f)
+    if (is.na(size)) {
+        return("unreadable")
+    }
+    if (size > file_bytes) {
+        return("large")
+    }
+    head <- tryCatch(readBin(f, "raw", 8000L), error = function(e) NULL)
+    if (is.null(head)) {
+        return("unreadable")
+    }
+    if (any(head == as.raw(0L))) {
+        return("binary")
+    }
+    "text"
+}
+
+# The lines that match. A line that is not UTF-8 (a Latin-1 file) is
+# matched by its bytes: grep() would warn for it and pass it by.
+.grep_lines <- function(pattern, lines) {
+    valid <- validUTF8(lines)
+    hits <- which(valid)[grep(pattern, lines[valid])]
+    if (!all(valid)) {
+        other <- which(!valid)
+        hits <- c(hits, other[grep(pattern, lines[other], useBytes = TRUE)])
+    }
+    sort(hits)
+}
+
+# The lines as the result shows them: UTF-8 (a line that is not is read
+# as Latin-1, the usual other encoding of a text file), each cut to
+# `line_chars` characters.
+.grep_shown <- function(lines, line_chars) {
+    other <- !validUTF8(lines)
+    lines[other] <- iconv(lines[other], from = "latin1", to = "UTF-8")
+    long <- nchar(lines) > line_chars
+    lines[long] <- paste0(substr(lines[long], 1L, line_chars), "...")
+    lines
+}
+
+.grep_skipped_note <- function(skipped, file_bytes) {
+    skipped <- skipped[skipped > 0L]
+    if (!length(skipped)) {
+        return("")
+    }
+    size <- sprintf("%d bytes", as.integer(file_bytes))
+    if (file_bytes >= 1024 ^ 2) {
+        size <- sprintf("%g MB", file_bytes / 1024 ^ 2)
+    }
+    what <- c(binary = "binary", large = paste("over", size),
+              unreadable = "unreadable")
+    noun <- "files"
+    if (sum(skipped) == 1L) {
+        noun <- "file"
+    }
+    sprintf("Skipped %d %s: %s.", sum(skipped), noun,
+            paste(skipped, what[names(skipped)], collapse = ", "))
 }
 
 # Code execution ----
@@ -665,9 +763,8 @@ tool_grep_files <- function(pattern, path = ".", file_pattern = "*.R") {
 #'
 #' By default, code runs in the host's global environment, preserving the
 #' original \code{run_r} contract. Pass a private persistent environment to
-#' give an agent or capability its own R scope. Scoped evaluation retains
-#' assignments and handles but does not copy bindings into the host workspace
-#' cache.
+#' give an agent or capability its own R scope. Assignments and handles
+#' persist in the selected scope.
 #'
 #' @param code (character) R code to execute.
 #' @param envir (environment) Persistent environment in which assignments
@@ -677,12 +774,6 @@ tool_grep_files <- function(pattern, path = ".", file_pattern = "*.R") {
 #' @export
 tool_run_r <- function(code, envir = globalenv()) {
     stopifnot(is.environment(envir))
-    capture_workspace <- identical(envir, globalenv())
-    if (isTRUE(capture_workspace)) {
-        before <- ls(envir)
-    } else {
-        before <- character()
-    }
     handle_store <- handle_store_for(envir)
     # Active handles are visible in `code` as regular R names.
     eval_env <- handle_eval_env(parent = envir, store = handle_store)
@@ -767,25 +858,7 @@ tool_run_r <- function(code, envir = globalenv()) {
     }
     text <- paste(c(streams, text), collapse = "\n")
     .audit_safe(.audit_tool_payload(.audit_runtime$active,
-        paste(c(streams, outcome$printed), collapse = "\n"), text, "run_r", stage = "render"))
-
-    if (isTRUE(capture_workspace)) {
-        # Auto-capture new bindings into the workspace. Hidden names
-        # (`.foo`, `.h_NNN`) are excluded by default ls() rules.
-        new_names <- setdiff(ls(envir), before)
-        origin <- list(tool = "run_r", args = list(code = code))
-        for (nm in new_names) {
-            val <- get(nm, envir = envir)
-            if (object.size(val) < 10e6) {
-                deps <- tryCatch({
-                    fn <- eval(parse(text = paste0("function() {", code, "}")))
-                    referenced <- codetools::findGlobals(fn)
-                    intersect(referenced, ws_names())
-                }, error = function(e) character())
-                ws_put(nm, val, origin = origin, deps = deps)
-            }
-        }
-    }
+                                    paste(c(streams, outcome$printed), collapse = "\n"), text, "run_r", stage = "render"))
 
     # The outer tool handler applies the same universal cap, but it does not
     # know which private evaluator produced this result. Admit it here first
@@ -813,33 +886,45 @@ tool_run_r_script <- function(code, timeout = 30L) {
 
     # Write code to temp file (avoids shell escaping issues)
     tmp <- tempfile(fileext = ".R")
-    on.exit(unlink(tmp))
+    out_file <- tempfile("corteza-rscript-", fileext = ".out")
+    on.exit(unlink(c(tmp, out_file)))
     writeLines(code, tmp)
 
+    proc <- NULL
+    on.exit(if (!is.null(proc) && proc$is_alive()) .tool_process_end(proc),
+            add = TRUE)
+    stopped <- FALSE
     result <- tryCatch({
-        # callr::rscript runs Rscript portably (Linux, macOS, Windows).
-        # stderr = "2>&1" merges stderr into stdout so the LLM sees both
-        # streams as a single text blob in res$stdout.
+        # callr runs Rscript portably (Linux, macOS, Windows), with
+        # callr::rscript()'s defaults. stderr = "2>&1" merges stderr into
+        # stdout so the LLM sees both streams as a single text blob.
         #
-        # stdout = NULL (not "|"): in CRAN callr <= 3.7.6 on Windows,
-        # stdout = "|" combined with stderr = "2>&1" hangs indefinitely
-        # when the child errors via stop() — internal timeout never
-        # fires (r-lib/callr#313, fixed upstream in e93efd1). Passing
-        # stdout = NULL skips the hanging cat(file = "|") call in
-        # setup_callbacks() while still populating res$stdout via the
-        # 2>&1 redirect. Can be reverted to "|" once corteza depends
-        # on a fixed callr release.
-        res <- callr::rscript(tmp, show = FALSE, fail_on_status = FALSE,
-                              timeout = timeout, stdout = NULL,
-                              stderr = "2>&1")
-        if (isTRUE(res$timeout)) {
+        # Output goes to a file, not "|": in CRAN callr <= 3.7.6 on
+        # Windows, stdout = "|" combined with stderr = "2>&1" hangs
+        # indefinitely when the child errors via stop() (r-lib/callr#313,
+        # fixed upstream in e93efd1). A file never takes that path, and
+        # no full pipe can block the child.
+        #
+        # The wait (.tool_process_wait()) asks between its slices whether
+        # the session's turn should stop (R/tool-stop.R).
+        proc <- callr::rscript_process$new(callr::rscript_process_options(
+                script = tmp, stdout = out_file, stderr = "2>&1"))
+        ended <- .tool_process_wait(proc, timeout)
+        if (identical(ended, "timeout")) {
             paste0("Error: timed out after ", timeout, "s")
+        } else if (identical(ended, "stopped")) {
+            stopped <- TRUE
+            paste0("[cancelled: the script's process was ended]\n",
+                   .tool_read_output(out_file))
         } else {
-            res$stdout
+            .tool_read_output(out_file)
         }
     }, error = function(e) {
         paste("Error:", e$message)
     })
+    if (stopped) {
+        return(err(result))
+    }
     ok(result)
 }
 
@@ -939,29 +1024,39 @@ tool_shell_impl <- function(args, shell_name) {
     # each arg literally (no shell word-splitting), so the command goes
     # through as a single unquoted `-c` arg. (system2 needed shQuote
     # because it pastes args; processx does not.)
+    #
+    # A processx process, not system2(stdout = TRUE): the latter is a
+    # blocking C call R can't interrupt, so Ctrl+C during a foreground
+    # tool (e.g. `bash sleep 30`) halted the whole REPL. The wait
+    # (.tool_process_wait()) is interruptible, and between its slices it
+    # asks whether the session's turn should stop (R/tool-stop.R). An
+    # interrupt, the deadline or a stop ends the child's process tree.
+    # Output, stderr with stdout, goes to a file, which no full pipe can
+    # block. Status is surfaced structurally via err()/ok() rather than
+    # a warning.
+    out_file <- tempfile("corteza-shell-", fileext = ".out")
+    on.exit(unlink(out_file), add = TRUE)
+    proc <- NULL
+    on.exit(if (!is.null(proc) && proc$is_alive()) .tool_process_end(proc),
+            add = TRUE)
     tryCatch({
-        # processx::run() instead of system2(stdout = TRUE): the latter
-        # is a blocking C call R can't interrupt, so Ctrl+C during a
-        # foreground tool (e.g. `bash sleep 30`) halted the whole REPL.
-        # processx polls and is interruptible -- the interrupt propagates
-        # to the turn's handler in run_repl_loop, which returns to the
-        # prompt. cleanup_tree kills the child's descendants; status is
-        # surfaced structurally via err()/ok() rather than a warning.
-        res <- processx::run(shell_exe, exe_args,
-                             error_on_status = FALSE,
-                             stderr_to_stdout = TRUE,
-                             timeout = timeout,
-                             cleanup_tree = TRUE)
-        status <- res$status %||% 0L
-        text <- res$stdout %||% ""
-        if (!is.null(status) && status != 0L) {
-            err(sprintf("[exit status %d]\n%s", status, text))
+        proc <- processx::process$new(shell_exe, exe_args, stdout = out_file,
+                                      stderr = "2>&1", cleanup_tree = TRUE)
+        ended <- .tool_process_wait(proc, timeout)
+        text <- .tool_read_output(out_file)
+        if (identical(ended, "timeout")) {
+            err(sprintf("[timed out after %ss]\n%s", timeout, text))
+        } else if (identical(ended, "stopped")) {
+            err(sprintf("[cancelled: the command and its children were ended]\n%s",
+                        text))
         } else {
-            ok(text)
+            status <- proc$get_exit_status() %||% 0L
+            if (!is.na(status) && status != 0L) {
+                err(sprintf("[exit status %d]\n%s", status, text))
+            } else {
+                ok(text)
+            }
         }
-    }, system_command_timeout_error = function(e) {
-        partial <- tryCatch(e$stdout %||% "", error = function(e2) "")
-        err(sprintf("[timed out after %ss]\n%s", timeout, partial))
     }, error = function(e) {
         err(paste("Error:", e$message))
     })
@@ -1062,8 +1157,11 @@ tool_r_help <- function(topic, package = NULL) {
     }
 
     tryCatch({
-        # Bare package name: return the exports table
-        if (is.null(pkg) && topic %in% rownames(installed.packages())) {
+        # Bare package name: return the exports table. system.file()
+        # finds the one package; installed.packages() would read every
+        # package installed, which is slow where thousands are.
+        if (is.null(pkg) && is.character(topic) && length(topic) == 1L &&
+             nzchar(topic) && nzchar(system.file(package = topic))) {
             out <- capture.output(print(saber::pkg_exports(topic)))
             return(ok(paste(out, collapse = "\n")))
         }
@@ -1517,11 +1615,20 @@ tool_kill_subagent <- function(id) {
 #' Creates skill specs for all built-in tools and registers them.
 #' Called on package load.
 #'
+#' Each tool names its class, which decides who approves a call to it
+#' (R/policy.R). `read` reports and changes nothing; `write` changes
+#' files or state a later session reads; `exec` runs code; `control`
+#' acts on this session's own work; `continue` runs work in a child, a
+#' worker or another room, whose mode was set elsewhere.
+#'
 #' @return Invisible character vector of registered skill names
 #' @noRd
 register_builtin_skills <- function() {
+    .registry_state$builtin <- TRUE
+    on.exit(.registry_state$builtin <- FALSE, add = TRUE)
+
     # File tools
-    register_skill_from_fn("read_file", tool_read_file)
+    register_skill_from_fn("read_file", tool_read_file, class = "read")
     register_skill(skill_spec(
                               "skill_instructions",
                               paste(
@@ -1545,14 +1652,16 @@ register_builtin_skills <- function() {
             ),
                               handler = function(args, ctx) {
         tool_skill_instructions(args$id, args$resource %||% NULL, ctx = ctx)
-    }
+    },
+                              class = "read"
         ))
-    register_skill_from_fn("write_file", tool_write_file)
-    register_skill_from_fn("replace_in_file", tool_replace_in_file)
-    register_skill_from_fn("list_files", tool_list_files)
+    register_skill_from_fn("write_file", tool_write_file, class = "write")
+    register_skill_from_fn("replace_in_file", tool_replace_in_file,
+                           class = "write")
+    register_skill_from_fn("list_files", tool_list_files, class = "read")
 
     # Search
-    register_skill_from_fn("grep_files", tool_grep_files)
+    register_skill_from_fn("grep_files", tool_grep_files, class = "read")
 
     # Code execution
     # `envir` remains a host-owned capability boundary on tool_run_r(). The
@@ -1580,7 +1689,8 @@ register_builtin_skills <- function() {
                 )),
                               handler = function(args, ctx) {
         .tool_run_r_session(args$code, args$timeout %||% NULL, ctx)
-    }
+    },
+                              class = "exec"
         ))
     register_skill(skill_spec(
                               "read_handle",
@@ -1614,9 +1724,10 @@ register_builtin_skills <- function() {
         .tool_read_handle_session(args$handle, args$op %||% "str", ctx,
                                   pattern = args$pattern, start = args$start,
                                   end = args$end)
-    }
+    },
+                              class = "read"
         ))
-    register_skill_from_fn("run_r_script", tool_run_r_script)
+    register_skill_from_fn("run_r_script", tool_run_r_script, class = "exec")
 
     # Shell tool: prefer bash everywhere for cross-OS consistency. On
     # Windows we register bash only if we can find a real bash (Rtools
@@ -1625,26 +1736,28 @@ register_builtin_skills <- function() {
     use_bash <- .Platform$OS.type != "windows" ||
     file.exists(.find_bash_exe())
     if (use_bash) {
-        register_skill_from_fn("bash", tool_bash)
+        register_skill_from_fn("bash", tool_bash, class = "exec")
     } else {
-        register_skill_from_fn("cmd", tool_cmd)
+        register_skill_from_fn("cmd", tool_cmd, class = "exec")
     }
 
-    # Background process management
-    register_skill_from_fn("bg_status", tool_bg_status)
-    register_skill_from_fn("bg_kill", tool_bg_kill)
+    # Background process management. bg_kill stops a process this
+    # session started, by its own id for it.
+    register_skill_from_fn("bg_status", tool_bg_status, class = "read")
+    register_skill_from_fn("bg_kill", tool_bg_kill, class = "control")
 
     # R-specific
-    register_skill_from_fn("r_help", tool_r_help)
-    register_skill_from_fn("installed_packages", tool_installed_packages)
+    register_skill_from_fn("r_help", tool_r_help, class = "read")
+    register_skill_from_fn("installed_packages", tool_installed_packages,
+                           class = "read")
 
     # Web. web_search needs a Tavily API key; hide it from the LLM
     # payload when the key isn't set so the model doesn't try calling
     # a tool that can't work.
     .have_tavily <- function() nzchar(Sys.getenv("TAVILY_API_KEY"))
     register_skill_from_fn("web_search", tool_web_search,
-                           available = .have_tavily)
-    register_skill_from_fn("fetch_url", tool_fetch_url)
+                           available = .have_tavily, class = "read")
+    register_skill_from_fn("fetch_url", tool_fetch_url, class = "read")
 
     # Git tools only make sense inside a working tree. Check both the
     # cheap `.git` directory case and the more general `git rev-parse`
@@ -1662,39 +1775,54 @@ register_builtin_skills <- function() {
         isTRUE(identical(trimws(status[1]), "true"))
     }
     register_skill_from_fn("git_status", tool_git_status,
-                           available = .in_git_repo)
-    register_skill_from_fn("git_diff", tool_git_diff, available = .in_git_repo)
-    register_skill_from_fn("git_log", tool_git_log, available = .in_git_repo)
+                           available = .in_git_repo, class = "read")
+    register_skill_from_fn("git_diff", tool_git_diff, available = .in_git_repo,
+                           class = "read")
+    register_skill_from_fn("git_log", tool_git_log, available = .in_git_repo,
+                           class = "read")
 
     # Continual harness: one-line lesson capture, approval-gated via
-    # the per-tool permissions default ("ask") in load_config().
-    register_skill_from_fn("harness_note", tool_harness_note)
+    # the per-tool permissions default ("ask") in load_config(). It
+    # writes text that later sessions read.
+    register_skill_from_fn("harness_note", tool_harness_note, class = "write")
 
-    # Subagent tools
-    register_skill_from_fn("spawn_subagent", tool_spawn_subagent)
-    register_skill_from_fn("query_subagent", tool_query_subagent)
-    register_skill_from_fn("collect_subagent", tool_collect_subagent)
-    register_skill_from_fn("list_subagents", tool_list_subagents)
-    register_skill_from_fn("kill_subagent", tool_kill_subagent)
+    # Subagent tools. A child takes its parent's mode when it is spawned,
+    # and every call it makes passes the gate in that mode. A query runs
+    # an existing child, whose mode may predate the parent's, so it is a
+    # continuation. Collecting reads work that already ran.
+    register_skill_from_fn("spawn_subagent", tool_spawn_subagent,
+                           class = "control")
+    register_skill_from_fn("query_subagent", tool_query_subagent,
+                           class = "continue")
+    register_skill_from_fn("collect_subagent", tool_collect_subagent,
+                           class = "read")
+    register_skill_from_fn("list_subagents", tool_list_subagents,
+                           class = "read")
+    register_skill_from_fn("kill_subagent", tool_kill_subagent,
+                           class = "control")
 
     # Talker job tools: exposed only to talker-mode sessions
-    # (see .talker_filter_tools).
-    register_skill_from_fn("delegate", tool_delegate)
-    register_skill_from_fn("job_status", tool_job_status)
-    register_skill_from_fn("job_cancel", tool_job_cancel)
-    register_skill_from_fn("job_resume", tool_job_resume)
+    # (see .talker_filter_tools). A job may run in a worker started
+    # before the caller's mode changed, or in another room, so delegate
+    # and job_resume are continuations.
+    register_skill_from_fn("delegate", tool_delegate, class = "continue")
+    register_skill_from_fn("job_status", tool_job_status, class = "read")
+    register_skill_from_fn("job_cancel", tool_job_cancel, class = "control")
+    register_skill_from_fn("job_resume", tool_job_resume, class = "continue")
 
-    # Plan mode: exit_plan_mode is registered always but exposed in the
-    # tool list only when session$plan_mode is TRUE
-    # (see .plan_mode_filter_tools).
-    register_skill_from_fn("exit_plan_mode", tool_exit_plan_mode)
+    # Plan mode: exit_plan_mode is in the tool list of every session that
+    # can be in plan mode (.plan_mode_filter_tools()). It asks the person
+    # to leave plan mode (check_plan_exit(), R/policy.R), so plan mode
+    # lets it through; its class alone would run it unasked.
+    register_skill_from_fn("exit_plan_mode", tool_exit_plan_mode,
+                           class = "control")
 
     # Task tracker: schema only -- the real handlers live in
     # task_tool_intercept() called from .make_tool_handler(), so they
     # mutate the live session env directly (a registered stub handler
     # only ever sees ctx = list(), not the session).
-    register_skill_from_fn("task_create", tool_task_create)
-    register_skill_from_fn("task_update", tool_task_update)
+    register_skill_from_fn("task_create", tool_task_create, class = "control")
+    register_skill_from_fn("task_update", tool_task_update, class = "control")
 
     invisible(list_skills())
 }
@@ -1710,14 +1838,16 @@ register_builtin_skills <- function() {
 #' @param ctx Optional context (cwd, session, etc.)
 #' @param timeout Timeout in seconds (default 30)
 #' @param dry_run If TRUE, validate only without executing
+#' @param table serve()'s tool table (R/tool-table.R), or NULL for the
+#'   registry.
 #' @return MCP tool result
 #' @noRd
 call_tool <- function(name, args, ctx = list(), timeout = 30L,
-                      dry_run = FALSE) {
+                      dry_run = FALSE, table = NULL) {
     args <- args %||% list()
 
     # Try skill system first
-    skill <- get_skill(name)
+    skill <- tool_entry(name, table)
     if (!is.null(skill)) {
         return(skill_run(skill, args, ctx, timeout, dry_run))
     }

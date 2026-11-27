@@ -1,4 +1,8 @@
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 if (!requireNamespace("chat.api", quietly = TRUE)) exit_file("needs chat.api")
+if (!requireNamespace("mx.client", quietly = TRUE)) exit_file("needs mx.client")
 local({
     ns <- asNamespace("corteza")
     root <- tempfile("approval-mode-")
@@ -34,7 +38,7 @@ local({
     expect_identical(cmd$mode, "on")
     expect_null(ns$bot_parse_approval_mode("approve all the files in this essay"))
     expect_identical(ns$bot_parse_approval_mode(paste("/approve-all off", id))$job, id)
-    for (text in c("auto", "Auto", "@cornelius:cornball.ai auto", "approve-all", "/auto", "/auto on")) {
+    for (text in c("auto", "Auto", "@helper:example.org auto", "approve-all", "/auto", "/auto on")) {
         expect_null(ns$bot_parse_approval_mode(text))
         expect_null(ns$bot_job_auto_grant(chat, cfg, s, j))
     }

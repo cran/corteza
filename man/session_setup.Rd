@@ -69,22 +69,28 @@ from \code{config$base_url} (falling back to the
 endpoint or model errors here rather than at the first request.}
 }
 \value{
-A session environment from \code{\link{new_session}}, with an
-  extra \code{cwd} field and, for an auto-built system prompt, a
-  \code{context_manifest} field.
+A session environment from \code{\link{new_session}}, with
+  extra \code{cwd}, \code{config} and \code{tool_table} fields and, for
+  an auto-built system prompt, a \code{context_manifest} field.
 }
 \description{
 Performs pre-turn setup common to all channels:
 }
 \details{
 \enumerate{
-\item Loads project + global corteza config from \code{cwd}.
+\item Loads project + global corteza config from \code{cwd}. The
+project's files (its config, skills, instructions, lessons and
+briefing) are read only where the user has trusted the directory:
+see "Trusted projects" in \code{vignette("configuration")}.
 \item Resolves provider, model, and verifies the required API
 environment variable is set.
-\item Registers built-in skills and loads user/project skills and
-skill docs from \code{tools::R_user_dir("corteza", "data")/skills}
-and \code{<cwd>/.corteza/skills}.
-\item Loads skill packages declared in the config.
+\item Builds the session's own tool table: the built-in tools, the
+user's skills from \code{tools::R_user_dir("corteza", "data")/skills},
+the package functions the config lists and, in a trusted
+directory, the skills in \code{<cwd>/.corteza/skills}. The session
+offers and runs these, whatever another session in the process
+loads; a skill whose name is already taken is skipped with a
+message. Loads the skill docs from the same folders.
 \item Optionally builds the system prompt and source manifest via
 \code{load_context_bundle(cwd)}.
 \item Returns a \code{new_session()} built from the above.
@@ -92,10 +98,8 @@ and \code{<cwd>/.corteza/skills}.
 
 }
 \examples{
-\dontrun{
-# Requires the relevant provider API key in the environment.
-s <- session_setup("cli", provider = "anthropic",
-                   load_project_context = FALSE)
-s$model
-}
+# Reads the user's config and builds the tool table; sends nothing.
+s <- session_setup("console", cwd = tempdir(), provider = "anthropic",
+                   load_project_context = FALSE, validate_api_key = FALSE)
+s$provider
 }

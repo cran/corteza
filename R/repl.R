@@ -9,7 +9,7 @@
 # ctx fields:
 #   Mutable state (reassigned in the loop): disk_session,
 #     pending_r_context, last_assistant_response, provider, model
-#   Read state: config, cwd, ws_enabled, session (the turn_session env)
+#   Read state: config, cwd, session (the turn_session env)
 #   Hooks: read_input(prompt_str), palette (color list),
 #     render_reply(text), help_text(), new_session_fn(),
 #     handle_copy(text), format_tools(session), turn_fn(prompt, session)
@@ -137,10 +137,32 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
     # The session journal (R/journal.R) follows ctx$session$sessionId,
     # so a /clear moves it with the new on-disk session.
     journal_install(ctx$session, agent_id = DEFAULT_AGENT_ID)
+    # Once a day, what old sessions no longer need goes (R/retention.R).
+    # Said here because files were removed. The session this loop has
+    # open is left alone, and so is its worker's folder, named by the
+    # on-disk session (.repl_jobs_setup()).
+    keep <- unique(as.character(c(ctx$session$sessionId,
+                                  ctx$disk_session$sessionId)))
+    pruned <- retention_tick(keep = keep)
+    if (!is.null(pruned)) {
+        cat(ctx$palette$dim, pruned, ctx$palette$reset, "\n", sep = "")
+    }
     .repl_jobs_setup(ctx)
     # Covers exits by error or interrupt; /quit and EOF call it directly
     # so its message comes before "Bye.". A second call is a no-op.
     on.exit(if (!keep_jobs) .repl_jobs_shutdown(ctx), add = TRUE)
+    # The reviewer (R/review.R), where the approval mode is "review".
+    # What it settles is said in a dim line; what it passes on prompts.
+    if (is.environment(ctx$session)) {
+        ctx$session$on_review <- function(rec) {
+            line <- review_line(rec)
+            if (!is.null(line)) {
+                cat(ctx$palette$dim, line, ctx$palette$reset, "\n", sep = "")
+            }
+        }
+        review_apply(ctx$session)
+        on.exit(if (!keep_jobs) review_close(ctx$session), add = TRUE)
+    }
     while (TRUE) {
         # Delegated jobs surface here, between commands: the input read
         # below blocks, and nothing can print while it waits.
@@ -189,11 +211,6 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 if (!keep_jobs) {
                     .repl_jobs_shutdown(ctx)
                 }
-                if (ctx$ws_enabled) {
-                    ws_prune()
-                    tryCatch(ws_save(ctx$disk_session$sessionId),
-                             error = function(e) NULL)
-                }
                 cat(sprintf("%sBye.%s\n", ctx$palette$dim, ctx$palette$reset))
                 break
             }
@@ -203,6 +220,10 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
             }
             if (cmd == "/help") {
                 cat(ctx$help_text())
+                next
+            }
+            if (cmd == "/guide") {
+                start_guide(ctx, parts[-1L])
                 next
             }
             if (cmd == "/jobs") {
@@ -222,28 +243,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 next
             }
             if (cmd == "/tasks") {
-                if (length(parts) >= 2L &&
-                    identical(tolower(parts[2]), "clear")) {
-                    ctx$session$tasks <- list()
-                    ctx$session$tasks_dirty <- FALSE
-                    # Persist immediately. If the user clears and
-                    # exits before another assistant turn, the
-                    # post-turn dirty-flag sync would never fire and
-                    # the clear would be lost.
-                    ctx$disk_session$session$tasks <- list()
-                    tryCatch(session_save(ctx$disk_session$session),
-                             error = function(e) NULL)
-                    cat("Task list cleared.\n")
-                    next
-                }
-                rendered <- format_task_list_display(
-                    ctx$session$tasks %||% list(),
-                    palette = ctx$palette)
-                if (is.null(rendered)) {
-                    cat("No tasks.\n")
-                } else {
-                    cat(rendered, "\n", sep = "")
-                }
+                .repl_cmd_tasks(ctx, parts)
                 next
             }
             if (cmd == "/tools") {
@@ -259,17 +259,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 next
             }
             if (cmd == "/provider") {
-                if (length(parts) < 2L) {
-                    cat(sprintf("Current provider: %s\nUsage: /provider <name>\n",
-                                ctx$session$provider %||% "(default)"))
-                    next
-                }
-                ctx$session$provider <- parts[2]
-                ctx$provider <- parts[2]
-                if (!is.null(ctx$disk_session)) {
-                    ctx$disk_session$session$provider <- parts[2]
-                }
-                cat(sprintf("Provider set to %s\n", parts[2]))
+                cat(.repl_provider_command(ctx, parts))
                 next
             }
             if (cmd == "/spawn") {
@@ -417,7 +407,10 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 next
             }
             if (cmd == "/sessions") {
-                cat(format_session_list(session_list()), "\n")
+                # This directory's, or every directory's with "all".
+                every <- length(parts) >= 2L && parts[2] %in% c("all", "--all")
+                listed <- session_list(cwd = ctx$cwd %||% getwd(), all = every)
+                cat(format_session_list(listed, how = "/sessions all"), "\n")
                 next
             }
             if (cmd == "/trace") {
@@ -453,8 +446,20 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                     # lying about itself.
                     ctx$session$config$approval_mode <- res$mode
                     ctx$config$approval_mode <- res$mode
+                    # Kept when /clear builds the next session's config.
+                    ctx$config_set <- union(ctx$config_set, "approval_mode")
+                    review_apply(ctx$session)
                 }
                 cat(res$text, "\n")
+                next
+            }
+            if (cmd == "/trust") {
+                # Where this directory stands, and `/trust yes` to add it
+                # to the user's trusted directories. The session's prompt
+                # and tools are fixed while a conversation lasts, so a new
+                # answer applies from the next one (.repl_session_rebuild()).
+                cat(trust_command(ctx$cwd %||% getwd(), parts[-1],
+                                  when = .repl_trust_when()), sep = "\n")
                 next
             }
             if (cmd == "/auto") {
@@ -482,6 +487,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
             if (cmd == "/dryrun") {
                 ctx$session$config$dry_run <- !isTRUE(ctx$session$config$dry_run)
                 ctx$config$dry_run <- ctx$session$config$dry_run
+                ctx$config_set <- union(ctx$config_set, "dry_run")
                 cat(sprintf("Dry-run mode %s\n",
                         if (isTRUE(ctx$session$config$dry_run))
                             "enabled (tools preview only)"
@@ -536,80 +542,19 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 }
                 cat(.context_edit_command(ctx$session, arg), "\n")
                 ctx$config$context_edit <- ctx$session$config$context_edit
+                ctx$config_set <- union(ctx$config_set, "context_edit")
                 next
             }
             if (cmd %in% c("/context", "/status")) {
-                cat(.context_edit_status(ctx$session), "\n")
-                files <- ctx$config$context_files %||% character(0)
-                sources <- ctx$session$context_manifest$sources %||% NULL
-                tools <- tryCatch(
-                                  skills_as_api_tools(ctx$session$tools_filter),
-                                  error = function(e) list()
-                )
-                tools <- .context_edit_tools(tools, ctx$session)
-                sys_tok <- estimate_text_tokens(
-                    .context_edit_system(ctx$session$system, ctx$session) %||% "")
-                tools_tok <- estimate_tool_tokens(tools)
-                hist_tok <- estimate_history_tokens(
-                    ctx$session$history %||% list()
-                )
-                total_tok <- as.integer(sys_tok + tools_tok + hist_tok)
-                disp_model <- ctx$model %||% ctx$session$model_map$cloud %||%
-                "(default)"
-                limit <- context_limit_for_model(
-                    disp_model,
-                    provider = ctx$session$provider %||% ctx$provider
-                )
-                # Codex-style header: corteza version, model, dir,
-                # session id. /status is now an alias of /context
-                # showing the same block.
-                status_info <- list(
-                                    corteza = as.character(utils::packageVersion("corteza")),
-                                    model = sprintf("%s @ %s", disp_model,
-                        ctx$session$provider %||% ctx$provider),
-                                    dir = ctx$cwd,
-                                    session = ctx$disk_session$session$sessionKey %||%
-                                    ctx$disk_session$session$sessionId %||% "(unset)"
-                )
-                cat(format_context_block(
-                        used = total_tok,
-                        limit = limit,
-                        breakdown = list(system = sys_tok,
-                            tools = tools_tok,
-                            history = hist_tok),
-                        compact_pct = ctx$config$context_compact_pct %||% 90L,
-                        warn_pct = ctx$config$context_warn_pct %||% 75L,
-                        high_pct = ctx$config$context_high_pct %||% 90L,
-                        crit_pct = ctx$config$context_crit_pct %||% 95L,
-                        files = files,
-                        sources = sources,
-                        palette = ctx$palette,
-                        status_info = status_info
-                    ), "\n", sep = "")
+                .repl_status(ctx)
                 next
             }
             if (cmd == "/compact") {
-                live_messages <- ctx$session$history %||% list()
-                if (length(live_messages) < 2L) {
+                if (length(ctx$session$history %||% list()) < 2L) {
                     cat("Nothing to compact.\n")
                     next
                 }
-                result <- .repl_interruptible(
-                    tryCatch(maybe_compact_turn_session(
-                            ctx$session,
-                            ctx$config,
-                            kind = ctx$session$kind %||% NULL,
-                            tools = tryCatch(
-                                skills_as_api_tools(ctx$session$tools_filter),
-                                error = function(e) NULL),
-                            system = ctx$session$system,
-                            threshold = 0,
-                            min_messages = 2L,
-                            reason = "manual"
-                        ), error = function(e) {
-                    message("Compaction failed: ", conditionMessage(e))
-                    FALSE
-                }),
+                result <- .repl_interruptible(.compact_now(ctx$session, ctx$config),
                     ctx$palette)
                 if (inherits(result, "repl_interrupted")) {
                     next
@@ -666,15 +611,16 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 next
             }
             if (cmd == "/doctor") {
-                tools <- skills_as_api_tools(ctx$session$tools_filter)
-                disp_model <- ctx$model %||% ctx$session$model_map$cloud %||%
+                tools <- session_request_parts(ctx$session)$tools
+                route <- .repl_work_route(ctx)
+                disp_model <- route$model %||% ctx$session$model_map$cloud %||%
                 "(default)"
                 docs <- tryCatch(list_skill_docs(),
                                  error = function(e) character())
                 cat(format_doctor_report(
                         cwd = ctx$cwd,
                         session = ctx$disk_session$session,
-                        provider = ctx$session$provider %||% ctx$provider,
+                        provider = route$provider,
                         display_model = disp_model,
                         tools = tools,
                         config = ctx$config,
@@ -684,11 +630,12 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 next
             }
             if (cmd == "/config") {
-                disp_model <- ctx$model %||% ctx$session$model_map$cloud %||%
+                route <- .repl_work_route(ctx)
+                disp_model <- route$model %||% ctx$session$model_map$cloud %||%
                 "(default)"
                 cat(format_config_summary(
                         config = ctx$config,
-                        provider = ctx$session$provider %||% ctx$provider,
+                        provider = route$provider,
                         display_model = disp_model,
                         opts = list(port = ctx$config$port,
                                     tools = ctx$session$tools_filter,
@@ -782,10 +729,8 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                                 ctx$palette$reset))
                     next
                 }
-                provider_check <- provider_status(
-                    ctx$session$provider %||% ctx$provider,
-                    ctx$model
-                )
+                route <- .repl_work_route(ctx)
+                provider_check <- provider_status(route$provider, route$model)
                 if (!isTRUE(provider_check$ok)) {
                     cat(sprintf("%sReview unavailable: %s%s\n",
                                 ctx$palette$yellow, provider_check$message,
@@ -795,8 +740,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                 cat(sprintf("%sReviewing diff against %s...%s\n",
                             ctx$palette$dim, material$target, ctx$palette$reset))
                 review_result <- run_review(
-                    ctx$session$provider %||% ctx$provider,
-                    ctx$model, material$target,
+                    route$provider, route$model, material$target,
                     material$status, material$diff, session = ctx$session
                 )
                 if (inherits(review_result, "error")) {
@@ -922,6 +866,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
             next
         }
 
+        typed <- prompt
         if (length(ctx$pending_r_context) > 0) {
             prompt <- paste(c(ctx$pending_r_context, prompt), collapse = "\n\n")
             ctx$pending_r_context <- character(0)
@@ -929,9 +874,22 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
         # auto_run_id is set for the life of an auto run and NULL
         # otherwise, so attended messages keep their exact format while
         # a run's worker conversation partitions cleanly from disk --
-        # including two runs with the same goal in one session.
+        # including two runs with the same goal in one session. In a run
+        # the driver writes the prompt, and what the person typed is what
+        # started the run.
+        person_typed <- typed
+        if (!is.null(ctx$session$auto_run_id)) {
+            person_typed <- ctx$session$auto_typed
+        }
         transcript_append(ctx$disk_session$session, "user", prompt,
-                          auto_run_id = ctx$session$auto_run_id)
+                          auto_run_id = ctx$session$auto_run_id,
+                          typed = person_typed)
+        # The first prompt names the conversation in lists: what the
+        # person typed, without the R context sent along with it.
+        if (!is.null(ctx$disk_session$session)) {
+            ctx$disk_session$session <- session_title_once(
+                ctx$disk_session$session, typed)
+        }
 
         cat(sprintf("%s\u25cf%s Thinking with %s%s%s\n",
                     ctx$palette$cyan, ctx$palette$reset,
@@ -1012,6 +970,13 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
             ctx$last_turn_error <- conditionMessage(e)
             message(sprintf("%sError:%s %s",
                             ctx$palette$bright_magenta, ctx$palette$reset, e$message))
+            # Every prompt gets a line after it, as the paths above
+            # write theirs: the reviewer reads a prompt with none before
+            # the next one as a reply the transcript lost
+            # (review_conversation()).
+            transcript_append(ctx$disk_session$session, "assistant",
+                              paste("Error:", conditionMessage(e)),
+                              auto_run_id = ctx$session$auto_run_id)
             NULL
         }
         )
@@ -1075,31 +1040,29 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
         # *live* history (ctx$session$history), not session$messages,
         # then print a terse one-line indicator and auto-compact when we
         # cross the compaction threshold.
-        sys_tok <- estimate_text_tokens(
-                                        .context_edit_system(ctx$session$system, ctx$session) %||% "")
-        compact_tools <- tryCatch(
-                                  skills_as_api_tools(ctx$session$tools_filter),
-                                  error = function(e) list())
-        compact_tools <- .context_edit_tools(compact_tools, ctx$session)
+        # What the next request carries (R/request-prefix.R), which a
+        # compaction below sends too.
+        parts <- tryCatch(session_request_parts(ctx$session),
+                          error = function(e) list(system = ctx$session$system %||% "",
+                tools = list()))
+        sys_tok <- estimate_text_tokens(parts$system)
+        compact_tools <- parts$tools
         tools_tok <- estimate_tool_tokens(compact_tools)
         hist_tok <- estimate_history_tokens(ctx$session$history %||% list())
         used <- as.integer(sys_tok + tools_tok + hist_tok)
-        # A model-less chat() session (no explicit model, model_map$cloud
-        # still the placeholder) resolves to the provider default so the
-        # meter shows the real limit; context_limit_for_model tolerates a
-        # NULL here regardless.
-        model <- ctx$model %||% ctx$session$model_map$cloud %||%
-        default_provider_model(ctx$session$provider)
-        limit <- context_limit_for_model(
-            model,
-            provider = ctx$session$provider %||% ctx$provider
-        )
+        # The window and the trigger come from the resolver the
+        # compactor uses (R/compact-trigger.R), so the meter shows a
+        # context_window from the config and the percentage at which
+        # the cap starts a compaction. A model-less chat() session
+        # resolves to the provider default there.
+        trig <- context_trigger(ctx$session, ctx$config)
+        limit <- trig$window
         if (!is.null(limit) && limit > 0L) {
             pct <- 100 * used / limit
         } else {
             pct <- 0
         }
-        compact_pct <- ctx$config$context_compact_pct %||% 90
+        compact_pct <- trig$effective_pct
         cat(.repl_context_indicator(
                                     used, limit, ctx$palette,
                                     list(warn = ctx$config$context_warn_pct %||% 75,
@@ -1108,11 +1071,7 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
                     compact = compact_pct)
             ), "\n")
 
-        compact_system <- task_compose_system(
-            .plan_mode_compose_system(ctx$session$system,
-                                      isTRUE(ctx$session$plan_mode)),
-            ctx$session$tasks %||% list(), channel = ctx$session$channel,
-            auto = !is.null(ctx$session$auto_run_id))
+        compact_system <- parts$system
         comp <- .repl_interruptible(
                                     tryCatch(maybe_compact_turn_session(
                     ctx$session,
@@ -1127,6 +1086,9 @@ run_repl_loop <- function(ctx, keep_jobs = FALSE) {
             cat(sprintf("%sAuto-compacted (context was %.0f%%).%s\n",
                         ctx$palette$dim, pct, ctx$palette$reset))
         }
+        # A job the turn handed off: stay with it, printing as it goes,
+        # until it ends or Ctrl+C (R/repl-jobs.R).
+        .repl_attach_jobs(ctx)
     }
 
     invisible(NULL)

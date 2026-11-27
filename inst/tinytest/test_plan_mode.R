@@ -88,20 +88,19 @@ expect_true(isTRUE(s$plan_mode))
 s2 <- corteza::new_session(channel = "cli", provider = "anthropic")
 expect_false(isTRUE(s2$plan_mode))
 
-# ---- .plan_mode_compose_system ----
+# ---- .plan_mode_note ----
+# Plan mode reaches the model as a note at the head of the next prompt;
+# the system text stays as it is (WP14, test_request_prefix.R).
 
-# Off: returns the base system prompt verbatim.
-expect_identical(
-    corteza:::.plan_mode_compose_system("base", FALSE),
-    "base"
-)
-# On with base: appends the addendum.
-out <- corteza:::.plan_mode_compose_system("base", TRUE)
-expect_true(grepl("# Plan mode", out, fixed = TRUE))
-expect_true(grepl("^base", out))
-# On with null base: addendum only, still mentions plan mode.
-out_null <- corteza:::.plan_mode_compose_system(NULL, TRUE)
-expect_true(grepl("# Plan mode", out_null, fixed = TRUE))
+# On: what to produce, and how to leave.
+on <- corteza:::.plan_mode_note(TRUE)
+expect_true(grepl("^\\[Plan mode is on\\.", on))
+expect_true(grepl("exit_plan_mode", on, fixed = TRUE))
+expect_true(grepl("\\]$", on))
+# Off: says so, and nothing about exit_plan_mode.
+off <- corteza:::.plan_mode_note(FALSE)
+expect_true(grepl("^\\[Plan mode is off\\.", off))
+expect_false(grepl("exit_plan_mode", off, fixed = TRUE))
 
 # ---- .plan_mode_filter_tools ----
 
@@ -159,3 +158,98 @@ handler <- corteza:::.make_tool_handler(
 expect_true(isTRUE(s_flip$plan_mode))
 handler("exit_plan_mode", list(plan = "do X"))
 expect_false(isTRUE(s_flip$plan_mode))
+
+# ---- Leaving plan mode asks a person ----
+# exit_plan_mode is a control tool, which runs unasked, and the tool
+# answers "Plan approved": before 0.8.1 the model left plan mode on its
+# own word. policy() asks (rule "plan_exit"), and nothing after the
+# mode answers it for the person.
+local({
+    leave <- function(config = NULL, channel = "cli", plan_mode = TRUE) {
+        corteza::policy(list(tool = "exit_plan_mode",
+                             args = list(plan = "1. edit a.R"),
+                             channel = channel,
+                             context = list(plan_mode = plan_mode)), config)
+    }
+    d <- leave()
+    expect_equal(d$approval, "ask")
+    expect_identical(d$rule, "plan_exit")
+    expect_true(corteza:::.person_rule(d))
+    expect_true(corteza:::.person_rule(list(rule = "credential")))
+    expect_false(corteza:::.person_rule(list(rule = "plan_mode")))
+    expect_false(corteza:::.person_rule(list()))
+    for (config in list(list(approval_mode = "allow"),
+                        list(approval_mode = "deny"),
+                        list(permissions = list(exit_plan_mode = "allow")))) {
+        expect_identical(leave(config)$rule, "plan_exit")
+        expect_equal(leave(config)$approval, "ask")
+    }
+    op <- options(corteza.policy = function(call) {
+        list(model = "cloud", approval = "allow", reason = "anything goes")
+    })
+    on.exit(options(op), add = TRUE)
+    expect_identical(leave()$rule, "plan_exit")
+    expect_identical(leave(channel = "matrix")$rule, "plan_exit")
+    expect_identical(leave(channel = "console")$rule, "plan_exit")
+    # Outside plan mode the rule says nothing: turn()'s handler refuses
+    # the call by name before policy() is asked.
+    expect_null(corteza:::check_plan_exit(list(tool = "exit_plan_mode",
+                                               context = list(plan_mode = FALSE))))
+})
+
+# The handler: a no keeps plan mode, and the model is told; a yes ends
+# it. The approval callback is shown the rule.
+local({
+    seen <- list()
+    answer <- FALSE
+    s <- corteza::new_session(channel = "console", provider = "anthropic",
+                              plan_mode = TRUE,
+                              approval_cb = function(call, decision) {
+                                  seen[[length(seen) + 1L]] <<- decision
+                                  answer
+                              })
+    ran <- 0L
+    handler <- corteza:::.make_tool_handler(s, tool_executor = function(name, args) {
+        ran <<- ran + 1L
+        corteza::tool_exit_plan_mode(args$plan)
+    })
+    out <- handler("exit_plan_mode", list(plan = "1. edit a.R"))
+    expect_true(isTRUE(s$plan_mode))
+    expect_equal(ran, 0L)
+    expect_identical(seen[[1L]]$rule, "plan_exit")
+    expect_false(grepl("Plan approved", paste(unlist(out), collapse = " ")))
+    answer <- TRUE
+    handler("exit_plan_mode", list(plan = "1. edit a.R"))
+    expect_false(isTRUE(s$plan_mode))
+    expect_equal(ran, 1L)
+})
+
+# Unattended gates send it to a person: a room's supervisor, and the
+# hall monitor of an /auto run, which ends the run there.
+local({
+    d <- corteza:::check_plan_exit(list(tool = "exit_plan_mode",
+                                        context = list(plan_mode = TRUE)))
+    call <- list(tool = "exit_plan_mode", args = list(plan = "1. edit a.R"),
+                 channel = "matrix", class = "control")
+    root <- tempfile("plan-exit-")
+    dir.create(root)
+    on.exit(unlink(root, recursive = TRUE), add = TRUE)
+    v <- corteza:::supervisor_route(call, d, cwd = root, root = root)
+    expect_identical(v$route, "human")
+    expect_true(any(grepl("would end plan mode", v$flags, fixed = TRUE)))
+    m <- corteza:::monitor_in_envelope(call, d)
+    expect_false(m$ok)
+    expect_true(grepl("plan mode", m$reason, fixed = TRUE))
+})
+
+# chat()'s callback: an "always" held for the tool does not answer it.
+local({
+    cb <- corteza:::chat_approval_cb(tempdir())
+    answered <- attr(cb, "answered")
+    attr(cb, "always")(list(tool = "exit_plan_mode"))
+    expect_true(isTRUE(answered(list(tool = "exit_plan_mode"),
+                                list(approval = "ask"))))
+    expect_false(isTRUE(answered(list(tool = "exit_plan_mode"),
+        corteza:::check_plan_exit(list(tool = "exit_plan_mode",
+                                       context = list(plan_mode = TRUE))))))
+})

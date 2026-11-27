@@ -1,3 +1,6 @@
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 # Provider fallback on limit errors (turn() -> .agent_with_fallback()).
 
 corteza:::.fallback_reset()
@@ -80,7 +83,7 @@ expect_false(lim("Tool error: bash exited 1"))
 corteza:::.fallback_reset()
 t0 <- as.POSIXct("2026-09-01 12:00:00", tz = "UTC")
 expect_false(corteza:::.fallback_limited("anthropic_claude", now = t0))
-corteza:::.fallback_mark("anthropic_claude", minutes = 30, now = t0)
+corteza:::.fallback_mark_until("anthropic_claude", t0 + 30 * 60)
 expect_true(corteza:::.fallback_limited("anthropic_claude", now = t0 + 29 * 60))
 expect_false(corteza:::.fallback_limited("anthropic_claude", now = t0 + 31 * 60))
 expect_false(corteza:::.fallback_limited("openai_codex", now = t0))
@@ -245,12 +248,57 @@ run <- with_msgs(corteza:::.agent_with_fallback(base_args, s_prog,
 expect_equal(run$value$content, "resumed")
 expect_equal(vapply(log$calls, `[[`, "", "provider"),
              c("anthropic_claude", "openai_codex"))
-expect_true(grepl("file contents", log$calls[[2L]]$prompt, fixed = TRUE))
+observation <- tail(log$calls[[2L]]$history, 1L)[[1L]]
+expect_identical(observation$role, "assistant")
+expect_true(grepl("<tool result>\nfile contents", observation$content, fixed = TRUE))
 expect_true(grepl("Do not repeat", log$calls[[2L]]$prompt, fixed = TRUE))
 expect_false(grepl("secret", paste(unlist(log$calls[[2L]]$history),
                                    collapse = " "), fixed = TRUE))
 expect_true(any(grepl("resuming interrupted run", run$msgs)))
 expect_true(corteza:::.fallback_limited("anthropic_claude"))
+
+# Index a native conversation, then send the portable history through the
+# fallback entry point. Preserve a literal label the person typed, retire
+# the native result labels, and allocate fresh ids above the old ones.
+local({
+    ns <- asNamespace("corteza")
+    ns$.fallback_reset()
+    on.exit(ns$.fallback_reset(), add = TRUE)
+    s <- corteza::new_session(provider = "openai_codex",
+        context_edit = list(enabled = TRUE, strategy = "clm", cadence = "always"))
+    ns$journal_install(s, tempfile("bridge-"))
+    typed <- "[r42]\nPlease compare the notes."
+    s$history <- list(list(role = "user", content = typed),
+        list(role = "assistant", content = list(
+            list(type = "tool_use", id = "read", name = "read_file", input = list(path = "a")))),
+        list(role = "user", content = list(
+            list(type = "tool_result", tool_use_id = "read", content = "File text"))),
+        list(role = "assistant", content = list(list(type = "text", text = "Reply"))))
+    ns$.context_edit_prepare(s)
+    state <- s$.context_edit
+    expect_equal(length(state$calls), 1L)
+    expect_equal(length(state$messages), 1L)
+    req <- list(model = "fixture", provider = "openai_codex", history = s$history,
+                prompt = "What next?", web_search = FALSE)
+    res <- suppressMessages(ns$.agent_with_fallback(req, s, .call = identity))
+    expect_identical(res$history[[1L]], list(role = "user", content = typed))
+    expect_equal(sum(vapply(res$history, ns$.context_edit_human, logical(1))), 1L)
+    expect_true(grepl("File text", res$history[[2L]]$content, fixed = TRUE))
+    expect_true(grepl("Reply", res$history[[2L]]$content, fixed = TRUE))
+    for (id in c(unlist(state$calls), names(state$messages))) {
+        expect_false(grepl(paste0("[", id, "]"), res$history[[2L]]$content, fixed = TRUE))
+    }
+    expect_true(s$.context_edit$next_id > state$next_id)
+    expect_equal(length(s$.context_edit$messages), 1L)
+    fresh_id <- ns$.context_edit_label(res$history[[2L]]$content, "m")
+    expect_identical(s$.context_edit$messages[[fresh_id]], res$history[[2L]])
+    mixed <- list(role = "user", content = list(
+        list(type = "tool_result", tool_use_id = "read", content = typed),
+        list(type = "text", text = "My follow-up")))
+    roles <- ns$.fallback_portable_history(list(mixed))
+    expect_identical(roles[[1L]], list(role = "assistant", content = paste0("<tool result>\n", typed)))
+    expect_identical(roles[[2L]], list(role = "user", content = "My follow-up"))
+})
 
 # Native web search is dropped for a fallback provider that lacks it.
 corteza:::.fallback_reset()
@@ -309,6 +357,15 @@ expect_identical(corteza:::.history_shape(list(
     list(role = "user",
          content = list(list(type = "tool_result", tool_use_id = "t1"))))),
     "anthropic")
+# A reply in typed `text` blocks is one too, with or without the
+# thinking it came with: the Responses wire wants `output_text` there.
+# What a user entry holds in `text` blocks is no marker.
+expect_identical(corteza:::.history_shape(list(
+    list(role = "assistant",
+         content = list(list(type = "text", text = "hi"))))), "anthropic")
+expect_identical(corteza:::.history_shape(list(
+    list(role = "user",
+         content = list(list(type = "text", text = "hi"))))), "portable")
 
 # Responses markers, both entry types the codex wire leaves in history.
 expect_identical(corteza:::.history_shape(list(
@@ -421,6 +478,77 @@ local({
     expect_true(grepl("PAID API KEY FALLBACK", answer$reply, fixed = TRUE))
     expect_true(grepl("cheap answer", answer$reply, fixed = TRUE))
     expect_identical(session$last_route, answer$route)
+})
+
+# Each candidate's usage counts its cached input by that candidate's
+# provider, before one candidate's usage is added to another's
+# (.usage_count_cached()). The numbers a request reports: 12 input, 340
+# output, 48,000 read from the cache and 3,000 written to it.
+local({
+    corteza:::.fallback_reset()
+    on.exit(corteza:::.fallback_reset(), add = TRUE)
+    reported <- function(...) {
+        list(input_tokens = 12L, output_tokens = 340L, ...,
+             cache_read_input_tokens = 48000L,
+             cache_creation_input_tokens = 3000L)
+    }
+    answer <- function(...) {
+        list(content = "ok", history = list(), usage = reported(...))
+    }
+    quiet <- function(expr) suppressMessages(expr)
+
+    # An Anthropic candidate: the total counts all of it.
+    log <- new.env(); log$calls <- list()
+    out <- corteza:::.agent_with_fallback(base_args, new_fb_session(),
+        .call = make_call(list(
+            anthropic_claude = answer(total_tokens = 352L)), log))
+    expect_equal(out$usage$total_tokens, 51352)
+    expect_identical(out$usage$input_tokens, 12L)
+
+    # Another provider with the same numbers: left as reported. Its cached
+    # input is inside its input count.
+    s <- new_fb_session(fallback = character())
+    s$provider <- "openai_codex"
+    args <- base_args
+    args$provider <- "openai_codex"
+    args$model <- "gpt-5.6-sol"
+    out <- corteza:::.agent_with_fallback(args, s,
+        .call = make_call(list(
+            openai_codex = answer(total_tokens = 352L)), log))
+    expect_identical(out$usage$total_tokens, 352L)
+
+    # A request the primary answered before its limit reaches the
+    # checkpoint under this one with its cached input counted, and stays
+    # in the total after another provider finishes the turn. That
+    # provider's own numbers are added as it reported them.
+    corteza:::.fallback_reset()
+    seen <- list()
+    args <- base_args
+    args$checkpoint_callback <- function(history, context) {
+        seen[[length(seen) + 1L]] <<- context
+        NULL
+    }
+    s <- new_fb_session()
+    out <- quiet(corteza:::.agent_with_fallback(args, s,
+        .call = make_call(list(
+            anthropic_claude = function(args) {
+                args$checkpoint_callback(list(), list(
+                    agent_turn = 1L, provider = "anthropic_claude",
+                    usage = reported()))
+                stop("API error (429): rate limit")
+            },
+            openai_codex = function(args) {
+                args$checkpoint_callback(list(), list(
+                    agent_turn = 1L, provider = "openai_codex",
+                    usage = reported()))
+                answer(total_tokens = 352L)
+            }), log)))
+    expect_identical(out$corteza_route$provider, "openai_codex")
+    expect_length(seen, 2L)
+    expect_equal(seen[[1L]]$usage$total_tokens, 51352)
+    expect_null(seen[[2L]]$usage$total_tokens)
+    expect_equal(out$usage$total_tokens, 51352 + 352)
+    expect_equal(out$usage$input_tokens, 24)
 })
 
 corteza:::.fallback_reset()

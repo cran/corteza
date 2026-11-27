@@ -23,6 +23,9 @@ local({
 
     global_path <- corteza:::corteza_config_path("config.json")
     dir.create(dirname(global_path), recursive = TRUE)
+    # A project's config, and a context file named through the project,
+    # load from a trusted directory only (R/trust.R).
+    corteza:::project_trust_add(project)
     writeLines('{"context_files": ["global.md"]}', global_path)
     project_path <- file.path(project, ".corteza", "config.json")
     writeLines('{"provider": "anthropic"}', project_path)
@@ -110,6 +113,13 @@ local({
 
     previous_cache <- Sys.getenv("R_USER_CACHE_DIR", unset = NA_character_)
     Sys.setenv(R_USER_CACHE_DIR = cache)
+    # The project's config, context file and skills load from a trusted
+    # directory only (R/trust.R). The list of those is the user's, so
+    # this block gets a config directory of its own before it adds to it.
+    previous_config <- Sys.getenv("R_USER_CONFIG_DIR", unset = NA_character_)
+    config_home <- tempfile("archival-context-config-")
+    Sys.setenv(R_USER_CONFIG_DIR = config_home)
+    corteza:::project_trust_add(project)
     original_archive <- getFromNamespace("archival_archive_turn", "corteza")
     assignInNamespace(
         "archival_archive_turn",
@@ -124,8 +134,14 @@ local({
         } else {
             Sys.setenv(R_USER_CACHE_DIR = previous_cache)
         }
+        if (is.na(previous_config)) {
+            Sys.unsetenv("R_USER_CONFIG_DIR")
+        } else {
+            Sys.setenv(R_USER_CONFIG_DIR = previous_config)
+        }
         unlink(project, recursive = TRUE)
         unlink(cache, recursive = TRUE)
+        unlink(config_home, recursive = TRUE)
     }, add = TRUE)
 
     prefix <- list(corteza:::context_text_source(
@@ -180,4 +196,29 @@ local({
         session$instruction_catalog, "project:refresh"
     )
     expect_true(grepl("new-skill-body", refreshed_skill, fixed = TRUE))
+
+    # A talker's guidance is a source of its context as well, ordered
+    # last, so the refresh renders it again, once (the terminal's /clear
+    # dropped it the same way, Codex's #293 review).
+    corteza:::talker_enable(session, list(enabled = TRUE))
+    guidance <- trimws(corteza:::TALKER_GUIDANCE, which = "right")
+    expect_true(endsWith(session$system, guidance))
+    session$history <- list(
+        list(role = "user", content = "archive this turn too"),
+        list(role = "assistant", content = "finished again")
+    )
+    corteza:::maybe_archive_turn(
+        turn_session = session,
+        prompt = "archive this turn too",
+        pre_turn_len = 0L,
+        result = list(reply = "finished again"),
+        config = config,
+        parent_session_id = "test-parent"
+    )
+    expect_equal(lengths(regmatches(session$system,
+                                    gregexpr(guidance, session$system, fixed = TRUE))), 1L)
+    expect_true(endsWith(session$system, guidance))
+    expect_identical(session$system,
+                     saber::context_render(session$context_manifest))
+    expect_true(grepl("matrix-prefix-sentinel", session$system, fixed = TRUE))
 })

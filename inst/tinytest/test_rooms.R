@@ -1,9 +1,19 @@
+# Slow. Skipped on CRAN for check time; CI sets NOT_CRAN.
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
+    exit_file("slow; runs at home and in CI")
+}
+
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 library(tinytest)
 
-# Matrix config/extract helpers delegate to mx.client (Suggests). Skip
-# when it's not installed (e.g. R CMD check without the GitHub mirror).
+# The Matrix fixtures use mx.client for config and chat.api for messages.
 if (!requireNamespace("mx.client", quietly = TRUE)) {
     exit_file("mx.client not available")
+}
+if (!requireNamespace("chat.api", quietly = TRUE)) {
+    exit_file("chat.api not available")
 }
 
 expect_true(is.function(corteza::bot_configure))
@@ -41,7 +51,7 @@ local({
   }, add = TRUE)
 
   cfg <- list(
-    server = "https://example",
+    server = "https://ex.invalid",
     user = "bot",
     password = "pw",
     token = "tok",
@@ -63,11 +73,28 @@ local({
   }
 })
 
-# bot_new_session wires config into a turn session.
-# Skipped in R CMD check: needs MOONSHOT_API_KEY via new_session().
-if (at_home()) local({
+# Exercise the real room registry with offline metadata and model discovery.
+with_room_services <- function(code) {
+    ns <- asNamespace("corteza")
+    old_chat <- ns$bot_channel_info
+    old_local <- ns$default_local_model
+    key <- Sys.getenv("MOONSHOT_API_KEY", unset = NA_character_)
+    on.exit({
+        assignInNamespace("bot_channel_info", old_chat, ns)
+        assignInNamespace("default_local_model", old_local, ns)
+        if (is.na(key)) Sys.unsetenv("MOONSHOT_API_KEY") else Sys.setenv(MOONSHOT_API_KEY = key)
+    }, add = TRUE)
+    assignInNamespace("bot_channel_info", function(chat, room_id) {
+        list(id = room_id, name = "Fixture room", topic = NULL)
+    }, ns)
+    assignInNamespace("default_local_model", function() NULL, ns)
+    Sys.setenv(MOONSHOT_API_KEY = "fixture")
+    force(code)
+}
+run_room_sessions <- at_home() || identical(Sys.getenv("NOT_CRAN"), "true")
+if (run_room_sessions) with_room_services({
   cfg <- list(
-    server = "https://example",
+    server = "https://ex.invalid",
     user = "bot",
     user_id = "@bot:example",
     token = "tok",
@@ -152,10 +179,14 @@ local({
   proj <- file.path(tmp_home, "project")
   dir.create(file.path(proj, ".git"), recursive = TRUE)
   fake <- function(task) {
+    s <- get(".subagent_state", asNamespace("corteza"))$session
+    s$history <- c(s$history, list(list(role = "user", content = task)))
     id <- sub(".*REQUEST-ID: ([A-Za-z0-9_-]+).*", "\\1", task)
-    verdict <- if (grepl("refuse-me", task)) {
+    # The call's own arguments: the request also lists the earlier calls.
+    args <- sub("(?s).*ARGUMENTS:\n(.*?)\n\n.*", "\\1", task, perl = TRUE)
+    verdict <- if (grepl("refuse-me", args)) {
       "refuse"
-    } else if (grepl("escalate-me", task)) {
+    } else if (grepl("escalate-me", args)) {
       "escalate"
     } else {
       "approve"
@@ -163,14 +194,29 @@ local({
     list(reply = sprintf("REQUEST: %s\nVERDICT: %s\nREASON: because %s", id,
                          verdict, verdict))
   }
+  # The monitor reads the room's conversation (R/room-record.R): it needs
+  # a record that begins with the conversation, and someone who may
+  # approve, whose line asks for the work. test_room_record.R covers the
+  # rest.
+  real_approvers <- corteza:::bot_room_approvers
+  assignInNamespace("bot_room_approvers", function(cfg, room_id) "@troy:ex",
+                    ns = "corteza")
+  on.exit(assignInNamespace("bot_room_approvers", real_approvers,
+                            ns = "corteza"), add = TRUE)
   supervised <- function(auto) {
     s <- new.env()
     s$cwd <- proj
     s$config <- list()
     s$job_key <- "!r:ex"
-    s$supervisor_goal <- list(text = "tidy the package", id = "$m1")
-    s$job_worker_spec <- list(init_fn = function(spec) invisible(TRUE),
-                              run_fn = fake)
+    s$conversation_id <- corteza:::job_new_id()
+    corteza:::bot_record_attach(s, cfg, "!r:ex", "conversation")
+    corteza:::bot_transcript_add(s, "$m1", "user", "tidy the package",
+                                 event = list(sender = "@troy:ex",
+                                              body = "tidy the package"))
+    s$job_worker_spec <- list(init_fn = function(spec) {
+      state <- get(".subagent_state", asNamespace("corteza"))
+      state$session <- corteza::new_session()
+    }, run_fn = fake)
     corteza:::bot_supervise_session(s, c(cfg, list(auto_approve_asks = auto)),
                                     "!r:ex")
     s
@@ -282,17 +328,18 @@ local({
     list(channel = channel, inviter = inviter)
   }
   invites <- list(inv("!newroom:ex"), inv("!another:ex"))
-  # No operators configured: everything is accepted, as before.
-  expect_equal(corteza:::bot_allowed_invites(invites),
-               c("!newroom:ex", "!another:ex"))
-  # Nothing pending -> character(0), not NULL.
+  # No operators configured: nothing is accepted. Up to 0.8.0
+  # everything was.
+  expect_equal(suppressMessages(corteza:::bot_allowed_invites(invites)),
+               character())
+  # Nothing pending -> character(0), not NULL, and nothing to report.
   expect_equal(corteza:::bot_allowed_invites(list()), character())
+  expect_silent(corteza:::bot_allowed_invites(list()))
 })
 
 # The session registry hands out the same session for the same room.
-# Skipped in R CMD check: creates sessions that need MOONSHOT_API_KEY.
-if (at_home()) local({
-  cfg <- list(server = "https://example", user = "bot",
+if (run_room_sessions) with_room_services({
+  cfg <- list(server = "https://ex.invalid", user = "bot",
               user_id = "@bot:ex", room_id = "!dm:ex",
               model = "kimi-k2.5", provider = "moonshot",
               tools_filter = NULL, auto_approve_asks = TRUE)
@@ -496,153 +543,48 @@ local({
 
 # bot_configure validates bots before any network call.
 expect_error(
-  corteza::bot_configure("https://example", "bot", "pw", "!r:ex",
+  corteza::bot_configure("https://ex.invalid", "bot", "pw", "!r:ex",
                             bots = "not-an-mxid"),
   pattern = "Matrix ID"
 )
 
-# Agent name is the localpart as written, so the default workspace matches
-# the instance directory (~/cornelius, not ~/Cornelius).
-expect_equal(
-  corteza:::bot_agent_name(list(user_id = "@cornelius:cornball.ai")),
-  "cornelius"
-)
-expect_equal(
-  corteza:::bot_agent_name(list(user_id = "@cloptimus:example")),
-  "cloptimus"
-)
-expect_equal(
-  corteza:::bot_agent_name(list(user_id = "")),
-  "agent"
-)
-
-# Topic parser.
+# Topic parser. A topic names no directory since 0.8.1 (WP12): the
+# description is what follows a leading path, and the path is read only
+# to tell the room (bot_topic_path()).
 expect_equal(
   corteza:::bot_parse_topic("~/To_Do | todo management"),
-  list(cwd = "~/To_Do", description = "todo management")
+  list(description = "todo management")
 )
+expect_identical(corteza:::bot_topic_path("~/To_Do | todo management"),
+                 "~/To_Do")
 expect_equal(
   corteza:::bot_parse_topic("/tmp/scratch | quick stuff"),
-  list(cwd = "/tmp/scratch", description = "quick stuff")
+  list(description = "quick stuff")
 )
-expect_equal(
-  corteza:::bot_parse_topic("./relative | works"),
-  list(cwd = "./relative", description = "works")
-)
+expect_identical(corteza:::bot_topic_path("./relative | works"), "./relative")
 # Description-only topic (no leading path).
 expect_equal(
   corteza:::bot_parse_topic("Discussing the wiki contents"),
-  list(cwd = NULL, description = "Discussing the wiki contents")
+  list(description = "Discussing the wiki contents")
 )
+expect_null(corteza:::bot_topic_path("Discussing the wiki contents"))
 # Pipe without leading path — treated as description containing a pipe.
 expect_equal(
   corteza:::bot_parse_topic("a | b | c"),
-  list(cwd = NULL, description = "a | b | c")
+  list(description = "a | b | c")
 )
+expect_null(corteza:::bot_topic_path("a | b | c"))
 # Empty / NULL topic.
-expect_equal(
-  corteza:::bot_parse_topic(NULL),
-  list(cwd = NULL, description = NULL)
-)
-expect_equal(
-  corteza:::bot_parse_topic("   "),
-  list(cwd = NULL, description = NULL)
-)
+expect_equal(corteza:::bot_parse_topic(NULL), list(description = NULL))
+expect_equal(corteza:::bot_parse_topic("   "), list(description = NULL))
+expect_null(corteza:::bot_topic_path(NULL))
 
 if (at_home() && nzchar(Sys.getenv("MX_TEST_SERVER"))) {
   # Live round-trip would configure, send, and poll here. Skipped in
   # package check.
 }
 
-# bot_session_to_markdown: format the ledger from `start` onward.
-local({
-    s <- new.env(parent = emptyenv())
-    corteza:::bot_transcript_add(s, "$m1", "user", "hello")
-    corteza:::bot_transcript_add(s, "$m2", "assistant", "hi back")
-    corteza:::bot_transcript_add(s, "$m3", "user", "and now this")
-    md <- corteza:::bot_session_to_markdown(s, "!room:s.c", "Test Room",
-                                               which = 2:3)
-    expect_true(grepl("# !room:s.c", md, fixed = TRUE))
-    expect_true(grepl("Room name at archive time: Test Room",
-                      md, fixed = TRUE))
-    expect_false(grepl("hello", md, fixed = TRUE))      # already archived
-    expect_true(grepl("hi back", md, fixed = TRUE))
-    expect_true(grepl("and now this", md, fixed = TRUE))
-
-    # Past the end -> NULL.
-    expect_null(corteza:::bot_session_to_markdown(s, "!room:s.c",
-                                                     which = 4L))
-    # History is not a source: tool turns there never reach the archive.
-    s$history <- list(list(role = "tool", content = "TOOLNOISE"))
-    expect_false(grepl("TOOLNOISE",
-                       corteza:::bot_session_to_markdown(s, "!room:s.c"),
-                       fixed = TRUE))
-})
-
-# bot_archive_session round-trip: ingest, dedupe, ingest tail only.
-# Sessions in real use are environments, so test with environments.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        on.exit(unlink(v, recursive = TRUE), add = TRUE)
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        on.exit(options(op), add = TRUE)
-
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(sd, recursive = TRUE)
-        }, add = TRUE)
-
-        s <- new.env(parent = emptyenv())
-        s$transcript <- list(
-            list(event_id = "$t1", role = "user",      content = "first"),
-            list(event_id = "$t2", role = "assistant", content = "ok")
-        )
-        out1 <- corteza:::bot_archive_session(s, "!t:s.c")
-        expect_true(file.exists(out1))
-        fm1 <- pensar:::parse_frontmatter(out1)
-        expect_equal(fm1$title, "!t:s.c")
-        expect_equal(fm1$source, "!t:s.c")
-        # Archived events are consumed from the ledger, which is what
-        # keeps it from outgrowing the persisted id tail.
-        expect_equal(length(s$transcript), 0L)
-
-        # Nothing pending -> no-op.
-        out2 <- corteza:::bot_archive_session(s, "!t:s.c")
-        expect_null(out2)
-        expect_equal(length(s$transcript), 0L)
-
-        # A new event -> only that event lands in the file.
-        corteza:::bot_transcript_add(s, "$t3", "user", "third")
-        out3 <- corteza:::bot_archive_session(s, "!t:s.c")
-        body <- paste(readLines(out3), collapse = "\n")
-        expect_false(grepl("first", body, fixed = TRUE))
-        expect_true(grepl("third", body, fixed = TRUE))
-        expect_equal(length(s$transcript), 0L)
-    })
-}
-
-# bot_archive_session: silent no-op when pensar isn't installed.
-if (!requireNamespace("pensar", quietly = TRUE)) {
-    s <- new.env(parent = emptyenv())
-    corteza:::bot_transcript_add(s, "$a1", "user", "x")
-    out <- corteza:::bot_archive_session(s, "!r:s.c")
-    expect_null(out)
-    # The no-op must not drain the queue. Entries stay queued so they
-    # can still be archived if pensar turns up later; discarding them
-    # here would lose the turns silently. Seeding history instead of a
-    # transcript, as this test used to, asserted nothing: archival stopped
-    # deriving from history when the event ledger landed.
-    expect_equal(length(s$transcript), 1L)
-}
+# What becomes of the ledger, the archive, is test_archive.R's.
 
 # bot_request_flush: writes archive.signal in CORTEZA_STATE_DIR.
 local({
@@ -668,91 +610,14 @@ local({
     expect_equal(corteza:::bot_handle_flush_signal(sig, new.env()), 0L)
 })
 
-# bot_handle_flush_signal: signal present -> flush + remove file.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        on.exit(unlink(v, recursive = TRUE), add = TRUE)
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        on.exit(options(op), add = TRUE)
-
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(sd, recursive = TRUE)
-        }, add = TRUE)
-
-        sig <- tempfile("sig-")
-        file.create(sig)
-        on.exit(if (file.exists(sig)) file.remove(sig), add = TRUE)
-
-        reg <- new.env(parent = emptyenv())
-        s <- new.env(parent = emptyenv())
-        s$transcript <- list(list(event_id = "$h1", role = "user",
-                                 content = "hi"))
-        assign("!r:s.c", s, envir = reg)
-
-        n <- corteza:::bot_handle_flush_signal(sig, reg)
-        expect_equal(n, 1L)
-        expect_false(file.exists(sig))    # signal consumed
-        expect_equal(length(s$transcript), 0L)   # ledger consumed
-    })
-}
-
-# bot_archive_all: walks the registry and counts archived rooms.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        on.exit(unlink(v, recursive = TRUE), add = TRUE)
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        on.exit(options(op), add = TRUE)
-        # Archive keys persist under CORTEZA_STATE_DIR; without this the
-        # suite writes them into the real state directory and later runs
-        # dedupe against leftovers from earlier ones.
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(sd, recursive = TRUE)
-        }, add = TRUE)
-
-        reg <- new.env(parent = emptyenv())
-        s1 <- new.env(parent = emptyenv())
-        s1$transcript <- list(list(event_id = "$a1", role = "user",
-                                  content = "a"))
-        assign("!r1:s.c", s1, envir = reg)
-        s2 <- new.env(parent = emptyenv())
-        s2$transcript <- list(list(event_id = "$b1", role = "user",
-                                  content = "b"))
-        assign("!r2:s.c", s2, envir = reg)
-
-        expect_equal(corteza:::bot_archive_all(reg), 2L)
-        # Second flush is a no-op for both rooms.
-        expect_equal(corteza:::bot_archive_all(reg), 0L)
-    })
-}
-
 # bot_is_clear_command: recognize /clear, /reset, /new alone or
 # after an @-mention; reject bare prose that happens to contain /clear.
 expect_true(corteza:::bot_is_clear_command("/clear"))
 expect_true(corteza:::bot_is_clear_command("  /clear  "))
 expect_true(corteza:::bot_is_clear_command("/reset"))
 expect_true(corteza:::bot_is_clear_command("/new"))
-expect_true(corteza:::bot_is_clear_command("@cornelius /clear"))
-expect_true(corteza:::bot_is_clear_command("@cornelius:s.c /reset"))
+expect_true(corteza:::bot_is_clear_command("@helper /clear"))
+expect_true(corteza:::bot_is_clear_command("@helper:example.org /reset"))
 expect_false(corteza:::bot_is_clear_command("/clear the room please"))
 expect_false(corteza:::bot_is_clear_command("don't /clear yet"))
 expect_false(corteza:::bot_is_clear_command("hello"))
@@ -956,21 +821,44 @@ local({
     prev_user_cache_dir <- Sys.getenv("R_USER_CACHE_DIR", unset = NA)
     cache <- tempfile("matrix-room-context-cache-")
     Sys.setenv(R_USER_CACHE_DIR = cache)
+    # A room's project is read where its directory is trusted
+    # (R/trust.R). The list of those is the user's, so this block gets a
+    # config directory of its own before it adds the room's directory.
+    prev_user_config_dir <- Sys.getenv("R_USER_CONFIG_DIR", unset = NA)
+    config <- tempfile("matrix-room-context-config-")
+    Sys.setenv(R_USER_CONFIG_DIR = config)
     on.exit({
         unlink(tmp, recursive = TRUE)
         unlink(cache, recursive = TRUE)
+        unlink(config, recursive = TRUE)
         if (is.na(prev_user_cache_dir)) {
             Sys.unsetenv("R_USER_CACHE_DIR")
         } else {
             Sys.setenv(R_USER_CACHE_DIR = prev_user_cache_dir)
         }
+        if (is.na(prev_user_config_dir)) {
+            Sys.unsetenv("R_USER_CONFIG_DIR")
+        } else {
+            Sys.setenv(R_USER_CONFIG_DIR = prev_user_config_dir)
+        }
     }, add = TRUE)
 
-    bundle <- corteza:::bot_room_context_bundle(
-        list(user_id = "@bot:x", user = "Troy"),
-        cwd = tmp,
-        room_name = "~/project",
-        description = "topic")
+    room_bundle <- function() {
+        corteza:::bot_room_context_bundle(
+            list(user_id = "@bot:x", user = "Troy"),
+            cwd = tmp,
+            room_name = "~/project",
+            description = "topic")
+    }
+    # Untrusted, the room has its own header and corteza's guidance, and
+    # nothing of the project's.
+    sys <- room_bundle()$system
+    expect_true(grepl("You are @bot:x", sys, fixed = TRUE))
+    expect_true(grepl("Corteza Runtime Environment", sys, fixed = TRUE))
+    expect_false(grepl("saber-context-sentinel", sys, fixed = TRUE))
+
+    corteza:::project_trust_add(tmp)
+    bundle <- room_bundle()
     sys <- bundle$system
 
     expect_true(grepl("You are @bot:x", sys, fixed = TRUE))
@@ -1035,9 +923,30 @@ local({
                     # read, so who invited us is unknown.
                     inv("!blank:ex", NA_character_))
 
-    # No operators configured: every invite is accepted, as before.
-    expect_equal(corteza:::bot_allowed_invites(invites),
-                 c("!ok:ex", "!bad:ex", "!blank:ex"))
+    # No operators configured: no invite is accepted, whoever sent it.
+    # An open bot hands a session with tools to anyone who can invite
+    # it. Up to 0.8.0 this was c("!ok:ex", "!bad:ex", "!blank:ex").
+    for (none in list(character(), NULL,
+                      corteza:::bot_operators(list()),
+                      corteza:::bot_operators(list(operators = c("", NA))))) {
+        expect_equal(suppressMessages(
+            corteza:::bot_allowed_invites(invites, none)), character())
+    }
+    expect_equal(suppressMessages(corteza:::bot_allowed_invites(invites)),
+                 character())
+
+    # Each refusal is reported, and the cause and the fix are said once
+    # for the batch, not once per invite.
+    msgs <- capture.output(corteza:::bot_allowed_invites(invites),
+                           type = "message")
+    for (room in c("!ok:ex", "!bad:ex", "!blank:ex")) {
+        expect_equal(sum(grepl(paste("refusing invite to", room), msgs,
+                               fixed = TRUE)), 1L, info = room)
+    }
+    fix <- msgs[grepl("has no operators", msgs, fixed = TRUE)]
+    expect_equal(length(fix), 1L)
+    expect_true(any(grepl("accepts no invites", fix, fixed = TRUE)))
+    expect_true(any(grepl("bot_configure(operators = ", fix, fixed = TRUE)))
 
     # Configured: only the operator's invite survives, and one whose
     # sender could not be determined is refused rather than guessed at.
@@ -1053,6 +962,10 @@ local({
         type = "message")
     expect_true(any(grepl("!bad:ex from @jorge:ex", msgs)))
     expect_true(any(grepl("!blank:ex from an unknown sender", msgs)))
+    # A bot that has operators is not told it has none.
+    expect_false(any(grepl("has no operators", msgs, fixed = TRUE)))
+    # And an invite that is accepted is not reported as refused.
+    expect_false(any(grepl("!ok:ex", msgs, fixed = TRUE)))
 
     # An operator list that matches nobody accepts nothing.
     expect_equal(suppressMessages(
@@ -1086,232 +999,9 @@ local({
     expect_equal(corteza:::bot_transcript_ids(list()), character())
 })
 
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            options(op)
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(c(v, sd), recursive = TRUE)
-        }, add = TRUE)
-
-        mk <- function(ids) {
-            s <- new.env(parent = emptyenv())
-            for (i in ids) {
-                corteza:::bot_transcript_add(s, i, "user", paste("turn", i))
-            }
-            s
-        }
-        n_files <- function() {
-            length(list.files(file.path(v, "raw"), recursive = TRUE))
-        }
-
-        # 1. First flush archives the ledger once.
-        corteza:::bot_archive_session(mk(c("$1", "$2")), "!a:ex")
-        expect_equal(n_files(), 1L)
-
-        # 2. A repeat flush of the same events archives nothing.
-        corteza:::bot_archive_session(mk(c("$1", "$2")), "!a:ex")
-        expect_equal(n_files(), 1L)
-
-        # 3. Restart: a fresh session whose backfill rebuilt the same
-        #    events archives nothing, with no in-memory watermark.
-        restarted <- mk(c("$1", "$2"))
-        expect_equal(length(restarted$transcript), 2L)  # queued
-        corteza:::bot_archive_session(restarted, "!a:ex")
-        expect_equal(n_files(), 1L)
-
-        # 4. A new event archives once, and only the new event lands.
-        corteza:::bot_archive_session(mk(c("$1", "$2", "$3")), "!a:ex")
-        expect_equal(n_files(), 2L)
-        raw <- list.files(file.path(v, "raw"), recursive = TRUE,
-                          full.names = TRUE)
-        body <- paste(readLines(raw[which.max(file.mtime(raw))],
-                                warn = FALSE), collapse = "\n")
-        expect_true(grepl("turn $3", body, fixed = TRUE))
-        expect_false(grepl("turn $1", body, fixed = TRUE))
-
-        # A room with more events than any fixed window still dedupes:
-        # event ids are exact, so there is no alignment search to cap.
-        many <- sprintf("$m%03d", 1:65)
-        corteza:::bot_archive_session(mk(many), "!long:ex")
-        n <- n_files()
-        corteza:::bot_archive_session(mk(many), "!long:ex")
-        expect_equal(n_files(), n)
-        corteza:::bot_archive_session(mk(c(many, "$new")), "!long:ex")
-        expect_equal(n_files(), n + 1L)
-
-        # 5. A failed ingest leaves persistent state untouched, so the
-        #    same events are retried rather than lost.
-        expect_equal(length(corteza:::bot_archive_state_read("!b:ex")), 0L)
-        options(pensar.vault = file.path(tempfile("gone-"), "nope"))
-        suppressMessages(corteza:::bot_archive_session(mk("$x"), "!b:ex"))
-        expect_equal(length(corteza:::bot_archive_state_read("!b:ex")), 0L)
-        options(pensar.vault = v)
-        corteza:::bot_archive_session(mk("$x"), "!b:ex")
-        expect_true(length(corteza:::bot_archive_state_read("!b:ex")) > 0L)
-
-        # 6. Rooms are isolated: one room's state cannot suppress
-        #    identical events in another.
-        n <- n_files()
-        corteza:::bot_archive_session(mk(c("$1", "$2")), "!c:ex")
-        expect_equal(n_files(), n + 1L)
-        expect_false(identical(
-            corteza:::bot_archive_state_path("!a:ex"),
-            corteza:::bot_archive_state_path("!c:ex")))
-
-        # Equal-length room ids differing only in punctuation must not
-        # share a state file.
-        expect_false(identical(corteza:::bot_archive_state_path("!a-b:ex"),
-                               corteza:::bot_archive_state_path("!a_b:ex")))
-
-        # Tool turns live in history for the provider's benefit and must
-        # never reach the archive, whatever role the provider gives them
-        # (Anthropic returns tool results as role = "user").
-        withtools <- mk(c("$v1", "$v2"))
-        withtools$history <- list(
-            list(role = "user", content = "visible ask"),
-            list(role = "assistant", content = "calling a tool"),
-            list(role = "tool", content = "TOOLRESULT-SENTINEL"),
-            list(role = "user", content = "TOOLRESULT-ANTHROPIC-SHAPE"))
-        corteza:::bot_archive_session(withtools, "!tools:ex")
-        raw <- list.files(file.path(v, "raw"), recursive = TRUE,
-                          full.names = TRUE)
-        tool_body <- paste(readLines(raw[which.max(file.mtime(raw))],
-                                     warn = FALSE), collapse = "\n")
-        expect_false(grepl("TOOLRESULT-SENTINEL", tool_body, fixed = TRUE))
-        expect_false(grepl("TOOLRESULT-ANTHROPIC-SHAPE", tool_body,
-                           fixed = TRUE))
-        expect_true(grepl("turn $v1", tool_body, fixed = TRUE))
-    })
-}
-
-# bot_archive_all counts rooms that actually reached the vault, not
-# rooms it merely looked at.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            options(op)
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(c(v, sd), recursive = TRUE)
-        }, add = TRUE)
-
-        mk_reg <- function() {
-            reg <- new.env(parent = emptyenv())
-            s <- new.env(parent = emptyenv())
-            corteza:::bot_transcript_add(s, "$c1", "user", "hello")
-            corteza:::bot_transcript_add(s, "$c2", "assistant", "hi back")
-            assign("!count:ex", s, envir = reg)
-            reg
-        }
-        n_files <- function() {
-            length(list.files(file.path(v, "raw"), recursive = TRUE))
-        }
-
-        expect_equal(corteza:::bot_archive_all(mk_reg()), 1L)
-        expect_equal(n_files(), 1L)
-        # Restart with the same events: nothing archived, nothing counted.
-        expect_equal(corteza:::bot_archive_all(mk_reg()), 0L)
-        expect_equal(n_files(), 1L)
-    })
-}
-
-# Ledger archival regressions found in review of the transcript change.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            options(op)
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(c(v, sd), recursive = TRUE)
-        }, add = TRUE)
-
-        mk <- function(ids) {
-            s <- new.env(parent = emptyenv())
-            for (i in ids) {
-                corteza:::bot_transcript_add(s, i, "user", paste("turn", i))
-            }
-            s
-        }
-        n_files <- function() {
-            length(list.files(file.path(v, "raw"), recursive = TRUE))
-        }
-
-        # More events than the persisted cap. The ledger is consumed on
-        # success, so nothing can age out of the tail while still
-        # pending -- previously event 1 fell off the 512-entry tail and
-        # came back as fresh on the next flush.
-        big <- sprintf("$big%04d", 1:513)
-        s <- mk(big)
-        corteza:::bot_archive_session(s, "!big:ex")
-        expect_equal(n_files(), 1L)
-        expect_equal(length(s$transcript), 0L)
-        corteza:::bot_archive_session(s, "!big:ex")
-        expect_equal(n_files(), 1L)
-
-        # A fresh event BETWEEN persisted ones archives only itself.
-        # Finding the first fresh index and slicing to the end
-        # re-archived everything after it.
-        seeded <- mk(c("$s1", "$s2", "$s3"))
-        corteza:::bot_archive_session(seeded, "!mid:ex")
-        n <- n_files()
-        gapped <- mk(c("$s1", "$snew", "$s2", "$s3"))
-        corteza:::bot_archive_session(gapped, "!mid:ex")
-        expect_equal(n_files(), n + 1L)
-        raw <- list.files(file.path(v, "raw"), recursive = TRUE,
-                          full.names = TRUE)
-        body <- paste(readLines(raw[which.max(file.mtime(raw))],
-                                warn = FALSE), collapse = "\n")
-        expect_true(grepl("turn $snew", body, fixed = TRUE))
-        expect_false(grepl("turn $s2", body, fixed = TRUE))
-        expect_false(grepl("turn $s3", body, fixed = TRUE))
-
-        # The /clear shape: an acknowledgement that reaches the room
-        # after earlier traffic was archived. A restart's backfill puts
-        # it back among archived events; only it should be archived.
-        restart <- mk(c("$s1", "$snew", "$s2", "$s3", "$clear"))
-        corteza:::bot_archive_session(restart, "!mid:ex")
-        raw <- list.files(file.path(v, "raw"), recursive = TRUE,
-                          full.names = TRUE)
-        body <- paste(readLines(raw[which.max(file.mtime(raw))],
-                                warn = FALSE), collapse = "\n")
-        expect_true(grepl("turn $clear", body, fixed = TRUE))
-        expect_false(grepl("turn $snew", body, fixed = TRUE))
-        expect_false(grepl("turn $s3", body, fixed = TRUE))
-    })
-}
-
 # /clear replaces the session. Three obligations, all regressions.
-if (at_home()) local({
-    cfg <- list(server = "https://example", user = "bot",
+if (run_room_sessions) with_room_services({
+    cfg <- list(server = "https://ex.invalid", user = "bot",
                 user_id = "@bot:ex", room_id = "!c:ex", token = "tok",
                 device_id = "DEV", model = "kimi-k2.5",
                 provider = "moonshot", tools_filter = NULL,
@@ -1324,6 +1014,7 @@ if (at_home()) local({
 
     fresh <- corteza:::bot_reset_session(
         reg, "!c:ex", cfg, "$ack1", "Cleared. Starting a fresh session.",
+        corteza:::bot_conversation_begin(cfg, "!c:ex", "!c:ex", NULL),
         provider = "moonshot", model = "kimi-k2.5")
 
     # It really is a new session, not the old one handed back.
@@ -1347,82 +1038,11 @@ if (at_home()) local({
 
     # A send that failed leaves nothing to remember or replay.
     reg2 <- corteza:::bot_new_session_registry()
-    none <- corteza:::bot_reset_session(reg2, "!c:ex", cfg, NULL, "ack")
+    none <- corteza:::bot_reset_session(reg2, "!c:ex", cfg, NULL, "ack",
+                                        corteza:::bot_conversation_new())
     expect_equal(length(none$transcript), 0L)
 })
 
-# Every pass discards entries already represented in persisted state.
-# Leaving them queued let one outlive its id in the bounded tail and be
-# archived a second time, which is the cap failure returning by another
-# route.
-if (requireNamespace("pensar", quietly = TRUE)) {
-    local({
-        v <- tempfile("vault-")
-        pensar::init_vault(v)
-        op <- options(pensar.vault = v)
-        sd <- tempfile("state-")
-        prev_sd <- Sys.getenv("CORTEZA_STATE_DIR", unset = NA)
-        Sys.setenv(CORTEZA_STATE_DIR = sd)
-        on.exit({
-            options(op)
-            if (is.na(prev_sd)) {
-                Sys.unsetenv("CORTEZA_STATE_DIR")
-            } else {
-                Sys.setenv(CORTEZA_STATE_DIR = prev_sd)
-            }
-            unlink(c(v, sd), recursive = TRUE)
-        }, add = TRUE)
-
-        mk <- function(ids) {
-            s <- new.env(parent = emptyenv())
-            for (i in ids) {
-                corteza:::bot_transcript_add(s, i, "user", paste("turn", i))
-            }
-            s
-        }
-        n_files <- function() {
-            length(list.files(file.path(v, "raw"), recursive = TRUE))
-        }
-
-        corteza:::bot_archive_session(mk("$r1"), "!q:ex")
-        expect_equal(n_files(), 1L)
-
-        # Restart replays a known event: nothing archived, and nothing
-        # left queued to age out later.
-        replay <- mk("$r1")
-        corteza:::bot_archive_session(replay, "!q:ex")
-        expect_equal(n_files(), 1L)
-        expect_equal(length(replay$transcript), 0L)
-
-        # Mixed pass: one known, one new. Both leave the queue.
-        mixed <- mk(c("$r1", "$r2"))
-        corteza:::bot_archive_session(mixed, "!q:ex")
-        expect_equal(n_files(), 2L)
-        expect_equal(length(mixed$transcript), 0L)
-
-        # Push the known ids out of the bounded tail; the old entry must
-        # not come back as fresh.
-        s <- mk(sprintf("$n%04d", 1:512))
-        corteza:::bot_archive_session(s, "!q:ex")
-        expect_equal(n_files(), 3L)
-        after <- mk("$r1")
-        corteza:::bot_archive_session(after, "!q:ex")
-        # $r1 aged out of the tail, so it does archive again -- but the
-        # queue is not what caused it, and it is not archived twice.
-        n <- n_files()
-        corteza:::bot_archive_session(mk("$r1"), "!q:ex")
-        expect_equal(n_files(), n)
-
-        # A failed ingest keeps only what still needs archiving.
-        options(pensar.vault = file.path(tempfile("gone-"), "nope"))
-        # $r1 was just re-archived, so it is in the tail; $fresh1 is not.
-        retry <- mk(c("$r1", "$fresh1"))
-        suppressMessages(corteza:::bot_archive_session(retry, "!q:ex"))
-        expect_equal(corteza:::bot_transcript_ids(retry$transcript),
-                     "$fresh1")
-        options(pensar.vault = v)
-    })
-}
 
 # A send that created several events hands back several ids. Both
 # consumers must cope: `!nzchar()` on a vector is a vector, and `||` on
@@ -1489,35 +1109,35 @@ local({
 # <model>" while switched; NULL in "never" mode so the profile is
 # untouched. session = NULL means "on defaults" (startup, /clear).
 local({
-    cfg <- list(user_id = "@r2j2:cornball.ai", model = "qwen3:8b",
+    cfg <- list(user_id = "@helper:example.org", model = "qwen3:8b",
                 provider = "ollama", model_badge = "non_default")
-    expect_equal(corteza:::bot_badge_displayname(cfg), "r2j2")
+    expect_equal(corteza:::bot_badge_displayname(cfg), "helper")
 
     s <- new.env()
     s$model_map <- list(cloud = "qwen3:8b")
     s$provider <- "ollama"
     s$default_model <- "qwen3:8b"
     s$default_provider <- "ollama"
-    expect_equal(corteza:::bot_badge_displayname(cfg, s), "r2j2")
+    expect_equal(corteza:::bot_badge_displayname(cfg, s), "helper")
 
     s$model_map <- list(cloud = "claude-sonnet-4-6")
     s$provider <- "anthropic_claude"
     expect_equal(corteza:::bot_badge_displayname(cfg, s),
-                 "r2j2 ⚡ claude-sonnet-4-6")
+                 "helper ⚡ claude-sonnet-4-6")
 
     cfg$model_badge <- "always"
     expect_equal(corteza:::bot_badge_displayname(cfg),
-                 "r2j2 ⚡ qwen3:8b")
+                 "helper ⚡ qwen3:8b")
 
     cfg$model_badge <- "never"
     expect_null(corteza:::bot_badge_displayname(cfg, s))
 
     # display_name override beats the localpart.
-    cfg2 <- list(user_id = "@r2j2:cornball.ai", display_name = "R2J2",
+    cfg2 <- list(user_id = "@helper:example.org", display_name = "Helper",
                  model = "qwen3:8b", provider = "ollama",
                  model_badge = "always")
     expect_equal(corteza:::bot_badge_displayname(cfg2),
-                 "R2J2 ⚡ qwen3:8b")
+                 "Helper ⚡ qwen3:8b")
 })
 
 # Sessions stamp their creation-time model/provider so the badge can
@@ -1547,7 +1167,7 @@ local({
 # -- and chat_send() does no relogin of its own, so the next reply
 # vanishes into a best-effort tryCatch.
 local({
-    cfg <- list(user_id = "@r2j2:cornball.ai", model = "qwen3:8b",
+    cfg <- list(user_id = "@helper:example.org", model = "qwen3:8b",
                 provider = "ollama", model_badge = "always")
 
     orig_load <- corteza:::bot_load_config
@@ -1564,7 +1184,7 @@ local({
         seen <- NULL
         chat <- chat.api::chat_matrix(
             mx = list(server = "https://ex.invalid", user = "bot",
-                      token = "tok", user_id = "@r2j2:cornball.ai",
+                      token = "tok", user_id = "@helper:example.org",
                       device_id = "DEV1"),
             .sync = function(...) NULL, .extract = function(...) list(),
             .send = function(...) "$1", .media = function(...) NULL,
@@ -1588,14 +1208,14 @@ local({
 # cfg advertises the configured model while every reply is badged with
 # the override.
 local({
-    cfg <- list(user_id = "@r2j2:cornball.ai", model = "qwen3:8b",
+    cfg <- list(user_id = "@helper:example.org", model = "qwen3:8b",
                 provider = "ollama", model_badge = "always")
     expect_equal(corteza:::bot_badge_displayname(cfg),
-                 "r2j2 ⚡ qwen3:8b")
+                 "helper ⚡ qwen3:8b")
     expect_equal(
         corteza:::bot_badge_displayname(cfg, model = "claude-sonnet-4-6",
                                            provider = "anthropic_claude"),
-        "r2j2 ⚡ claude-sonnet-4-6")
+        "helper ⚡ claude-sonnet-4-6")
 })
 
 # The chat.api floor is enforced at runtime, not merely declared in

@@ -23,6 +23,29 @@ journal_session <- function(dir = NULL, history = list(),
 
 user_msg <- function(text) list(role = "user", content = text)
 
+# A 256-character entry path on Windows must have an equally short
+# staging path, regardless of the host on which this test runs.
+local({
+    dir <- journal_tmp()
+    on.exit(unlink(dir, recursive = TRUE))
+    ns <- asNamespace("corteza")
+    rename <- ns$.journal_rename
+    staged <- character()
+    assignInNamespace(".journal_rename", function(from, to) {
+        if (basename(dirname(to)) == "entries") {
+            staged <<- from
+            if (nchar(from) > nchar(to)) return(FALSE)
+        }
+        rename(from, to)
+    }, "corteza")
+    on.exit(assignInNamespace(".journal_rename", rename, "corteza"), add = TRUE)
+    history <- list(user_msg("fixture"))
+    s <- journal_session(dir, history)
+    ns$journal_rewrite(s, history, history, "context_edit", edits = list())
+    expect_true(length(staged) == 1L)
+    expect_identical(ns$journal_load(dir)$segments[[1L]]$after, history)
+})
+
 summary_msg <- function(text, role = "user") {
     list(role = role, content = paste0("[compacted history]\n\n", text))
 }
@@ -515,9 +538,9 @@ run_commit_boundary_tests()
 
 # Room journals are owned by the bot as well as the room --------
 
-cfg_a <- list(user_id = "@cornelius:cornball.ai")
-cfg_b <- list(user_id = "@padre:cornball.ai")
-room <- "!abc:cornball.ai"
+cfg_a <- list(user_id = "@helper:example.org")
+cfg_b <- list(user_id = "@other:example.org")
+room <- "!abc:example.org"
 expect_false(identical(corteza:::bot_journal_dir(cfg_a, room),
                        corteza:::bot_journal_dir(cfg_b, room)))
 expect_identical(corteza:::bot_journal_dir(cfg_a, room),
@@ -645,10 +668,12 @@ run_monitor_scope_journal_test <- function() {
     worker_state <- corteza:::.job_worker_state
     old_session <- sub_state$session
     old_scope <- worker_state$monitor_scope
+    old_record <- worker_state$review_record
     old_run <- worker_state$monitor_run_fn
     on.exit({
         assign("session", old_session, envir = sub_state)
         assign("monitor_scope", old_scope, envir = worker_state)
+        assign("review_record", old_record, envir = worker_state)
         assign("monitor_run_fn", old_run, envir = worker_state)
     }, add = TRUE)
     cwd <- tempfile("corteza_monitor_cwd_")
@@ -678,13 +703,19 @@ run_monitor_scope_journal_test <- function() {
     corteza:::.job_worker_child_init(cwd, spec, state_dir)
     jdir <- file.path(state_dir, "journal")
 
-    a1 <- corteza:::.job_monitor_child_ask("q1", "job-1")
+    question <- function(id, job) {
+        list(request_id = id, record = job, conversation = "Person: review the file.")
+    }
+    ask <- function(id, job) {
+        corteza:::.job_monitor_child_ask(question(id, job), paste(job, id))
+    }
+    a1 <- ask("q1", "job-1")
     expect_equal(a1$reply, "approve")
-    a2 <- corteza:::.job_monitor_child_ask("q2", "job-1")
+    a2 <- ask("q2", "job-1")
     expect_equal(length(sub_state$session$history), 4L)
     expect_equal(length(corteza:::journal_load(jdir)$segments), 0L)
 
-    a3 <- corteza:::.job_monitor_child_ask("q3", "job-2")
+    a3 <- ask("q3", "job-2")
     expect_equal(a3$reply, "approve")
     expect_equal(length(sub_state$session$history), 2L)
     j <- corteza:::journal_load(jdir)
@@ -694,8 +725,8 @@ run_monitor_scope_journal_test <- function() {
     expect_equal(j$segments[[1]]$kept, 0L)
     record <- corteza:::journal_history(jdir)
     expect_equal(length(record), 6L)
-    expect_equal(record[[1]]$content, "q1")
-    expect_equal(record[[5]]$content, "q3")
+    expect_equal(record[[1]]$content, corteza:::job_monitor_question(question("q1", "job-1")))
+    expect_equal(record[[5]]$content, corteza:::job_monitor_question(question("q3", "job-2")))
 
     # A journal that cannot record the change keeps the old scope and
     # its history, and the answer is an error for the parent to act on.
@@ -703,11 +734,113 @@ run_monitor_scope_journal_test <- function() {
         !identical(Sys.info()[["effective_user"]], "root")) {
         Sys.chmod(jdir, mode = "0500")
         on.exit(Sys.chmod(jdir, mode = "0700"), add = TRUE)
-        a4 <- corteza:::.job_monitor_child_ask("q4", "job-3")
+        a4 <- ask("q4", "job-3")
         Sys.chmod(jdir, mode = "0700")
         expect_true(grepl("journal", a4$error %||% ""))
-        expect_equal(worker_state$monitor_scope, "job-2")
+        expect_equal(worker_state$monitor_scope, "job-2 q3")
         expect_equal(length(sub_state$session$history), 2L)
     }
 }
 run_monitor_scope_journal_test()
+
+# Removed under a running session --------------------------------------
+# Retention removes the journal of a session nobody has used for long
+# enough (R/retention.R), and the process that holds the session may
+# still be running. The journal starts again from nothing, with the
+# whole live history in its first snapshot. Retention removes the
+# journal's files and leaves the audit records beside them; a person
+# may remove the folder. Both are covered.
+local({
+    h <- c(list(user_msg("go")), anthropic_round(1), anthropic_round(2))
+    after <- c(list(summary_msg("s")), anthropic_round(2))
+    for (how in c("files", "folder")) {
+        dir <- journal_tmp()
+        s <- journal_session(dir, h)
+        corteza:::journal_snapshot(s)
+        corteza:::journal_rewrite(s, h, after, "threshold")
+        s$history <- after
+        expect_equal(corteza:::journal_mark(s)$seq, 1L, info = how)
+        dir.create(file.path(dir, "audit"))
+        if (how == "files") {
+            unlink(corteza:::retention_journal_files(dir), recursive = TRUE)
+            expect_identical(list.files(dir), "audit")
+        } else {
+            unlink(dir, recursive = TRUE)
+        }
+
+        expect_true(corteza:::journal_snapshot(s), info = how)
+        expect_equal(corteza:::journal_mark(s)$seq, 0L, info = how)
+        j <- corteza:::journal_load(dir)
+        expect_identical(j$live$history, after, info = how)
+        expect_equal(j$live$inherited, 0L, info = how)
+        expect_equal(length(j$segments), 0L, info = how)
+        expect_identical(corteza:::journal_history(dir), after, info = how)
+
+        # And it takes a rewrite, which a journal that could not be
+        # written would block.
+        after2 <- list(summary_msg("t"))
+        corteza:::journal_rewrite(s, after, after2, "threshold")
+        s$history <- after2
+        expect_equal(length(corteza:::journal_load(dir)$segments), 1L,
+                     info = how)
+        expect_identical(corteza:::journal_history(dir), after, info = how)
+        unlink(dir, recursive = TRUE)
+    }
+})
+
+# A mark taken before the journal went still gives the turn its slice.
+# The old journal had one segment when the mark was taken, and the new
+# one has one after the compaction below: counted alike, the mark would
+# say nothing was rewritten.
+local({
+    h <- c(list(user_msg("go")), anthropic_round(1))
+    after <- c(list(summary_msg("s")), anthropic_round(1))
+    dir <- journal_tmp()
+    s <- journal_session(dir, h)
+    corteza:::journal_snapshot(s)
+    corteza:::journal_rewrite(s, h, after, "threshold")
+    s$history <- after
+    corteza:::journal_snapshot(s)
+
+    mark <- corteza:::journal_mark(s)
+    pre <- length(s$history)
+    unlink(dir, recursive = TRUE)
+    s$history <- c(s$history, anthropic_round(2))
+    corteza:::journal_snapshot(s)
+    expect_identical(corteza:::journal_turn_slice(s, mark, pre),
+                     anthropic_round(2))
+    expect_false(corteza:::journal_rewritten_since(s, mark))
+
+    after2 <- c(list(summary_msg("t")), anthropic_round(2))
+    corteza:::journal_rewrite(s, s$history, after2, "threshold")
+    s$history <- after2
+    expect_equal(corteza:::journal_mark(s)$seq, mark$seq)
+    expect_identical(corteza:::journal_turn_slice(s, mark, pre),
+                     anthropic_round(2))
+    expect_true(corteza:::journal_rewritten_since(s, mark))
+    expect_false(corteza:::journal_rewritten_since(s, mark,
+                                                   ignore = "threshold"))
+    unlink(dir, recursive = TRUE)
+})
+
+# Everything above the journal out of sight, as when a mount goes away:
+# the journal fails as it always has and keeps its count, so the
+# segments are not written over when they come back. Nothing is made in
+# their place.
+local({
+    h <- c(list(user_msg("go")), anthropic_round(1))
+    after <- c(list(summary_msg("s")), anthropic_round(1))
+    root <- journal_tmp()
+    dir <- file.path(root, "sessions", "x.journal")
+    s <- journal_session(dir, h)
+    corteza:::journal_snapshot(s)
+    corteza:::journal_rewrite(s, h, after, "threshold")
+    s$history <- after
+    unlink(file.path(root, "sessions"), recursive = TRUE)
+    expect_false(corteza:::journal_snapshot(s))
+    expect_error(corteza:::journal_rewrite(s, after, list(summary_msg("t")),
+                                           "threshold"), "journal")
+    expect_equal(corteza:::journal_mark(s)$seq, 1L)
+    expect_false(dir.exists(file.path(root, "sessions")))
+    unlink(root, recursive = TRUE)
+})

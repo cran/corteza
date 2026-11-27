@@ -107,6 +107,24 @@ local({
                project_config
     )
 
+    # A project's skills folder and its config load from a trusted
+    # directory only (R/trust.R). Untrusted, the catalog is the user's
+    # own: the project's folder is no root, and its config adds no root,
+    # replaces none and disables nothing.
+    stranger <- corteza:::build_instruction_catalog(project)
+    stranger_ids <- names(stranger$entries)
+    expect_true("shared:shared/audit" %in% stranger_ids)
+    expect_true("replace:old" %in% stranger_ids)
+    expect_false("replace:new" %in% stranger_ids)
+    expect_false(any(grepl("^(project|narrow):", stranger_ids)))
+    expect_false("project:disabled" %in% stranger$disabled)
+    expect_false(grepl("PROJECT-BODY-SENTINEL|Log analyst",
+                       corteza:::format_instruction_catalog(stranger)))
+    expect_error(corteza:::instruction_catalog_read(
+            stranger, "project:analysis/logs"
+        ), pattern = "not in this session catalog")
+    corteza:::project_trust_add(project)
+
     catalog <- corteza:::build_instruction_catalog(project)
     ids <- names(catalog$entries)
     expect_true(inherits(catalog, "corteza_instruction_catalog"))
@@ -182,6 +200,7 @@ local({
     other <- file.path(root, "other")
     .write_instruction(file.path(other, ".corteza", "skills", "only-b"),
                        "Only B", "Belongs to B.", "B-BODY")
+    corteza:::project_trust_add(other)
     other_catalog <- corteza:::build_instruction_catalog(other)
     expect_true("project:only-b" %in% names(other_catalog$entries))
     expect_false("project:only-b" %in% names(catalog$entries))
@@ -189,19 +208,9 @@ local({
             catalog, "project:only-b"
         ), pattern = "not in this session catalog")
 
-    # Building the new catalog must not mutate the old process-global docs
-    # registry or the executable tool registry.
-    corteza:::clear_skill_docs()
-    legacy <- file.path(root, "legacy")
-    dir.create(legacy)
-    writeLines(c("---", "name: legacy", "description: old", "---",
-                 "LEGACY-BODY-SENTINEL"), file.path(legacy, "legacy.md"))
-    corteza:::load_skill_docs(legacy)
-    before_docs <- corteza:::format_skill_docs()
+    # Building a catalog leaves the executable registry intact.
     before_tools <- corteza:::list_skills()
     invisible(corteza:::build_instruction_catalog(project))
-    expect_identical(corteza:::format_skill_docs(), before_docs)
-    expect_true(grepl("LEGACY-BODY-SENTINEL", before_docs, fixed = TRUE))
     expect_identical(corteza:::list_skills(), before_tools)
 
     cache_home <- file.path(root, "cache-home")
@@ -254,6 +263,20 @@ local({
     }, logical(1L))))
 })
 
+# R for Windows cannot remove a directory link: unlink() and file.remove()
+# both fail on one, and the session's temp folder then stays behind with
+# it. cmd's rmdir removes the link and leaves its target.
+remove_dir_link <- function(path) {
+    if (.Platform$OS.type == "windows") {
+        win <- gsub("/", "\\\\",
+                    file.path(normalizePath(dirname(path), winslash = "/"),
+                              basename(path)))
+        system2("cmd", c("/c", "rmdir", shQuote(win, type = "cmd")),
+                stdout = FALSE, stderr = FALSE)
+    }
+    invisible(NULL)
+}
+
 local({
     root <- tempfile("instruction-symlink-")
     inside <- file.path(root, "inside")
@@ -278,6 +301,12 @@ local({
             identical(x$code, "directory_cycle")
         }, logical(1L))))
     }
+    if (isTRUE(made_escape)) {
+        remove_dir_link(file.path(inside, "escape-link"))
+    }
+    if (isTRUE(made_cycle)) {
+        remove_dir_link(file.path(inside, "cycle"))
+    }
     unlink(root, recursive = TRUE)
     unlink(outside, recursive = TRUE)
 })
@@ -299,10 +328,15 @@ local({
     writeLines("REMOTE-REF", file.path(pkg, "remote", "reference.md"))
     .write_instruction(file.path(hub, "local"), "Local", "Hub-owned.", "LOCAL")
     dir.create(file.path(hub, "nested"))
-    made_alias <- file.symlink(file.path(pkg, "remote"), file.path(hub, "remote"))
-    made_deep <- file.symlink(file.path(pkg, "remote"),
-                              file.path(hub, "nested", "deep"))
-    made_inner <- file.symlink(root, file.path(pkg, "remote", "outward"))
+    # Unix only. The checks below need Sys.readlink(), which reports
+    # nothing on Windows, and there the links would outlast the session.
+    unix <- .Platform$OS.type == "unix"
+    made_alias <- unix &&
+        file.symlink(file.path(pkg, "remote"), file.path(hub, "remote"))
+    made_deep <- unix && file.symlink(file.path(pkg, "remote"),
+                                      file.path(hub, "nested", "deep"))
+    made_inner <- unix &&
+        file.symlink(root, file.path(pkg, "remote", "outward"))
 
     old_config <- Sys.getenv("R_USER_CONFIG_DIR", unset = NA_character_)
     Sys.setenv(R_USER_CONFIG_DIR = cfg_home)
@@ -383,3 +417,15 @@ expect_identical(corteza:::classify_op("skill_instructions"), "read")
 file_tool_names <- vapply(corteza::schema_from_registry("file"),
                           function(x) x$name, character(1L))
 expect_true("skill_instructions" %in% file_tool_names)
+local({
+    root <- tempfile("instruction-discovery-")
+    on.exit(unlink(root, recursive = TRUE), add = TRUE)
+    for (dir in c(".archive/old", "synced/current", "normal/.backup/old")) {
+        dir.create(file.path(root, dir), recursive = TRUE)
+        writeLines("fixture", file.path(root, dir, "SKILL.md"))
+    }
+    walk <- function(path) corteza:::instruction_walk_root(path, aliases = TRUE)$skills
+    expect_identical(walk(root), normalizePath(file.path(root, "synced/current/SKILL.md"),
+                                               winslash = "/"))
+    expect_equal(length(walk(file.path(root, ".archive"))), 1L)
+})

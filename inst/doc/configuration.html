@@ -294,7 +294,9 @@ last update and how to continue.</p>
 <p>How to configure corteza for your workflow.</p>
 <h2 id="config-files">Config files</h2>
 <p>corteza reads two JSON files and merges them. Project config
-overrides global config.</p>
+overrides global config. The project file is read from a trusted
+directory only (see <a href="#trusted-projects">Trusted
+projects</a>).</p>
 <table>
 <thead>
 <tr class="header">
@@ -326,8 +328,114 @@ global config &gt; built-in defaults.</p>
 <span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>Create the directory first:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">dir.create</span>(<span class="st">&quot;.corteza&quot;</span>, <span class="at">showWarnings =</span> <span class="cn">FALSE</span>)</span></code></pre></div>
+<h2 id="trusted-projects">Trusted projects</h2>
+<p>A project’s own files arrive with its repository, and a cloned
+repository is somebody else’s text. A session therefore loads them only
+from a directory you have trusted. In any other directory it loads
+nothing of the project’s, says so, and runs on your global config and
+the package’s own guidance.</p>
+<p>What trust covers:</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 44%" />
+<col style="width: 52%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">From the project</th>
+<th style="text-align: left;">Effect when trusted</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>.corteza/config.json</code></td>
+<td style="text-align: left;">Merged over the global config: provider,
+model, base URL, approval settings and the rest</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>.corteza/skills/</code></td>
+<td style="text-align: left;">R files are sourced at start;
+<code>SKILL.md</code> files join the instruction catalog</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>AGENTS.md</code> or
+<code>CLAUDE.md</code></td>
+<td style="text-align: left;">Added to the system prompt</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>.corteza/harness.json</code></td>
+<td style="text-align: left;">Its lessons are added to the system
+prompt, and <code>/refine</code> and the lesson tool may write it</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>DESCRIPTION</code> and commit
+subjects</td>
+<td style="text-align: left;">Summarized in the briefing at the top of
+the prompt</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Files your global
+<code>context_files</code> names by a relative path, or by a path inside
+the project</td>
+<td style="text-align: left;">Added to the system prompt</td>
+</tr>
+</tbody>
+</table>
+<p>A directory is trusted when it is, or lies inside, a directory on
+your list. Paths are compared after links are resolved, so a link into a
+trusted directory is judged by where it points. The list lives in your
+config directory, where no project can write:</p>
+<ul>
+<li><p><code>trusted_projects</code> in the global
+<code>config.json</code>, which you edit:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;trusted_projects&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;~/work&quot;</span><span class="ot">,</span> <span class="st">&quot;/srv/projects/reports&quot;</span><span class="ot">]</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div></li>
+<li><p><code>trusted-projects.json</code> beside it, which
+<code>/trust yes</code> writes. Remove a line there to undo it.</p></li>
+</ul>
+<p>Trusting a directory trusts every directory inside it, so trusting
+your home trusts everything you clone into it.</p>
+<p>How you are asked:</p>
+<ul>
+<li>The <code>corteza</code> command and <code>chat()</code> ask once at
+start, when the directory is not trusted and holds something a session
+would load. Enter means no.</li>
+<li><code>/trust</code> shows where the directory stands and what it
+holds. <code>/trust yes</code> trusts it.</li>
+<li>A new answer applies from the next conversation: <code>/clear</code>
+starts one, with the config, the tools and the prompt taken again from
+the directory. A session’s prompt and tools are fixed while a
+conversation lasts. What a flag or a command set in this process
+(<code>--dry-run</code>, <code>/permissions</code>,
+<code>/dryrun</code>, <code>/context-edit</code>) carries over.</li>
+<li><code>/status</code> shows <code>trusted:</code> and lists what an
+untrusted session left alone.</li>
+</ul>
+<p>In a Matrix room, <code>/trust</code> acts on the room’s directory
+and only an operator of the bot may use it. The answer applies from the
+room’s next conversation (send <code>/clear</code> to start one). A room
+whose directory is not trusted says so once, ahead of its first reply. A
+bot’s directory has to be on the list before the bot starts, or the bot
+runs without its project config and instructions. A room with no
+directory works in a scratch folder, which is never trusted.</p>
+<p>In an untrusted directory the terminal’s “Allow always” lasts for the
+session and writes no file. The lessons tool refuses the project’s store
+and keeps a lesson only under scope <code>global</code>, and
+<code>/refine</code> lists the global store and runs no review pass.</p>
+<p>R can read the working directory’s <code>.Rprofile</code> before the
+terminal or <code>chat()</code> can ask about trust. The worker startup
+settings are described under <strong>Skills</strong> below.</p>
+<p>Trust decides what corteza loads by itself. It does not confine the
+agent: a tool can still read a file in an untrusted directory when
+asked, and what it reads comes back as a tool result under the approval
+settings below. For an unattended session (a Matrix room or one of its
+jobs), a write to a <code>.corteza</code> folder by a file tool, a shell
+command or R code goes to a person, and so does R code that names the
+list of trusted directories. The lessons tool still records a note in a
+trusted project’s store once that note is approved.</p>
 <h2 id="cli-flags">CLI flags</h2>
-<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> <span class="pp">[</span><span class="ss">options</span><span class="pp">]</span></span></code></pre></div>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> <span class="pp">[</span><span class="ss">options</span><span class="pp">]</span></span></code></pre></div>
 <table style="width:97%;">
 <colgroup>
 <col style="width: 26%" />
@@ -374,32 +482,40 @@ global config &gt; built-in defaults.</p>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>--resume</code></td>
-<td style="text-align: left;">Resume most recent session</td>
+<td style="text-align: left;">Resume the latest session started in this
+directory</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;"><code>--list</code></td>
-<td style="text-align: left;">List sessions and exit</td>
+<td style="text-align: left;">List the sessions started in this
+directory and exit</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
 <tr class="even">
+<td style="text-align: left;"><code>--all</code></td>
+<td style="text-align: left;">With <code>--resume</code> or
+<code>--list</code>: every directory</td>
+<td style="text-align: left;"><code>false</code></td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;"><code>--dry-run</code></td>
 <td style="text-align: left;">Preview tool calls without executing</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>--context-edit</code></td>
 <td style="text-align: left;">Enable conversation context editing for
 this session</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>--trace</code></td>
 <td style="text-align: left;">Print structured tool-call events to
 stderr</td>
 <td style="text-align: left;"><code>false</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>--help</code></td>
 <td style="text-align: left;">Show help and exit</td>
 <td style="text-align: left;">-</td>
@@ -414,6 +530,15 @@ provider uses its matching configured model or its default; it does not
 carry the old provider’s model across. The same rules apply to
 <code>chat(session = ...)</code> and its <code>provider</code> and
 <code>model</code> arguments.</p>
+<p>A session belongs to the directory it was started in.
+<code>--resume</code>, <code>--list</code>, <code>/sessions</code> and
+<code>chat(session = TRUE)</code> look at the current directory’s
+sessions, and say how many there are elsewhere when it has none.
+<code>--all</code> and <code>/sessions all</code> cover every directory.
+<code>--session &lt;key&gt;</code> and
+<code>chat(session = &quot;&lt;key&gt;&quot;)</code> resume that session from
+anywhere, and say so when it was started somewhere else: the paths in
+its history belong to that directory.</p>
 <h2 id="unattended-work">Unattended work</h2>
 <p><code>/auto</code> continues the current task using the conversation
 and its approved plan. <code>/auto &lt;goal&gt;</code> supplies a new
@@ -425,13 +550,109 @@ conversation.</p>
 <p>The startup display names the working-directory scope and whether
 shell/R execution is enabled. <code>/auto --exec</code> explicitly
 permits the monitor to assess shell/R calls; a project restriction can
-still veto it. Without that grant, those tools are omitted. Unclassified
-package tools are also omitted rather than offered to the model and then
-stopping the run when selected. Path, credential, policy, and monitor
-checks still apply to every dispatched call.</p>
+still veto it. Without that grant, those tools are omitted. Tools with
+no class, the session’s control and continue tools, and writes that name
+no path the monitor can check are also omitted rather than offered to
+the model and then stopping the run when selected. Path, credential,
+policy, and monitor checks still apply to every dispatched call.</p>
+<p>The monitor reads each tool argument in full. If any one argument
+exceeds 2,000 characters in JSON, <code>/auto</code> refuses that call
+before asking the monitor. The worker receives the reason and can
+continue with a smaller call. This includes the content of a file write,
+even when your config allows the tool. JSON quotes and escapes count
+toward the limit.</p>
 <p>When a run stops, auto mode is off. Ordinary messages do not restart
 it. <code>/permissions</code> controls ordinary tool approvals
 separately from <code>/auto</code>.</p>
+<p>The <code>auto</code> block of <code>config.json</code> sets a run’s
+bounds and its monitor. The first of these limits to be reached stops
+the run.</p>
+<p>The iteration limit is the exception. <code>/auto --loops N</code>
+stops after N iterations. <code>/auto</code> without
+<code>--loops</code> runs with no iteration limit, whatever
+<code>max_loops</code> says, and the other limits stop it.
+<code>/auto resume</code> keeps the count of the run it resumes. One
+iteration can run many model turns.</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 35%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Key</th>
+<th style="text-align: left;">Default</th>
+<th style="text-align: left;">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>max_loops</code></td>
+<td style="text-align: left;">10</td>
+<td style="text-align: left;">Iterations, for a run that sets no count
+of its own. <code>/auto</code> always sets one or runs without, so it
+does not read this</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>max_tool_calls</code></td>
+<td style="text-align: left;">300</td>
+<td style="text-align: left;">Tool calls, the bound that holds whatever
+a turn does</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>max_minutes</code></td>
+<td style="text-align: left;">30</td>
+<td style="text-align: left;">Minutes since the run started</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>max_cost</code></td>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;">Dollars spent. Skipped where the provider
+reports no price, as on a subscription, and <code>max_tokens</code>
+holds instead</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>max_tokens</code></td>
+<td style="text-align: left;">2000000</td>
+<td style="text-align: left;">Tokens used</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>stall_loops</code></td>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">Iterations in a row that changed nothing
+on disk</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>allow_exec</code></td>
+<td style="text-align: left;"><code>false</code></td>
+<td style="text-align: left;">Whether the monitor may rule on shell and
+R calls. Your config or <code>--exec</code> grants it; a project’s
+config can only refuse it</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>never_broker</code></td>
+<td style="text-align: left;">none</td>
+<td style="text-align: left;">Tools that always stop the run for you.
+Yours and the project’s together</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>monitor_model</code></td>
+<td style="text-align: left;">the session’s model</td>
+<td style="text-align: left;">The model the monitor runs on. The monitor
+uses the session’s provider, so name a model of that provider</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>monitor_timeout</code></td>
+<td style="text-align: left;">120</td>
+<td style="text-align: left;">Seconds the monitor has to rule on a
+call</td>
+</tr>
+</tbody>
+</table>
+<p>The monitor makes a request for each call it rules on, so a long run
+makes many. A smaller model in <code>monitor_model</code> costs less for
+each ruling.</p>
 <h2 id="matrix-remote-control">Matrix remote control</h2>
 <p><code>/remote-control [--bot @bot:server] [room]</code> hands the
 current CLI or <code>chat()</code> session to a Matrix room. The model,
@@ -532,13 +753,208 @@ summary compaction. If recovery ends with a partial reply, the rendered
 text is kept in conversation history and the journal. A later turn can
 refer to what the user actually saw; unfinished tool calls are still
 discarded.</p>
+<h2 id="the-prompt-cache">The prompt cache</h2>
+<p>On an Anthropic provider (<code>anthropic</code>,
+<code>anthropic_claude</code>) a session caches its prompt for 5 minutes
+unless a setting says otherwise. The provider keeps the tools, the
+system text and the conversation that a request sent. A request that
+starts within 5 minutes of the start of the one before it reads them
+back at a lower price and pays the write price only for what it added.
+Each read renews the 5 minutes.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;cache&quot;</span><span class="fu">:</span> <span class="st">&quot;none&quot;</span> <span class="fu">}</span></span></code></pre></div>
+<p><code>cache</code> is <code>&quot;5m&quot;</code>, <code>&quot;1h&quot;</code> or
+<code>&quot;none&quot;</code>. <code>new_session(cache = )</code> sets it for one
+session and wins over the config.</p>
+<p>The cache changes only the bill: the model receives the same input
+either way. Against an input token sent with no cache, a 5-minute write
+costs 1.25 times as much, a 1-hour write 2 times, and a read a tenth, or
+less on the newest models (Anthropic’s prompt caching page, <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" class="uri">https://platform.claude.com/docs/en/build-with-claude/prompt-caching</a>,
+read 2026-11-17). So:</p>
+<ul>
+<li>A turn of several requests, which every turn with a tool call is,
+pays the write once and reads after it.</li>
+<li>A request with none before it in the last 5 minutes pays the write
+on its whole input and reads nothing: a quarter more than with no cache.
+That is the first request of a session, a reply after a pause, and the
+request after a tool that ran longer than 5 minutes. A conversation of
+single replies more than 5 minutes apart costs more with the cache than
+without. Set <code>&quot;none&quot;</code> there, or <code>&quot;1h&quot;</code> where the
+replies come inside the hour.</li>
+<li>A prompt shorter than the provider’s minimum, from 512 tokens on the
+newest models to 4,096 on some older ones, is not cached and costs what
+it did.</li>
+<li>A change to the system text is a change to everything after it. With
+the task list on (<code>task_list_enabled</code>), the list is part of
+that text, so the turn after one that changed the list writes the whole
+prompt again.</li>
+</ul>
+<p><code>turn()$usage</code> says what a turn read and wrote
+(<code>cache_read_input_tokens</code>,
+<code>cache_creation_input_tokens</code>), and its <code>cost</code>
+counts both. Anthropic leaves cached input out of
+<code>input_tokens</code>. <code>total_tokens</code> counts it, and so
+do <code>/spent</code> and the 2 token caps,
+<code>auto.max_tokens</code> for <code>/auto</code> and
+<code>subagents.mcp_spend_cap_tokens</code> for subagents over MCP: a
+cached token counts as 1 there, whatever it cost.</p>
+<p>The setting reaches Anthropic providers only. corteza sends it to no
+other, whatever the config says.</p>
+<p>Anthropic sessions with context editing also default to
+<code>&quot;5m&quot;</code>. Editing an earlier entry changes the reusable prefix.
+Choose <code>&quot;1h&quot;</code> for longer pauses or <code>&quot;none&quot;</code> to
+disable caching.</p>
+<h2 id="when-a-conversation-is-compacted">When a conversation is
+compacted</h2>
+<p>A compaction replaces the older turns of a conversation with a
+summary. Three conditions start one.</p>
+<ul>
+<li><strong>A share of the window.</strong> The context reaches
+<code>context_compact_pct</code> of the model’s window, 90% by
+default.</li>
+<li><strong>A size.</strong> The context reaches
+<code>context_compact_tokens</code>, 200,000 by default. On a model with
+a 1M window, 90% is 900,000 tokens, so this number decides there.
+<code>0</code> turns it off.</li>
+<li><strong>A return after a pause.</strong> The model last answered at
+least <code>context_idle_minutes</code> ago (60 by default), the pause
+is longer than the prompt cache lasts (<code>cache</code>, under “The
+prompt cache”), and the context holds at least
+<code>context_idle_tokens</code> (100,000 by default). The provider has
+dropped its cached copy of the conversation by then, so the next request
+pays the full price for the whole history. A summary costs one such
+request and makes every later request smaller.
+<code>&quot;context_idle_minutes&quot;: 0</code> turns it off.</li>
+</ul>
+<p>The first two are checked before a turn and between the tool rounds
+of a turn, and the terminal checks again after the reply. The third is
+checked once, before a turn’s first request. The summary is then a
+request of its own ahead of the reply, and a line in the terminal, or in
+a bot’s log, says what the wait is. A voice session skips the third,
+since a caller would hear the wait as silence.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_compact_pct&quot;</span><span class="fu">:</span> <span class="dv">90</span><span class="fu">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_compact_tokens&quot;</span><span class="fu">:</span> <span class="dv">200000</span><span class="fu">,</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_idle_minutes&quot;</span><span class="fu">:</span> <span class="dv">60</span><span class="fu">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_idle_tokens&quot;</span><span class="fu">:</span> <span class="dv">100000</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p><code>/context</code> shows the trigger in force and the window it is
+measured against. With <code>&quot;memory_flush_enabled&quot;: true</code>, an
+automatic compaction in the terminal runs the memory flush first, which
+is a request of its own. It is off by default, and <code>/flush</code>
+runs it by hand.</p>
+<p>The R objects outlive the turns that made them: a compaction leaves
+every object in place, whatever its size. So the summary ends with the
+names of the objects <code>run_r</code> made that are still there, up to
+30 of them, then the open handles. The agent can use an object instead
+of rebuilding it. Only names are listed, since reading an object can run
+code: a binding made with <code>makeActiveBinding()</code> or
+<code>delayedAssign()</code> is named and left alone. This is for the
+terminal, <code>chat()</code> and a subagent or doer, whose R process is
+the session’s own. A bot’s rooms share one, so a room’s summary has no
+list, and neither does a session whose <code>run_r</code> runs in a
+worker process (<code>run_r_mode: &quot;worker&quot;</code>).</p>
+<p>None of the three applies to a session that manages its own context
+(<code>context_edit</code> with <code>&quot;strategy&quot;: &quot;clm&quot;</code>, under
+“Conversation context editing”). Such a session is never compacted, and
+<code>/context</code> says so.</p>
+<p>Each size is corteza’s estimate, about 1 token per 4 characters. A
+provider counts with its own tokenizer and can count more, so a context
+that corteza puts at 200,000 tokens can be billed as a larger one.</p>
+<h3 id="what-the-summary-reads">What the summary reads</h3>
+<p>The session’s own model writes the summary, in one request, from the
+turns the summary replaces. That request holds a budget of text that
+follows the model’s window: 120,000 characters at a window of 128,000
+tokens or less, and the same share of a larger one, which is 937,500
+characters at 1M. With the default <code>context_compact_tokens</code>,
+a model with a 1M window reads every turn it summarizes. Where the turns
+do not fit, the oldest are left out and the summarizer is told how many.
+On the Codex transport the budget is also held to a quarter of
+<code>context_compact_bytes</code>, counted in characters.</p>
+<p>The summarizer has 60 seconds to answer
+(<code>subagents.context_compaction.timeout_seconds</code>). When it
+fails, the conversation stays as it was and the turn goes on. The
+session’s next summary then reads 120,000 characters whatever the
+window, the smaller request, and a summary that succeeds brings the
+larger budget back. A model too slow for the larger request wants a
+longer <code>timeout_seconds</code>.</p>
+<p>A summary made because the provider refused a request for its size
+reads 120,000 characters too. The larger budget rests on corteza’s count
+of 4 characters to a token, and such a refusal says the count ran low
+for this conversation, as it does for text in Chinese or Japanese.</p>
+<h3 id="the-models-window">The model’s window</h3>
+<p>corteza reads a model’s window from a table in the package
+(<code>R/context-budget.R</code>), where each number names the
+provider’s page it was read from. The table holds the largest input a
+model takes: OpenAI’s API models have a 1,050,000-token window and take
+922,000 tokens of input, and the table says 922,000. A model with no row
+is taken to have 128,000 tokens, and <code>/context</code> says so.</p>
+<p><code>context_window</code> overrides the table:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;context_window&quot;</span><span class="fu">:</span> <span class="dv">64000</span> <span class="fu">}</span></span></code></pre></div>
+<p>It takes a number above 0. Anything else, a quoted
+<code>&quot;64000&quot;</code> included, is ignored and the table answers.</p>
+<p>Set it for a local model. An Ollama server decides the window when it
+loads a model (<code>OLLAMA_CONTEXT_LENGTH</code>, or 4k, 32k or 256k
+tokens by the memory of the GPU), so the table’s row for an Ollama model
+is a guess, and your server may give the model less.</p>
+<h2 id="what-a-session-sends">What a session sends</h2>
+<p>A session’s system text and its tool list are fixed for the session.
+Each request carries the earlier requests’ messages unchanged, with the
+new ones after them, so the provider’s cache holds and so do the model’s
+thinking blocks. A change to either would make the provider read the
+whole history again, and a model that signs its thinking (next section)
+refuses a replay after one.</p>
+<ul>
+<li>Plan mode, an <code>/auto</code> run and the task list change
+neither. When one of them changes, the next prompt opens with a note in
+brackets, such as <code>[Plan mode is on. ...]</code>, and the note
+stays in the history. After a compaction, a context edit or a restore,
+which may have removed earlier notes, the next prompt states the session
+again.</li>
+<li>A tool the mode rules out stays in the list and is refused at the
+call: <code>exit_plan_mode</code> outside plan mode, a write or a
+command in plan mode, a call outside an <code>/auto</code> run’s scope,
+and a call outside a job’s tools. The refusal says why.</li>
+<li>The availability tests (the git tools in a repository, a search key)
+run once, so a <code>git init</code> during a session adds no tool.</li>
+</ul>
+<p>These change the system text or the tools on purpose, and the log
+records each (<code>request_prefix_reset</code>): a move to another
+provider, the terminal’s <code>/clear</code>, <code>/cd</code> in a
+room, a job that may not search (which sends the provider’s tools
+without its search tool, with the thinking removed before and after it),
+and a worker given other tools. Context edits can reduce cache reuse
+from the first changed entry.</p>
+<h2 id="thinking-blocks-after-a-rewrite">Thinking blocks after a
+rewrite</h2>
+<p>A Claude model that thinks by default signs each thinking block
+against the conversation that produced it: the system text, the tools
+and every earlier message. Where the provider checks that signature, a
+request that replays a block after any of the three changed returns
+<code>API error (400)</code> with “bound to a different conversation”,
+and so does every retry.</p>
+<p>corteza removes the thinking blocks from a history whenever it
+replaces one: a compaction, a context edit, an archived turn, a move to
+another provider, a conversation restored after a restart, and a job
+resumed in a new worker. Text and tool calls stay, and the journal keeps
+the history as the model wrote it. Appending removes nothing, so the
+tool rounds of a turn go back with their thinking.</p>
+<p>A session that sets <code>thinking_budget_tokens</code> keeps its
+blocks when its own history is replaced. The models that accept a budget
+do not run the check, and they expect an open tool round to keep the
+thinking it started with. A history passed to <code>new_session()</code>
+comes from another conversation and loses its blocks whatever the
+session’s settings.</p>
+<p>When a provider refuses replayed thinking anyway, the turn removes
+every thinking block from the history, records that in the journal, and
+continues once. Tools that already ran in the turn do not run again. A
+second refusal in the same turn is raised as the provider’s error.</p>
 <h2 id="conversation-context-editing">Conversation context editing</h2>
 <p>Context editing is experimental and off by default. Enable it in the
 global or project <code>config.json</code>:</p>
-<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;context_edit&quot;:</span> <span class="fu">{</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;pressure&quot;</span></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;context_edit&quot;:</span> <span class="fu">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;pressure&quot;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>Project fields override global fields within this block.
 <code>cadence</code> is <code>&quot;pressure&quot;</code> (allow edits after the
 <code>context_warn_pct</code> notice, 75% by default) or
@@ -555,9 +971,9 @@ Spawned subagents inherit the parent’s effective setting.
 <code>/status</code> reports the effective mode, including when an
 enabled setting is unavailable on an unsupported provider or because the
 journal is disabled.</p>
-<p>On Anthropic and OpenAI chat-completions history shapes, the model
-receives an <code>edit_context</code> tool and visible IDs on completed
-tool outputs (<code>[rN]</code>) and earlier assistant text
+<p>On Anthropic, Codex Responses, and OpenAI chat-completions routes,
+the model receives an <code>edit_context</code> tool and visible IDs on
+completed tool outputs (<code>[rN]</code>) and earlier assistant text
 (<code>[mN]</code>). The tool supports:</p>
 <ul>
 <li><code>drop</code>: remove the selected entries, keeping each tool
@@ -583,16 +999,19 @@ overflow, and holder archival. The model must manage the window before
 it fills; exhaustion reports an error and retains the journal. In a
 room, later messages can also overflow the same full window. Use
 <code>/clear</code> to start a fresh working window; the journal retains
-the previous record. Unsupported providers are skipped in a pure CLM
-fallback chain. The package default remains the existing
-threshold-compaction behavior.</p>
+the previous record. A provider or history format that cannot support
+CLM uses standard compaction instead, including the API-key OpenAI
+Responses route. The configured CLM preference stays intact, so a
+compatible route can use it again. Model-switch acknowledgments and
+fallback replies explain the effective context strategy. The package
+default remains the existing threshold-compaction behavior.</p>
 <p>Doers can select this policy independently of their conversation
 session:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;jobs&quot;:</span> <span class="fu">{</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;doer&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;context_edit&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span> <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;always&quot;</span><span class="fu">,</span> <span class="dt">&quot;strategy&quot;</span><span class="fu">:</span> <span class="st">&quot;clm&quot;</span><span class="fu">}</span></span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb9"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;jobs&quot;:</span> <span class="fu">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;doer&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;context_edit&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span> <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;always&quot;</span><span class="fu">,</span> <span class="dt">&quot;strategy&quot;</span><span class="fu">:</span> <span class="st">&quot;clm&quot;</span><span class="fu">}</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>A doer inherits the conversation’s effective editing settings, with
 <code>jobs.doer.context_edit</code> taking precedence. Reviewers and
 approval monitors retain their existing configuration. Doers preserve
@@ -600,12 +1019,12 @@ their complete record in the session journal; they do not file context
 into a vault.</p>
 <p>For a Matrix talker, configure the policy and an explicit vault in
 the Matrix account’s <code>talker</code> block:</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;talker&quot;:</span> <span class="fu">{</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_edit&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span> <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;always&quot;</span><span class="fu">,</span> <span class="dt">&quot;strategy&quot;</span><span class="fu">:</span> <span class="st">&quot;clm&quot;</span><span class="fu">},</span></span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_vault&quot;</span><span class="fu">:</span> <span class="st">&quot;/path/to/this-bots/vault&quot;</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
-<p>For an unsplit Matrix bot, put <code>context_edit</code> and
+<div class="sourceCode" id="cb10"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;talker&quot;:</span> <span class="fu">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_edit&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span> <span class="dt">&quot;cadence&quot;</span><span class="fu">:</span> <span class="st">&quot;always&quot;</span><span class="fu">,</span> <span class="dt">&quot;strategy&quot;</span><span class="fu">:</span> <span class="st">&quot;clm&quot;</span><span class="fu">},</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;context_vault&quot;</span><span class="fu">:</span> <span class="st">&quot;/path/to/this-bots/vault&quot;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>For an unsplit Matrix bot, one whose rooms are no talkers (see <a href="#talker-mode">Talker mode</a>), put <code>context_edit</code> and
 <code>context_vault</code> at the account config’s top level instead.
 Its existing model and tools stay in place; the combined
 conversation/work session owns filing. In split mode, the
@@ -687,21 +1106,21 @@ there is no default</li>
 <p><code>base_url</code> is used as given with
 <code>/chat/completions</code> appended, so include whatever
 <code>/v1</code> prefix the gateway expects.</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;openai_compatible&quot;</span><span class="fu">,</span></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;base_url&quot;</span><span class="fu">:</span> <span class="st">&quot;https://openrouter.ai/api/v1&quot;</span><span class="fu">,</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span></span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb11"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;openai_compatible&quot;</span><span class="fu">,</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;base_url&quot;</span><span class="fu">:</span> <span class="st">&quot;https://openrouter.ai/api/v1&quot;</span><span class="fu">,</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>The API key is read from <code>OPENAI_COMPATIBLE_API_KEY</code>,
 falling back to <code>OPENAI_API_KEY</code>. A keyless gateway (an
 internal proxy that needs no <code>Authorization</code> header) works
 with neither set. Equivalent one-liners:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> <span class="at">--provider</span> openai_compatible <span class="dt">\</span></span>
-<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--base-url</span> https://openrouter.ai/api/v1 <span class="dt">\</span></span>
-<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--model</span> meta-llama/llama-3-70b-instruct</span></code></pre></div>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># base_url comes from config or OPENAI_COMPATIBLE_BASE_URL</span></span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">chat</span>(<span class="at">provider =</span> <span class="st">&quot;openai_compatible&quot;</span>,</span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>              <span class="at">model =</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb12"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> <span class="at">--provider</span> openai_compatible <span class="dt">\</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--base-url</span> https://openrouter.ai/api/v1 <span class="dt">\</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--model</span> meta-llama/llama-3-70b-instruct</span></code></pre></div>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># base_url comes from config or OPENAI_COMPATIBLE_BASE_URL</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">chat</span>(<span class="at">provider =</span> <span class="st">&quot;openai_compatible&quot;</span>,</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>              <span class="at">model =</span> <span class="st">&quot;meta-llama/llama-3-70b-instruct&quot;</span>)</span></code></pre></div>
 <p>A missing endpoint or model is reported at startup, not at the first
 request. Cost is usually <code>NA</code>, since gateway model ids rarely
 match the bundled price table. Requires
@@ -712,12 +1131,12 @@ Most defaults live in <code>R/config.R::load_config()</code>; a few
 (memory keys and the CLI port fallback) live in
 <code>inst/bin/corteza</code>.</p>
 <h3 id="core">Core</h3>
-<table style="width:97%;">
+<table style="width:98%;">
 <colgroup>
-<col style="width: 17%" />
-<col style="width: 17%" />
-<col style="width: 26%" />
-<col style="width: 36%" />
+<col style="width: 25%" />
+<col style="width: 15%" />
+<col style="width: 23%" />
+<col style="width: 32%" />
 </colgroup>
 <thead>
 <tr class="header">
@@ -749,6 +1168,23 @@ required for <code>openai_compatible</code>)</td>
 <td style="text-align: left;">null</td>
 <td style="text-align: left;">Endpoint for
 <code>openai_compatible</code> (see below)</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>cache</code></td>
+<td style="text-align: left;">string or null</td>
+<td style="text-align: left;">null</td>
+<td style="text-align: left;">Anthropic prompt cache, <code>&quot;5m&quot;</code>
+by default, including CLM. <code>&quot;1h&quot;</code> and <code>&quot;none&quot;</code>
+override it.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>task_list_enabled</code></td>
+<td style="text-align: left;">boolean</td>
+<td style="text-align: left;"><code>false</code></td>
+<td style="text-align: left;">The task list in the terminal and in
+<code>chat()</code>: the <code>task_create</code> and
+<code>task_update</code> tools, and the instructions to ask first and
+propose a plan that go with them</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>port</code></td>
@@ -806,23 +1242,64 @@ warnings</td>
 <td style="text-align: left;"><code>context_compact_pct</code></td>
 <td style="text-align: left;">integer</td>
 <td style="text-align: left;"><code>90</code></td>
-<td style="text-align: left;">Auto-compaction threshold</td>
+<td style="text-align: left;">Auto-compaction threshold, as a share of
+the model’s window</td>
 </tr>
 <tr class="even">
+<td style="text-align: left;"><code>context_compact_tokens</code></td>
+<td style="text-align: left;">integer</td>
+<td style="text-align: left;"><code>200000</code></td>
+<td style="text-align: left;">A cap on that threshold in estimated
+tokens; the smaller of the two applies. <code>0</code> turns the cap
+off</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>context_idle_minutes</code></td>
+<td style="text-align: left;">integer</td>
+<td style="text-align: left;"><code>60</code></td>
+<td style="text-align: left;">Compact before a turn when the model last
+answered this long ago and the prompt cache has expired. <code>0</code>
+turns it off</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>context_idle_tokens</code></td>
+<td style="text-align: left;">integer</td>
+<td style="text-align: left;"><code>100000</code></td>
+<td style="text-align: left;">The smallest context the idle rule
+compacts</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>context_window</code></td>
+<td style="text-align: left;">integer or null</td>
+<td style="text-align: left;">null</td>
+<td style="text-align: left;">The model’s window in tokens (null = the
+package’s table). Set it for a local model</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>context_window_cap</code></td>
+<td style="text-align: left;">integer or null</td>
+<td style="text-align: left;">null</td>
+<td style="text-align: left;">Upper bound for the working window. For
+example, <code>400000</code> gives a 1M route a 400k budget and keeps a
+200k route at 200k. Applies to the meter, compaction, model-managed
+history pressure and reviewer budgets. Ordinary compaction still starts
+at the earlier configured threshold (200k tokens by default).</td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;"><code>context_compact_bytes</code></td>
 <td style="text-align: left;">integer</td>
 <td style="text-align: left;"><code>900000</code></td>
 <td style="text-align: left;">Serialized-history compaction guard for
 the Codex transport</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>context_request_buffer_retries</code></td>
 <td style="text-align: left;">integer</td>
 <td style="text-align: left;"><code>3</code></td>
 <td style="text-align: left;">Forced compact-and-continue attempts after
 a Codex request-buffer error</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>journal_enabled</code></td>
 <td style="text-align: left;">boolean</td>
 <td style="text-align: left;"><code>true</code></td>
@@ -830,7 +1307,7 @@ a Codex request-buffer error</td>
 (<code>&lt;id&gt;.journal/</code>: a live snapshot plus a segment per
 compaction) beside the session transcript</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>audit.enabled</code></td>
 <td style="text-align: left;">boolean</td>
 <td style="text-align: left;"><code>true</code></td>
@@ -838,14 +1315,14 @@ compaction) beside the session transcript</td>
 deliveries independently of display verbosity and
 <code>journal_enabled</code></td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>audit.limits</code></td>
 <td style="text-align: left;">object</td>
 <td style="text-align: left;">see below</td>
 <td style="text-align: left;">Bound raw payload capture independently of
 model context caps</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>context_edit</code></td>
 <td style="text-align: left;">object</td>
 <td style="text-align: left;"><code>{&quot;enabled&quot;: false, &quot;cadence&quot;: &quot;pressure&quot;}</code></td>
@@ -853,7 +1330,7 @@ model context caps</td>
 cadence is <code>pressure</code> or <code>always</code>, and journaling
 is required</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>tool_output_caps</code></td>
 <td style="text-align: left;">object</td>
 <td style="text-align: left;"><code>{}</code></td>
@@ -861,28 +1338,28 @@ is required</td>
 e.g. <code>{&quot;game_action&quot;: {&quot;max_chars&quot;: 400000, &quot;max_lines&quot;: 20000}}</code>;
 other tools keep the 50-line / 5000-char cap</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>context_include_soul</code></td>
 <td style="text-align: left;">boolean or null</td>
 <td style="text-align: left;">null</td>
 <td style="text-align: left;">Include <code>SOUL.md</code> (null = saber
 default)</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>context_include_user</code></td>
 <td style="text-align: left;">boolean or null</td>
 <td style="text-align: left;">null</td>
 <td style="text-align: left;">Include <code>USER.md</code> (null = saber
 default)</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>instruction_roots</code></td>
 <td style="text-align: left;">object</td>
 <td style="text-align: left;"><code>{}</code></td>
 <td style="text-align: left;">Additional named roots for lazily loaded
 <code>SKILL.md</code> instructions</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>instruction_disabled</code></td>
 <td style="text-align: left;">string[]</td>
 <td style="text-align: left;"><code>[]</code></td>
@@ -932,11 +1409,42 @@ or a capture failure. <code>audit_payload_pin()</code> protects
 incident/evaluation evidence from explicit expiry; pinned bytes still
 count toward quota. <code>audit_payload_expire()</code> defaults to a
 dry run with a 30-day horizon. It writes expiry records before deleting
-unpinned payloads. There is no automatic pruning of payloads or event
-metadata. The 365-day metadata retention value is planning guidance, not
-an automatic deletion policy. See <code>vignette(&quot;audit-records&quot;)</code>
-for the record format.</p>
+unpinned payloads. A positive <code>retention.audit_payload_days</code>
+enables automatic expiry. Event metadata stays. See
+<code>vignette(&quot;audit-records&quot;)</code>.</p>
 <h3 id="safety">Safety</h3>
+<p>Every tool has a class, which decides who approves a call to it:
+<code>read</code>, <code>write</code>, <code>exec</code>,
+<code>control</code> (the session’s own subagents, tasks and jobs) or
+<code>continue</code> (work that goes on in a child, a worker or another
+room). Reads, control and continue run; writes and commands ask. A tool
+that names no class, such as a skill or a package tool whose
+<code>skill_packages</code> entry gives none, asks too.</p>
+<p>Plan mode refuses writes, commands, continuations and tools with no
+class, and nothing below lifts that. The agent ends plan mode with
+<code>exit_plan_mode</code>, whose prompt shows you its plan; a no keeps
+plan mode. That prompt comes each time, as does the one for a path under
+a credential store (<code>~/.ssh</code>, <code>~/.aws/credentials</code>
+and others): a saved “always” never answers either, and neither prompt
+offers one. Personal paths (<code>~/Documents</code>,
+<code>~/Downloads</code>) can be read; a write or a command touching
+them in a room is refused.</p>
+<p>At the terminal, “Allow always for this project” saves the answer in
+<code>approvals.json</code> in your config directory, by directory, and
+later sessions there skip that prompt. A project’s own
+<code>.corteza/approvals.json</code>, where earlier versions kept these
+answers, is not read, trusted or not: the terminal says so when it
+starts. <code>/permissions</code> lists what is saved for the
+directory.</p>
+<p>The answers cover a talker’s delegated jobs as well. A tool you
+allowed always in the directory runs in a job without a question, except
+where the credential rule asks, and a job’s question offers “always”
+beside yes and no, kept as the terminal’s own prompt keeps it. In
+<code>chat()</code> an “always” lasts for the session, from either
+prompt. A room’s jobs take none of these answers: a room’s approvers
+answer there.</p>
+<p>The keys below apply to what is left. None of them turns a refusal
+into a run.</p>
 <table style="width:99%;">
 <colgroup>
 <col style="width: 12%" />
@@ -957,21 +1465,26 @@ for the record format.</p>
 <td style="text-align: left;"><code>approval_mode</code></td>
 <td style="text-align: left;">string</td>
 <td style="text-align: left;"><code>&quot;ask&quot;</code></td>
-<td style="text-align: left;"><code>&quot;ask&quot;</code>, <code>&quot;allow&quot;</code>,
-or <code>&quot;deny&quot;</code></td>
+<td style="text-align: left;">What “ask” means for a tool with no
+<code>permissions</code> entry: <code>&quot;ask&quot;</code>,
+<code>&quot;allow&quot;</code>, <code>&quot;deny&quot;</code>, or <code>&quot;review&quot;</code> (the
+reviewer first; see Supervisor). A project’s config cannot set
+<code>&quot;review&quot;</code></td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>dangerous_tools</code></td>
 <td style="text-align: left;">string[]</td>
 <td style="text-align: left;"><code>[&quot;bash&quot;, &quot;run_r&quot;, &quot;run_r_script&quot;, &quot;write_file&quot;, &quot;replace_in_file&quot;, &quot;base::writeLines&quot;]</code></td>
-<td style="text-align: left;">Tools requiring approval</td>
+<td style="text-align: left;">Tools that ask even where their class
+would run. Leaving a tool off this list does not stop it asking</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;"><code>permissions</code></td>
 <td style="text-align: left;">object</td>
-<td style="text-align: left;"><code>{}</code></td>
-<td style="text-align: left;">Per-tool overrides,
-e.g. <code>{&quot;bash&quot;: &quot;deny&quot;}</code></td>
+<td style="text-align: left;"><code>{&quot;harness_note&quot;: &quot;ask&quot;}</code></td>
+<td style="text-align: left;">Per-tool verdicts,
+e.g. <code>{&quot;bash&quot;: &quot;deny&quot;}</code> or <code>{&quot;bash&quot;: &quot;allow&quot;}</code>. An
+entry replaces the verdict for its tool</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>denied_paths</code></td>
@@ -1010,6 +1523,92 @@ in place of step
 <p>No setting approves a call unseen. The rules read text and are not a
 sandbox: a command can be written so that they miss it, which is what
 the monitor and the tool policy above are also there for.</p>
+<p>A room’s monitor reads the conversation to judge a call. Each
+conversation keeps a record beside the room’s journal, a file per
+conversation: who sent each message, in the words they sent, and the
+bot’s own posts. Only the lines of someone who may approve are taken as
+instructions: the room’s operators, or the one person in a private room.
+Anyone else’s, another bot’s or a peer’s request included, are shown as
+theirs. A job’s calls are judged by the conversation that asked for the
+job, read when the call comes, so a “stop” sent since is in it. A job
+handed over from another room is judged by that room’s. The monitor is
+not asked, and a person is, when nobody in the room may approve or the
+record cannot be read whole:</p>
+<ul>
+<li>one with an unreadable line or over 100,000 new characters;</li>
+<li>one with a break: a restart whose backfill did not reach back to the
+last message on record, a line that could not be written, or a thread
+that went on from its archive;</li>
+<li>one that does not reach back to the start of the conversation. A
+conversation under way when a bot first runs 0.8.1 is one of these, and
+<code>/clear</code> starts one the monitor can read.</li>
+</ul>
+<p>At the terminal and in <code>chat()</code>,
+<code>&quot;approval_mode&quot;: &quot;review&quot;</code> gives a session the same three
+steps for each call that would prompt. The monitor there is called the
+reviewer. It rules on reads, writes and commands that the rules leave
+open. It reads the conversation to judge them, from the session’s
+transcript: every message you sent, whole, each after all the agent said
+since your message before it, the reply and any job’s result that came
+after. Only your words are taken as instructions. It is not shown
+these:</p>
+<ul>
+<li>a compaction’s summary, which the agent wrote;</li>
+<li>output you staged with <code>/r</code> or <code>!</code>;</li>
+<li>an <code>/auto</code> run’s prompts, which its driver wrote, and the
+goal corteza writes for a bare <code>/auto</code>. It sees what you
+typed to start the run, and the run’s replies;</li>
+<li>the agent’s task list.</li>
+</ul>
+<p>An approval runs the call and prints a dim line saying so. A refusal
+goes back to the agent with its reason. A call it passes on prompts you
+with its reason. These still prompt without it:</p>
+<ul>
+<li>a call the rules flag;</li>
+<li>a tool with no class;</li>
+<li>a credential path;</li>
+<li>leaving plan mode;</li>
+<li>any call while the reviewer cannot read the whole conversation: one
+with over 100,000 new characters, one with no transcript or with a line
+it cannot read, one where a reply to your message is missing (its write
+failed, or corteza stopped mid-turn), or one begun before 0.8.1, whose
+transcript does not mark what you typed. <code>/clear</code> starts a
+conversation it can read; in an editor, a new session does.</li>
+</ul>
+<p>Room and terminal reviewers send a call to a person when any JSON
+argument exceeds 2,000 characters, the worker’s explanation exceeds
+1,500 characters, or the delegated task exceeds 4,000 characters. The
+reviewer reads the delegated task in full whenever it rules on a job’s
+call. The next eligible call can use the same verified conversation. In
+<code>/auto</code>, an oversized argument is refused and the run can
+continue.</p>
+<p>The reviewer uses CLM for its own notes and tool results. With
+<code>journal_enabled: false</code>, it reads the complete record afresh
+for each call. A fresh reviewer reads up to 100,000 characters. A warm
+reviewer can take another batch of that size if its earlier inputs are
+intact and its model has room for the request. On Claude and Codex, an
+unchanged request prefix can use the provider’s measured token total.
+New material and unmeasured requests use a conservative byte bound. Both
+reserve room for the reply. A changed record starts a fresh review.</p>
+<p>A tool you allowed always runs without asking it. Plan mode still
+refuses what it refuses. A reviewer that fails, or has not ruled by
+<code>supervisor.timeout_sec</code>, passes the call to you.
+Interrupting a turn while the reviewer works cancels its request, and
+the next call is asked afresh. “review” changes only what would prompt:
+a call that policy allows runs, as under “ask”. In a room the rules read
+every call, allowed ones included.</p>
+<p><code>/permissions review</code> turns it on for the session and
+<code>/permissions ask</code> turns it off. Your config can turn it on
+for every session. A project’s config cannot: who reviews the agent is
+yours to choose. In a Matrix room, <code>auto_approve_asks</code> is
+this mode. An <code>/auto</code> run keeps its own monitor, since nobody
+is at its prompt.</p>
+<p>A talker’s delegated jobs are covered too. The doer reads the mode
+before each call, so <code>/permissions review</code> typed while a job
+runs reaches its next call. The reviewer judges a job’s call by the
+conversation that asked for the job and the task the talker wrote. Your
+“allow always” answers cover a job’s calls as they cover the session’s
+own, before the reviewer is asked.</p>
 <p>These keys are read from the user’s config file only. A project’s
 <code>.corteza/config.json</code> cannot set them.</p>
 <table style="width:98%;">
@@ -1077,13 +1676,74 @@ be written without asking a person, such as a notes directory</td>
 </tr>
 </tbody>
 </table>
-<h3 id="skills">Skills</h3>
+<h3 id="retention">Retention</h3>
+<p>corteza keeps its sessions under
+<code>tools::R_user_dir(&quot;corteza&quot;, &quot;data&quot;)</code>. Once a day, when a
+terminal session starts and while a chat bot runs, it removes the
+journal and the tool trace of every session that has gone unused for
+<code>retention.session_days</code>. A session was last used when its
+journal, its trace or its transcript last changed. The terminal says
+what it removed.</p>
+<p>Transcripts, session stores, config and audit event records stay. Old
+terminal workspaces and unpinned audit payloads have separate opt-in
+ages. A session whose journal is gone still resumes from its transcript,
+and says what is gone. A room that restores its context from its journal
+starts its next conversation fresh. A room’s records of its
+conversations go with its journal, and the room’s calls then go to a
+person until <code>/clear</code>.</p>
+<p>A session’s audit records are kept in its journal folder, under
+<code>audit/</code>. The event stream stays. You can expire unpinned
+payloads with <code>audit_payload_expire()</code> or the personal
+retention setting below.</p>
+<p>The same run clears corteza’s state folder (<code>state/</code>
+beside the sessions, or <code>CORTEZA_STATE_DIR</code>) and its
+remote-control folder:</p>
+<ul>
+<li>A delegated job’s records go with every job linked to it as a
+resume, a review or a delegation, once all of them have ended and none
+has changed for <code>session_days</code>. While one of them is queued
+or running, all stay.</li>
+<li>A job that ended incomplete and was never resumed holds the snapshot
+a resume starts from. Its chain waits <code>incomplete_days</code>
+instead, and never fewer than <code>session_days</code>. The terminal
+names each such job when it goes.</li>
+<li>A worker process’s folder with no checkpoint loses its journal, less
+its audit records.</li>
+<li>A worker’s folder with a checkpoint (the R objects and history a
+delegated job’s worker left for the next job) goes once it and the
+session it belongs to have both gone unused for
+<code>session_days</code>: at the terminal the conversation’s session,
+in a room or a thread the room’s session, judged by its journal, which
+holds the record of its conversations. A room keeps one such folder
+across <code>/clear</code>, so the room’s use counts, not one
+conversation’s. Where the session has left nothing, the folder goes by
+its own age. The checkpoint goes first, then the rest, less the
+journal’s audit records.</li>
+<li>A remote-control session goes once it was closed, or once its
+process on this machine has ended. One from another machine stays.</li>
+</ul>
+<p>A worker’s folder stays, whatever its age, while its worker process
+is alive (a worker on another machine counts as alive), while its
+session is open in the terminal or the bot doing the removal, and while
+a job is open in its directory. Each of these, and the last use of the
+folder and of its session, is read again just before the folder
+goes.</p>
+<p>A folder there whose name and record are not of the form corteza
+writes stays whole. Once it is old enough the terminal counts it, and
+<code>sessions_prune(dry_run = TRUE)</code> lists it with kind
+<code>&quot;unknown&quot;</code>.</p>
+<p><code>sessions_prune(dry_run = TRUE)</code> reports what a run would
+remove. <code>sessions_prune()</code> runs one now.</p>
+<p>These keys are read from the user’s config file only. A project’s
+<code>.corteza/config.json</code> cannot set them. A config file that
+does not parse turns retention off, and a value that is not one
+non-negative number keeps everything that key governs.</p>
 <table style="width:98%;">
 <colgroup>
+<col style="width: 37%" />
+<col style="width: 12%" />
 <col style="width: 19%" />
-<col style="width: 10%" />
-<col style="width: 44%" />
-<col style="width: 24%" />
+<col style="width: 27%" />
 </colgroup>
 <thead>
 <tr class="header">
@@ -1095,33 +1755,91 @@ be written without asking a person, such as a notes directory</td>
 </thead>
 <tbody>
 <tr class="odd">
-<td style="text-align: left;"><code>skill_paths</code></td>
-<td style="text-align: left;">string[]</td>
-<td style="text-align: left;"><code>[]</code></td>
-<td style="text-align: left;">Legacy executable/file-skill
-configuration</td>
+<td style="text-align: left;"><code>retention.session_days</code></td>
+<td style="text-align: left;">number</td>
+<td style="text-align: left;"><code>90</code></td>
+<td style="text-align: left;">Days a session goes unused before its
+journal and tool trace are removed, and days a job chain, worker folder
+or remote-control session goes unchanged before it is removed.
+<code>0</code> disables idle-session cleanup.</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;"><code>skill_packages</code></td>
-<td style="text-align: left;">object[]</td>
-<td style="text-align: left;"><code>[{&quot;package&quot;:&quot;base&quot;, ...}, {&quot;package&quot;:&quot;utils&quot;, ...}]</code></td>
-<td style="text-align: left;">R packages registered as tools</td>
+<td style="text-align: left;"><code>retention.incomplete_days</code></td>
+<td style="text-align: left;">number</td>
+<td style="text-align: left;"><code>180</code></td>
+<td style="text-align: left;">Days a job chain that ended incomplete,
+and was never resumed, is kept for its resume snapshot. Never fewer than
+<code>session_days</code>. <code>0</code> keeps it</td>
 </tr>
 <tr class="odd">
+<td style="text-align: left;"><code>retention.audit_payload_days</code></td>
+<td style="text-align: left;">number</td>
+<td style="text-align: left;"><code>0</code></td>
+<td style="text-align: left;">Days since an unpinned payload was last
+captured. Audit event records stay.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>retention.journal_segment_days</code></td>
+<td style="text-align: left;">number</td>
+<td style="text-align: left;"><code>0</code></td>
+<td style="text-align: left;">Whole days to keep earlier rewrites in an
+active journal. Positive fractions round up. A running turn keeps the
+entries it needs. The live snapshot and latest committed rewrite stay.
+New journals group shared entries by day for expiry. Older shared
+entries keep their original layout until idle-session cleanup.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>retention.workspace_snapshot_days</code></td>
+<td style="text-align: left;">number</td>
+<td style="text-align: left;"><code>0</code></td>
+<td style="text-align: left;">Days to keep a legacy R workspace snapshot
+beside its transcript.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="skills">Skills</h3>
+<table style="width:98%;">
+<colgroup>
+<col style="width: 19%" />
+<col style="width: 10%" />
+<col style="width: 15%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Key</th>
+<th style="text-align: left;">Type</th>
+<th style="text-align: left;">Default</th>
+<th style="text-align: left;">Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>skill_packages</code></td>
+<td style="text-align: left;">object[]</td>
+<td style="text-align: left;"><code>[]</code></td>
+<td style="text-align: left;">R package functions registered as tools,
+as in
+<code>[{&quot;package&quot;: &quot;utils&quot;, &quot;functions&quot;: [&quot;head&quot;], &quot;class&quot;: &quot;read&quot;}]</code>.
+An entry’s <code>class</code> applies to all its functions; an entry
+without one leaves them asking. Up to 0.8.0 the default registered 8
+functions of base and utils</td>
+</tr>
+<tr class="even">
 <td style="text-align: left;"><code>skill_timeout</code></td>
 <td style="text-align: left;">number</td>
 <td style="text-align: left;"><code>30</code></td>
 <td style="text-align: left;">Default skill execution timeout
 (seconds)</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>skill_timeout_max</code></td>
 <td style="text-align: left;">number</td>
 <td style="text-align: left;"><code>1800</code></td>
 <td style="text-align: left;">Host ceiling for a model-requested
 supervised <code>run_r</code> timeout</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>run_r_mode</code></td>
 <td style="text-align: left;">string</td>
 <td style="text-align: left;"><code>&quot;in_process&quot;</code></td>
@@ -1129,7 +1847,7 @@ supervised <code>run_r</code> timeout</td>
 caller’s R workspace; <code>&quot;worker&quot;</code> uses a private persistent
 <code>callr::r_session</code> with enforceable deadlines</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>run_r_worker_options</code></td>
 <td style="text-align: left;">object</td>
 <td style="text-align: left;"><code>{}</code></td>
@@ -1138,8 +1856,31 @@ caller’s R workspace; <code>&quot;worker&quot;</code> uses a private persisten
 <code>&quot;worker&quot;</code>: <code>env</code>, <code>libpath</code>,
 <code>cmdargs</code>, <code>arch</code>, …</td>
 </tr>
+<tr class="even">
+<td style="text-align: left;"><code>job_worker_options</code></td>
+<td style="text-align: left;">object</td>
+<td style="text-align: left;"><code>{}</code></td>
+<td style="text-align: left;">Named arguments for
+<code>callr::r_session_options()</code> for doers, reviewers and
+monitors</td>
+</tr>
 </tbody>
 </table>
+<p>Job workers, supervised <code>run_r</code> workers and spawned
+subagents skip the working directory’s <code>.Rprofile</code> by
+default. This includes any options that file sets, such as
+<code>options(corteza.policy = ...)</code>. To load the profile for a
+job or supervised <code>run_r</code> worker, set
+<code>user_profile</code> to <code>&quot;project&quot;</code> in that worker’s
+options. Spawned subagents, archive summaries (foreground and
+background) and room consultations always skip the project profile.</p>
+<p>A project using <code>renv</code> can instead supply
+<code>job_worker_options.libpath</code> or
+<code>run_r_worker_options.libpath</code>. This list replaces the
+worker’s library search path. Put the project library first, followed by
+the libraries containing corteza and its dependencies. The initial R
+process and the approved <code>run_r_script</code> tool follow their
+ordinary startup rules.</p>
 <p><code>skill_timeout</code> is the default for ordinary skills and for
 self-bounded tools such as <code>bash</code>, <code>cmd</code>, and
 <code>run_r_script</code>. An explicit tool argument still wins. Those
@@ -1171,6 +1912,13 @@ work exactly as in a standard session; set
 to override. A model may request a different timeout on an individual
 call; <code>skill_timeout_max</code> is the host-owned ceiling. A host
 may narrow it further for an expiring external lease.</p>
+<p>A turn that is asked to stop (an ACP client’s cancel, below)
+interrupts the worker, as its deadline does, and the worker keeps its R
+objects. A worker that does not come back within 5 seconds of the
+interrupt, because its code is in C that never checks for one or catches
+the interrupt and goes on, is ended: all of the session’s R objects are
+lost, the call’s result says so, and the next <code>run_r</code> starts
+a new worker. Files the code wrote stay.</p>
 <p><code>run_r_worker_options</code> shapes that worker process without
 touching the host: a private environment or library path, extra
 command-line arguments, or <code>arch</code>, which callr resolves to
@@ -1223,32 +1971,13 @@ code.</p>
 </tr>
 </tbody>
 </table>
-<h3 id="rate-limiting">Rate limiting</h3>
-<table>
-<thead>
-<tr class="header">
-<th style="text-align: left;">Key</th>
-<th style="text-align: left;">Type</th>
-<th style="text-align: left;">Default</th>
-<th style="text-align: left;">Description</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td style="text-align: left;"><code>rate_limits</code></td>
-<td style="text-align: left;">object</td>
-<td style="text-align: left;"><code>{}</code></td>
-<td style="text-align: left;">Per-provider limits</td>
-</tr>
-</tbody>
-</table>
 <h3 id="subagents">Subagents</h3>
 <table style="width:99%;">
 <colgroup>
-<col style="width: 21%" />
-<col style="width: 9%" />
-<col style="width: 48%" />
-<col style="width: 19%" />
+<col style="width: 18%" />
+<col style="width: 7%" />
+<col style="width: 55%" />
+<col style="width: 17%" />
 </colgroup>
 <thead>
 <tr class="header">
@@ -1275,7 +2004,8 @@ code.</p>
 <td style="text-align: left;"><code>subagents.timeout_minutes</code></td>
 <td style="text-align: left;">integer</td>
 <td style="text-align: left;"><code>30</code></td>
-<td style="text-align: left;">Subagent kill timeout</td>
+<td style="text-align: left;">A query after this deadline ends the
+child. <code>/agents</code> shows the deadline.</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"><code>subagents.allow_nested</code></td>
@@ -1286,16 +2016,9 @@ code.</p>
 <tr class="odd">
 <td style="text-align: left;"><code>subagents.default_tools</code></td>
 <td style="text-align: left;">string[]</td>
-<td style="text-align: left;"><code>[&quot;read_file&quot;, &quot;grep_files&quot;, &quot;r_help&quot;, &quot;web_search&quot;, &quot;fetch_url&quot;]</code></td>
+<td style="text-align: left;"><code>[&quot;read_file&quot;, &quot;skill_instructions&quot;, &quot;grep_files&quot;, &quot;r_help&quot;, &quot;web_search&quot;, &quot;fetch_url&quot;]</code></td>
 <td style="text-align: left;">Tools available to subagents when no
 preset is given</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;"><code>subagents.base_port</code></td>
-<td style="text-align: left;">integer</td>
-<td style="text-align: left;"><code>7851</code></td>
-<td style="text-align: left;">Starting port for subagent MCP
-servers</td>
 </tr>
 </tbody>
 </table>
@@ -1325,83 +2048,120 @@ the parent cannot grant new tools after the fact. If a task may need
 shell, write, or network capability, choose a preset or explicit tool
 list that includes it at spawn time; otherwise the child should report
 that it is blocked.</p>
-<h3 id="workspace">Workspace</h3>
-<table style="width:98%;">
-<colgroup>
-<col style="width: 38%" />
-<col style="width: 12%" />
-<col style="width: 19%" />
-<col style="width: 27%" />
-</colgroup>
-<thead>
-<tr class="header">
-<th style="text-align: left;">Key</th>
-<th style="text-align: left;">Type</th>
-<th style="text-align: left;">Default</th>
-<th style="text-align: left;">Description</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td style="text-align: left;"><code>workspace.enabled</code></td>
-<td style="text-align: left;">boolean</td>
-<td style="text-align: left;"><code>true</code></td>
-<td style="text-align: left;">Enable managed workspace</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;"><code>workspace.budget_chars</code></td>
-<td style="text-align: left;">integer</td>
-<td style="text-align: left;"><code>32000</code></td>
-<td style="text-align: left;">Context budget in characters</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;"><code>workspace.capture_results</code></td>
-<td style="text-align: left;">boolean</td>
-<td style="text-align: left;"><code>true</code></td>
-<td style="text-align: left;">Promote large results to handles</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;"><code>workspace.max_result_size</code></td>
-<td style="text-align: left;">integer</td>
-<td style="text-align: left;"><code>50000</code></td>
-<td style="text-align: left;">Max result size before handle
-promotion</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;"><code>workspace.scan_globalenv</code></td>
-<td style="text-align: left;">boolean</td>
-<td style="text-align: left;"><code>true</code></td>
-<td style="text-align: left;">Scan <code>.GlobalEnv</code> on
-startup</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;"><code>workspace.scan_max_bytes</code></td>
-<td style="text-align: left;">integer</td>
-<td style="text-align: left;"><code>52428800</code></td>
-<td style="text-align: left;">Max bytes to scan from
-<code>.GlobalEnv</code> (50 MB)</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;"><code>workspace.max_object_summary_chars</code></td>
-<td style="text-align: left;">integer</td>
-<td style="text-align: left;"><code>2000</code></td>
-<td style="text-align: left;">Max summary length per object</td>
-</tr>
-</tbody>
-</table>
+<h3 id="recovering-old-r-workspace-snapshots">Recovering old R workspace
+snapshots</h3>
+<p>Versions through 0.8.0 saved a list of R objects in
+<code>&lt;session&gt;_workspace.rds</code> under the agent’s sessions
+directory. Use <code>readRDS(path)</code> to recover that list. New
+sessions keep live <code>run_r</code> bindings in their evaluator.
+Conversation history and delegated job checkpoints have their own
+storage.</p>
 <h3 id="channels">Channels</h3>
 <h4 id="chat-channel">Chat channel</h4>
 <p>The chat channel requires <code>chat.api</code> (Suggests), which
 carries the transport adapters. Configured via a separate helper, not
 the main JSON config.</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">bot_configure</span>(</span>
-<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">server =</span> <span class="st">&quot;https://matrix.example.com&quot;</span>,</span>
-<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">user =</span> <span class="st">&quot;corteza_bot&quot;</span>,</span>
-<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">password =</span> <span class="st">&quot;verysecure&quot;</span>,</span>
-<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">room =</span> <span class="st">&quot;#general:example.com&quot;</span>,</span>
-<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">model =</span> <span class="st">&quot;llama3.2&quot;</span>,</span>
-<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;ollama&quot;</span></span>
-<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">bot_configure</span>(</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">server =</span> <span class="st">&quot;https://matrix.example.com&quot;</span>,</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">user =</span> <span class="st">&quot;corteza_bot&quot;</span>,</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">password =</span> <span class="st">&quot;verysecure&quot;</span>,</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">room =</span> <span class="st">&quot;#general:example.com&quot;</span>,</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">model =</span> <span class="st">&quot;llama3.2&quot;</span>,</span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;ollama&quot;</span>,</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">operators =</span> <span class="st">&quot;@you:example.com&quot;</span>,</span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">project_roots =</span> <span class="st">&quot;~/projects&quot;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<h4 id="who-a-bot-answers-to">Who a bot answers to</h4>
+<p><code>operators</code> names the people a bot answers to, each by a
+full Matrix id.</p>
+<ul>
+<li>The bot accepts an invite only from an operator.</li>
+<li>In a room with one person in it, the bot answers only when that
+person is an operator.</li>
+<li>Operators answer its approval prompts, and commands such as
+<code>/approve-all</code>, <code>/cd</code> and <code>/ls</code> are
+theirs.</li>
+</ul>
+<p>A bot with no operators accepts no invites. It works in the room it
+was configured with and in rooms it has already joined. Where such a
+room has one person in it, that person is answered and answers the
+approval prompts. Where it has more, the bot answers when it is
+mentioned and nobody can approve, so a call that needs approval is
+declined. Each invite the bot refuses is reported in its log, with what
+would change that.</p>
+<p>Up to 0.8.0 a bot with no operators accepted every invite, which gave
+a session with tools to anyone who could invite it. A bot that should go
+on accepting invites needs <code>operators</code>: pass it to
+<code>bot_configure()</code>, which writes the whole config again, or
+add <code>&quot;operators&quot;: [&quot;@you:example.com&quot;]</code> to the bot
+config.</p>
+<h4 id="where-a-room-works">Where a room works</h4>
+<p>A room works in the first of these that applies:</p>
+<ol type="1">
+<li>The directory an operator bound it to with
+<code>/cd &lt;dir&gt;</code>. It must exist and lie inside one of the
+bot’s project roots, links resolved.</li>
+<li>The bot’s <code>cwd</code>. <code>bot_configure(cwd = )</code> saves
+one. <code>bot_run(cwd = )</code>, <code>bot_run_init(cwd = )</code> and
+<code>bot_poll(cwd = )</code> give one for a run, and it wins over the
+saved one.</li>
+<li>A scratch folder under the session’s temporary directory, deleted
+when the process ends. The room is told it has no project directory, and
+it reads, searches and talks only. It writes no files, runs no commands,
+starts no subagent and hands no work to a doer or another room, and no
+room hands work to it. A refusal says how to give the room a directory.
+Room lists show it as having none, and it is named by its id or name,
+never by the scratch folder. A room an operator bound with
+<code>/cd none</code> works here, as does one whose bound directory is
+gone or lies outside every root now. So does a room whose state file the
+bot could not read: the file is copied aside, and the room stays here,
+across restarts, until an operator runs <code>/cd</code>, since what was
+lost may have been <code>/cd none</code>.</li>
+</ol>
+<p>The project roots are <code>project_roots</code>, existing
+directories inside which a room may be bound.
+<code>bot_configure(project_roots = )</code> saves them, and
+<code>bot_run()</code>, <code>bot_run_init()</code> and
+<code>bot_poll()</code> take them for a run. With none,
+<code>/cd &lt;dir&gt;</code> is refused.</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">bot_configure</span>(server, user, password, room,</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>                       <span class="at">project_roots =</span> <span class="fu">c</span>(<span class="st">&quot;~/projects&quot;</span>, <span class="st">&quot;~/src&quot;</span>))</span></code></pre></div>
+<p>In a room, for an operator of the bot:</p>
+<ul>
+<li><code>/cd</code> says where the room works, the 3 forms and the
+roots.</li>
+<li><code>/cd &lt;dir&gt;</code> binds the room to
+<code>&lt;dir&gt;</code>. A bare name is looked for under each
+root.</li>
+<li><code>/cd none</code> binds it to no directory, and
+<code>/cd default</code> returns it to the bot’s <code>cwd</code>.</li>
+<li><code>/ls</code> lists the roots, and <code>/ls &lt;dir&gt;</code>
+the directories directly inside one, names only, at most 50.</li>
+</ul>
+<p>A move ends every conversation the room holds, the main timeline’s
+and each thread’s, as <code>/clear</code> does: each goes to the host’s
+archive, and the next starts in the new directory with a new prompt,
+tools and doer. A thread first seen later starts there too, and a
+restart seeds no conversation with messages from before the move. A move
+is refused while any of the room’s conversations has a job open, and the
+refusal names it. The binding is kept in the room’s state file and
+outlives a restart. A room the <code>on_clear</code> hook files a
+conversation into takes the binding of the room it came from.</p>
+<p>Up to 0.8.0 a room worked in the directory its topic started with,
+written <code>&lt;path&gt; | &lt;description&gt;</code>. Anyone with the
+power level can change a topic, and that directory became the checkout
+where the supervisor let writes through without asking a person. A topic
+names no directory now. A room whose topic still starts with a path is
+told once that the path is not read, and which <code>/cd</code> would
+bind it.</p>
+<p>corteza creates none of these directories. A <code>cwd</code> or root
+that does not exist is an error where it is given, and a run stops at
+its start when the saved <code>cwd</code> has been removed. Up to 0.8.0
+the last step was <code>~/&lt;bot name&gt;</code>, created on first use.
+A bot that relied on that directory now needs <code>cwd</code>:</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">bot_run</span>(<span class="at">cwd =</span> <span class="st">&quot;~/mybot&quot;</span>)</span></code></pre></div>
+<p><code>voice_serve()</code> sessions resolve their directory the same
+way. In a process of their own they use the saved <code>cwd</code>.</p>
 <h3 id="legacy-memory">Legacy memory</h3>
 <table style="width:98%;">
 <colgroup>
@@ -1420,18 +2180,14 @@ the main JSON config.</p>
 </thead>
 <tbody>
 <tr class="odd">
-<td style="text-align: left;"><code>legacy_memory_tools_enabled</code></td>
-<td style="text-align: left;">boolean</td>
-<td style="text-align: left;"><code>false</code></td>
-<td style="text-align: left;">Show memory slash commands</td>
-</tr>
-<tr class="even">
 <td style="text-align: left;"><code>memory_flush_enabled</code></td>
 <td style="text-align: left;">boolean</td>
-<td style="text-align: left;"><code>true</code></td>
-<td style="text-align: left;">Auto-flush before compaction</td>
+<td style="text-align: left;"><code>false</code></td>
+<td style="text-align: left;">Run the memory flush ahead of an automatic
+compaction in the terminal. <code>/flush</code> runs it by hand either
+way</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;"><code>context_include_memory_logs</code></td>
 <td style="text-align: left;">boolean</td>
 <td style="text-align: left;"><code>false</code></td>
@@ -1488,21 +2244,32 @@ health</td>
 <td style="text-align: left;">Tool approval and sandbox settings</td>
 </tr>
 <tr class="odd">
+<td style="text-align: left;"><code>/trust [yes]</code></td>
+<td style="text-align: left;">Show whether this directory is trusted, or
+trust it</td>
+</tr>
+<tr class="even">
 <td style="text-align: left;"><code>/clear</code></td>
 <td style="text-align: left;">Clear conversation (keeps session)</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;"><code>/compact</code></td>
 <td style="text-align: left;">Summarize conversation to free
 context</td>
 </tr>
-<tr class="odd">
-<td style="text-align: left;"><code>/sessions</code></td>
-<td style="text-align: left;">List sessions</td>
-</tr>
 <tr class="even">
+<td style="text-align: left;"><code>/sessions [all]</code></td>
+<td style="text-align: left;">List this directory’s sessions, or every
+directory’s</td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;"><code>/context</code></td>
 <td style="text-align: left;">Live context usage and loaded files</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>/tasks [clear]</code></td>
+<td style="text-align: left;">Show or clear the task list. With the list
+off (<code>task_list_enabled</code>), says how to turn it on</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;"><code>/model</code></td>
@@ -1613,26 +2380,25 @@ selection uses the last displayed list.</p>
 <code>/effort high</code> changes it for the current conversation.
 <code>/effort default</code> removes the session override and uses
 configuration, or the provider default when none is configured. The
-provider validates which levels its model accepts. In a split bot this
-changes the talker, leaving the doer’s effort unchanged. These overrides
-are not global configuration changes; use <code>reasoning_effort</code>
-(or <code>talker.reasoning_effort</code> for a split bot) for a startup
-default.</p>
+provider validates which levels its model accepts. In a talker session
+<code>/model</code> and <code>/effort</code> change the doer’s model and
+effort, which the next job runs with (<a href="#talker-mode">Talker
+mode</a>). These overrides are not global configuration changes; use
+<code>reasoning_effort</code> (or <code>talker.reasoning_effort</code>
+for the talker) for a startup default.</p>
 <p>GPT-6 tool calls (including Astra and Sol) require OpenAI’s Responses
 API. The corresponding llm.api routing update selects Responses with web
 search off as well as on. Older OpenAI models keep their Chat
-Completions route when search is off, and <code>openai_codex</code>
-always uses Responses. Corteza’s context-editing tool currently excludes
-Responses histories, so CLM edits remain unavailable on that wire. With
-llm.api’s <code>agent_uses_responses()</code> export, Corteza checks the
-selected model and search setting before the first request, including
-fallback candidates. Pure CLM rejects unsupported routes before
-generation; hybrid mode keeps automatic compaction and omits the editing
-tool. With older llm.api versions, the preflight follows their
-search-only OpenAI routing rule.</p>
+Completions route when search is off. <code>openai_codex</code> uses
+Responses and supports CLM on native tool batches and text replies. The
+separate API-key <code>openai</code> route uses standard compaction when
+it selects Responses.</p>
 <h2 id="instruction-skills">Instruction skills</h2>
-<p>Instruction skills are exact <code>SKILL.md</code> files discovered
-recursively at session startup. Built-in roots are:</p>
+<p>At session startup, corteza looks for files named exactly
+<code>SKILL.md</code> under each instruction root. It skips
+subdirectories whose names start with a dot, such as
+<code>.archive/</code>. An explicitly configured root can itself be
+hidden. The built-in roots are listed below.</p>
 <table>
 <thead>
 <tr class="header">
@@ -1651,6 +2417,7 @@ recursively at session startup. Built-in roots are:</p>
 </tr>
 </tbody>
 </table>
+<p>The project root, and the roots a project config adds, exist in a <a href="#trusted-projects">trusted</a> directory only.</p>
 <p>Only compact metadata enters the system prompt. The agent calls the
 read-only <code>skill_instructions</code> tool with the displayed stable
 id when it needs the body, or supplies a relative <code>resource</code>
@@ -1658,15 +2425,15 @@ path for a supporting file. The catalog and hashes are fixed for the
 session; restart or an archival context refresh creates a new
 snapshot.</p>
 <p>Additional roots must be explicit and named:</p>
-<div class="sourceCode" id="cb11"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
-<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;instruction_roots&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;shared&quot;</span><span class="fu">:</span> <span class="st">&quot;../../skills&quot;</span><span class="fu">,</span></span>
-<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;team&quot;</span><span class="fu">:</span> <span class="st">&quot;/srv/team/instructions&quot;</span></span>
-<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
-<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;instruction_disabled&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;shared:deploy/production&quot;</span></span>
-<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
-<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb17"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;instruction_roots&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;shared&quot;</span><span class="fu">:</span> <span class="st">&quot;../../skills&quot;</span><span class="fu">,</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;team&quot;</span><span class="fu">:</span> <span class="st">&quot;/srv/team/instructions&quot;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;instruction_disabled&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;shared:deploy/production&quot;</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>An entry at <code>&lt;root&gt;/analysis/logs/SKILL.md</code> has id
 <code>&lt;root-id&gt;:analysis/logs</code>. A <code>SKILL.md</code>
 directly in the root has the root id. Project roots override global
@@ -1690,14 +2457,14 @@ executable tool registry.</p>
 <h2 id="mcp-server">MCP server</h2>
 <p>Expose corteza tools to external MCP clients. <code>serve()</code>
 supports two transports:</p>
-<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># stdio transport (Claude Desktop, Claude Code, other MCP clients)</span></span>
-<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>()</span>
-<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"># socket transport (corteza CLI, R-to-R clients)</span></span>
-<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>)</span>
-<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co"># restrict the toolset</span></span>
-<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>, <span class="at">tools =</span> <span class="st">&quot;core&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># stdio transport (Claude Desktop, Claude Code, other MCP clients)</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>()</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="co"># socket transport (corteza CLI, R-to-R clients)</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>)</span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="co"># restrict the toolset</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">serve</span>(<span class="at">port =</span> <span class="dv">7850</span>, <span class="at">tools =</span> <span class="st">&quot;core&quot;</span>)</span></code></pre></div>
 <p><code>port = NULL</code> (the default) selects stdio.
 <code>cwd = NULL</code> (the default) leaves the working directory
 alone; pass an explicit path to anchor the server elsewhere. Tools
@@ -1705,29 +2472,124 @@ execute in a persistent R session, so objects and loaded packages
 survive across calls.</p>
 <p>Claude Desktop config
 (<code>~/.config/claude/claude_desktop_config.json</code>):</p>
-<div class="sourceCode" id="cb13"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
-<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;corteza&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;Rscript&quot;</span><span class="fu">,</span></span>
-<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;-e&quot;</span><span class="ot">,</span> <span class="st">&quot;corteza::serve()&quot;</span><span class="ot">]</span></span>
-<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
-<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
-<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb19"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;corteza&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;Rscript&quot;</span><span class="fu">,</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;-e&quot;</span><span class="ot">,</span> <span class="st">&quot;corteza::serve()&quot;</span><span class="ot">]</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<h2 id="editors-and-other-acp-clients">Editors and other ACP
+clients</h2>
+<p><code>corteza acp</code> runs corteza as an agent of the Agent Client
+Protocol (ACP, version 1): an editor, or any other client that speaks
+it, starts the command and talks to it over standard input and output.
+It runs on Linux and macOS in this release; on Windows it says so and
+exits. Each session the client opens is a corteza session in the
+directory the client names, set up as <code>chat()</code> sets one up,
+with that directory’s config, trust, tools and instructions. The
+directory must be an absolute path that exists; corteza creates
+none.</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> acp</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">corteza</span> acp <span class="at">--provider</span> openai <span class="at">--tools</span> core,git</span></code></pre></div>
+<p>A client needs the command’s full path: the one
+<code>install_cli()</code> reports (“Installed corteza to: …”) and
+returns. The command reads <code>~/.Renviron</code> as the terminal
+does, so the provider’s key need not be in the editor’s environment. In
+Zed, for example, a custom agent goes under <code>agent_servers</code>
+in <code>settings.json</code> (Zed’s page “External Agents”, section
+“Custom Agents”):</p>
+<div class="sourceCode" id="cb21"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;agent_servers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;corteza&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;custom&quot;</span><span class="fu">,</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;/home/you/.local/share/R/corteza/bin/corteza&quot;</span><span class="fu">,</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;acp&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;env&quot;</span><span class="fu">:</span> <span class="fu">{}</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>What a client gets:</p>
+<ul>
+<li><code>session/new</code>, <code>session/resume</code>,
+<code>session/list</code> and <code>session/close</code>. ACP sessions
+are kept with the terminal’s (Session records below), so
+<code>corteza --resume</code> takes up a conversation a client started
+in that directory, and a client can resume a terminal’s. A resume sends
+the model the conversation’s history and the client none of it.</li>
+<li>Prompts of text, and links to files, which reach the model as the
+file’s path. A prompt with an image, audio or an embedded resource is
+refused.</li>
+<li>The reply as it streams, with the secrets corteza knows hidden, and
+each tool call: announced, run, and finished with its result (cut to
+4,000 characters for the client; the model reads all of it) and, for an
+edit, its diff.</li>
+<li>Modes, which set the session’s <code>approval_mode</code>. In
+<code>ask</code>, each call that would prompt at the terminal becomes a
+permission request with the terminal’s 3 answers: allow, allow always
+for this project (kept where the terminal keeps it), deny. In
+<code>review</code>, the reviewer rules first, as under
+<code>approval_mode: &quot;review&quot;</code>, and the client is asked what it
+passes on. A config whose <code>approval_mode</code> is
+<code>&quot;allow&quot;</code> or <code>&quot;deny&quot;</code> adds that mode, and its
+sessions start in it. The credential rule’s request offers no “always”,
+and no saved answer covers it.</li>
+<li>Commands: <code>/help</code>, <code>/trust [yes]</code>,
+<code>/status</code> (or <code>/context</code>), <code>/tools</code>,
+<code>/tasks [clear]</code>, <code>/spent</code> and
+<code>/compact</code>, offered to the client after each session opens. A
+prompt that begins with one runs it in place of a turn, as the terminal
+does, and what it prints is the reply. Only <code>/compact</code> asks a
+model, for its summary; a cancel stops it before the request, or leaves
+the summary it returns uninstalled, and the prompt ends
+<code>cancelled</code>. A <code>/trust yes</code> applies to the
+sessions opened after it. <code>/clear</code> and <code>/cd</code>
+answer that a client starts a new session to begin again or to move; any
+other word after a slash is text for the model.</li>
+<li><code>session/cancel</code>. The turn stops at the next piece of the
+streamed reply, before the next model request or tool call, during a
+wait for permission or for the reviewer, or while a long tool runs:
+<code>bash</code> and <code>run_r_script</code> end their process and
+its children, and <code>run_r</code> interrupts its worker. A worker
+that does not come back within 5 seconds is ended, and the session’s R
+objects go with it (<code>run_r_mode</code>, under JSON config keys,
+Skills, above); the call’s result says so. Files written stay. Other
+tools finish first, within their own time limits.</li>
+</ul>
+<p>corteza connects to no MCP server a client names. A
+<code>session/new</code> or <code>session/resume</code> that lists one
+is refused, naming each server by its <code>name</code> alone; send an
+empty <code>mcpServers</code> list.</p>
+<p>One process can hold several sessions, and they share no R objects:
+each session’s <code>run_r</code> runs in a worker process of its own,
+whatever <code>run_r_mode</code> says, and a session whose config asks
+for <code>&quot;in_process&quot;</code> is told so when it opens. What corteza’s
+own process holds is still shared: the options it sets and the packages
+a skill loads in it, which trusted R code can change for every session.
+One prompt runs at a time. A prompt for another session waits until the
+running one ends, and a second prompt for the running session is
+refused. The requests that need no turn (opening, listing, closing,
+setting a mode) are answered while a prompt runs, each time the turn
+checks for a cancel. A close of the running session cancels its prompt
+and is answered after it.</p>
+<p>Nothing corteza or a tool prints reaches the protocol: while the
+command runs, R’s standard output goes to standard error.</p>
 <h2 id="session-tuning">Session tuning</h2>
 <p><code>new_session()</code> is the programmatic entry point for
 embedding corteza in your own R code: a Shiny app, a batch script, a
 custom approval flow, or tests. The CLI and Matrix channels build on
 this same primitive.</p>
-<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(corteza)</span>
-<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>s <span class="ot">&lt;-</span> <span class="fu">new_session</span>(</span>
-<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">channel =</span> <span class="st">&quot;cli&quot;</span>,</span>
-<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;anthropic&quot;</span>,</span>
-<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">max_turns =</span> <span class="dv">20</span><span class="dt">L</span>,</span>
-<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">verbose =</span> <span class="cn">FALSE</span></span>
-<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>)</span>
-<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">turn</span>(<span class="st">&quot;What packages are loaded?&quot;</span>, <span class="at">session =</span> s)</span></code></pre></div>
+<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(corteza)</span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>s <span class="ot">&lt;-</span> <span class="fu">new_session</span>(</span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">channel =</span> <span class="st">&quot;cli&quot;</span>,</span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">provider =</span> <span class="st">&quot;anthropic&quot;</span>,</span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">max_turns =</span> <span class="dv">20</span><span class="dt">L</span>,</span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">verbose =</span> <span class="cn">FALSE</span></span>
+<span id="cb22-8"><a href="#cb22-8" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb22-9"><a href="#cb22-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb22-10"><a href="#cb22-10" aria-hidden="true" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">turn</span>(<span class="st">&quot;What packages are loaded?&quot;</span>, <span class="at">session =</span> s)</span></code></pre></div>
 <p>The session is an environment that carries history, the active
 provider/model, and the approval callback. <code>turn()</code> mutates
 it in place and also returns the updated session, so you can chain calls
@@ -1760,8 +2622,8 @@ or persist <code>s$history</code> between runs.</p>
 <td style="text-align: left;"><code>history</code></td>
 <td style="text-align: left;">list or null</td>
 <td style="text-align: left;">null</td>
-<td style="text-align: left;">Prior messages; resumes
-mid-conversation</td>
+<td style="text-align: left;">Prior messages; resumes mid-conversation.
+Thinking blocks are removed</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;"><code>model_map</code></td>
@@ -1809,6 +2671,338 @@ falls back to <code>corteza.model_map</code> option</td>
 </tr>
 </tbody>
 </table>
+<h2 id="session-records">Session records</h2>
+<p>Each agent keeps one index of its conversations, a JSON object keyed
+by session key:</p>
+<pre><code>tools::R_user_dir(&quot;corteza&quot;, &quot;data&quot;)/agents/&lt;agent&gt;/sessions/sessions.json</code></pre>
+<p>The terminal and <code>chat()</code> write under agent
+<code>main</code>, a Matrix bot under agent <code>matrix</code>. Another
+program may read these files. Fields are added in later versions and
+never renamed, and a reader should skip an entry or a field it does not
+know. The file is replaced whole on every write, so it is always
+complete when read.</p>
+<p>A terminal or console session, keyed <code>corteza:&lt;id&gt;</code>
+or by the key given with <code>--session</code>:</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 43%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Field</th>
+<th style="text-align: left;">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>sessionId</code></td>
+<td style="text-align: left;">Names the session’s files in the same
+folder: <code>&lt;id&gt;.jsonl</code> (the transcript),
+<code>&lt;id&gt;_trace.jsonl</code>,
+<code>&lt;id&gt;.journal/</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>cwd</code></td>
+<td style="text-align: left;">The directory the session was started in,
+resolved, with forward slashes</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>title</code></td>
+<td style="text-align: left;">The first prompt on one line, cut to 100
+characters</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>updatedAt</code></td>
+<td style="text-align: left;">When the entry was last written, in
+milliseconds since 1970</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>surface</code></td>
+<td style="text-align: left;"><code>cli</code> or
+<code>console</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>sessionFile</code>,
+<code>createdAt</code>, <code>modelProvider</code>,
+<code>model</code></td>
+<td style="text-align: left;">The transcript’s path, the creation time,
+and the provider and model last used</td>
+</tr>
+</tbody>
+</table>
+<p>Entries keyed <code>agent:&lt;id&gt;:subagent:&lt;uuid&gt;</code> in
+the same file belong to subagents and are not conversations a person
+started.</p>
+<p>Sessions made before 0.8.1 have no <code>cwd</code> and no
+<code>title</code> in the index. corteza records a session’s directory,
+from the first line of its transcript, the first time its sessions are
+listed, and its title the first time the session is shown in a list.
+<code>surface</code> is absent on those. A session that never got a
+prompt has no <code>title</code>.</p>
+<p>A room or a thread a Matrix bot answers in:</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 43%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Field</th>
+<th style="text-align: left;">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>sessionId</code></td>
+<td style="text-align: left;">The entry’s key. The session’s journal is
+<code>&lt;sessionId&gt;.journal/</code> in the same folder</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>surface</code></td>
+<td style="text-align: left;"><code>matrix</code></td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>bot</code></td>
+<td style="text-align: left;">The bot’s Matrix user id. 2 bots in 1 room
+have 1 entry each</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>room</code></td>
+<td style="text-align: left;">The room id</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>thread</code></td>
+<td style="text-align: left;">The thread’s root event id, when the
+conversation is a thread</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>voice</code></td>
+<td style="text-align: left;"><code>true</code> for the room’s voice
+session</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>cwd</code></td>
+<td style="text-align: left;">The directory the room works in. Absent
+for a room with no directory</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>title</code></td>
+<td style="text-align: left;">The room’s name</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>journal</code></td>
+<td style="text-align: left;">The journal folder’s path</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>updatedAt</code></td>
+<td style="text-align: left;">When the bot last built the session: at
+its first message after a start or a <code>/clear</code></td>
+</tr>
+</tbody>
+</table>
+<p>A room has no transcript. How recently it was used is the
+modification time of <code>live.json</code> in its journal folder, a
+file that is not there before the session’s first turn.</p>
+<p>A bot also records which conversation each of a room’s sessions
+holds, in one file for each room, named by the <code>sessionId</code> of
+the room’s own entry:</p>
+<pre><code>&lt;state&gt;/rooms/&lt;sessionId&gt;.json</code></pre>
+<p><code>&lt;state&gt;</code> is the folder
+<code>CORTEZA_STATE_DIR</code> names, else <code>state</code> in the
+data directory. Retention leaves the file alone.</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 43%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Field</th>
+<th style="text-align: left;">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>room</code></td>
+<td style="text-align: left;">The room id</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>main</code></td>
+<td style="text-align: left;">The room’s own conversation</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>threads</code></td>
+<td style="text-align: left;">Each thread’s conversation, by the
+thread’s root event id</td>
+</tr>
+</tbody>
+</table>
+<p>Each conversation:</p>
+<table style="width:97%;">
+<colgroup>
+<col style="width: 43%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Field</th>
+<th style="text-align: left;">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>id</code></td>
+<td style="text-align: left;">The conversation’s id. A job asked in it
+carries the same id</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>since</code></td>
+<td style="text-align: left;">The event id of the <code>/clear</code>
+that started it. Absent for a conversation the bot started with the
+session</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>at</code></td>
+<td style="text-align: left;">When that <code>/clear</code> was sent, in
+seconds since 1970</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>ack</code></td>
+<td style="text-align: left;">The event ids of the bot’s answer to that
+<code>/clear</code></td>
+</tr>
+</tbody>
+</table>
+<p>A restart seeds each conversation with the room’s messages after
+<code>since</code>, and leaves <code>ack</code> out.</p>
+<h2 id="talker-mode">Talker mode</h2>
+<p>A bot’s room answers through a talker: a session with read-only tools
+that hands work needing edits, commands or tests to a doer, a worker
+process of the conversation’s own, and goes on answering while the doer
+works. The result arrives as its own message. From 0.8.1 this is the
+default in a bot’s rooms. The CLI and <code>chat()</code> run tools
+directly by default, in the session’s own R process. To enable
+talker/doer mode there, set:</p>
+<div class="sourceCode" id="cb25"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;talker&quot;:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span></span></code></pre></div>
+<p>To turn it off, put this in the config, the bot’s or your own:</p>
+<div class="sourceCode" id="cb26"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;talker&quot;:</span> <span class="fu">{</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">}</span></span></code></pre></div>
+<p>A room is no talker by default in 2 cases. Where the bot’s tools are
+restricted (<code>tools_filter</code>, from <code>bot_configure()</code>
+or the run), since a doer gets the work tools whatever that list says.
+And where the room has no directory, since such a room hands no work on.
+<code>&quot;enabled&quot;: true</code> explicitly turns it on in any of these; the
+doer receives its work tools even when the talker’s own tool list is
+restricted.</p>
+<p>At the terminal and in <code>chat()</code>, a turn that hands work to
+the doer stays with it: the doer’s steps, an approval it asks for and
+its result print as they come, and the prompt returns when the job ends.
+Ctrl+C returns the prompt and leaves the job running; <code>/jobs</code>
+lists the jobs and stays with an open one again. A terminal driven from
+a room with <code>/remote-control</code> does not stay, so the room’s
+next message is read as before.</p>
+<p>The talker runs on the bot’s own model, as the doer does. Up to 0.8.0
+it ran on a fast model of its provider’s (Claude Haiku 4.5 for
+<code>anthropic</code> and <code>anthropic_claude</code>, GPT-6 Luna for
+<code>openai</code> and <code>openai_codex</code>) and stopped with an
+error on any other provider. To give the talker a faster model, name
+it:</p>
+<div class="sourceCode" id="cb27"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;talker&quot;:</span> <span class="fu">{</span><span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;claude-haiku-4-5-20251001&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p><code>talker.provider</code> puts the talker on another provider, on
+that provider’s default model unless <code>talker.model</code> names
+one. On a local model the talker and the doer share it, and 2 requests
+can be in flight at once; name another model for the talker, or turn
+talker mode off, where the machine cannot serve both.</p>
+<p>The bot’s reasoning settings (<code>reasoning_effort</code>,
+<code>thinking_budget_tokens</code>, <code>thinking</code>) go to the
+doer with its model. The talker uses the provider’s defaults unless the
+<code>talker</code> block names its own
+(<code>talker.reasoning_effort</code> and the others), since a model it
+names may refuse settings made for another.</p>
+<p>In a talker session <code>/model</code> and <code>/effort</code>
+change the work: the doer’s model and effort, which the next job runs
+with. The doer starts on the model and provider the config’s
+<code>jobs</code> block names, if it names them, with that block’s
+reasoning settings; the talker stays on the session’s model, and the 2
+commands change the doer’s from there. Within a provider, a separately
+configured talker keeps its model. Switching provider moves both roles
+to that provider’s pair, and returning restores the previous pair. An
+unseen provider uses the selected model for both roles unless
+<code>model_pairs</code> names a pair. <code>/status</code> names both
+models. Up to 0.8.0 both commands changed the talker’s alone. Column
+<code>talker</code> of the command table
+(<code>corteza:::corteza_commands()</code>) says what each command acts
+on: the talker’s conversation, the doer and its jobs, or both.</p>
+<p>Optional provider pairs use model names or objects with
+<code>model</code> and the role’s reasoning settings. For example:</p>
+<div class="sourceCode" id="cb28"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;model_pairs&quot;:</span> <span class="fu">{</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;anthropic_claude&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;talker&quot;</span><span class="fu">:</span> <span class="st">&quot;claude-sonnet-4-6&quot;</span><span class="fu">,</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;doer&quot;</span><span class="fu">:</span> <span class="st">&quot;claude-opus-4-7&quot;</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;openai_codex&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;talker&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;gpt-5.6-sol&quot;</span><span class="fu">,</span> <span class="dt">&quot;reasoning_effort&quot;</span><span class="fu">:</span> <span class="st">&quot;low&quot;</span><span class="fu">},</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;doer&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;model&quot;</span><span class="fu">:</span> <span class="st">&quot;gpt-5.6-sol&quot;</span><span class="fu">,</span> <span class="dt">&quot;reasoning_effort&quot;</span><span class="fu">:</span> <span class="st">&quot;high&quot;</span><span class="fu">}</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>The <code>/model</code> menu includes configured fallback routes and
+pairs. Automatic quota fallback selects the pair too: a job delegated by
+a fallback talker uses that provider’s doer. The preferred provider
+remains unchanged for its next retry after cooldown. Already running
+jobs keep their own model.</p>
+<p>At the terminal, <code>/provider</code> switches the pair.
+<code>/max-tokens</code> is the doer’s: the output budget is the next
+job’s, while the talker’s replies keep theirs. A conversation you resume
+(<code>--resume</code>) starts its doer as a new conversation does:
+where the <code>jobs</code> block names a model, the doer runs on it
+again, whatever <code>/model</code> chose before. <code>/review</code>
+reviews with the doer’s model, and <code>/doctor</code> and
+<code>/config</code> name it. <code>/spent</code> counts each job with
+the talker’s replies, in the conversation that asked for it, and a job’s
+result goes into that conversation’s transcript, so
+<code>--resume</code> brings it back. <code>/r</code> runs R in the
+terminal’s own process and sends its output with your next message; the
+doer’s R objects stay in the doer. An <code>/auto</code> run works with
+the session’s own tools, which in a talker session only read and hand
+work on, so there <code>/auto</code> says to turn talker mode off and
+starts nothing.</p>
+<p>Without talker mode, <code>run_r</code> in a bot runs in the bot’s
+own process, which all its rooms share, so one room’s R objects are the
+others’. A talker’s work runs in its conversation’s doer, a process of
+its own, and a room’s objects stay its own.</p>
+<h2 id="what-a-delegated-job-obeys">What a delegated job obeys</h2>
+<p>A delegated job runs with the model, provider, reasoning settings and
+limits its conversation has when the job starts, in a worker that may
+have run earlier jobs. While it runs it follows the conversation’s
+<code>/plan</code>, <code>/permissions</code> and <code>/dryrun</code>:
+the worker checks them before each call, and again just before the call
+runs, so a <code>/plan</code> typed while a call waits for your approval
+stops that call. A worker cannot end plan mode; you do. After
+<code>/clear</code>, a job started before it keeps the settings its
+conversation last had, and <code>/cancel</code> stops it.</p>
+<p>A job stopped mid-run keeps what it wrote to files. The R objects and
+history its worker made since its last checkpoint are gone. The job’s
+report names that checkpoint, which the next job starts from.</p>
+<p>At the terminal, <code>/clear</code> starts a new conversation for
+the worker too. Its R objects stay, as they do in the terminal’s own
+session, and its history does not: the next job starts from an empty
+conversation, with the instructions and tools a session started now
+would have, so a <code>/trust</code> before the <code>/clear</code>
+reaches it. A job still running at <code>/clear</code> finishes, and its
+result is shown and saved to the conversation that asked for it. Each
+conversation keeps its own checkpoint, so
+<code>corteza --resume &lt;id&gt;</code> brings back that conversation’s
+worker as its last job left it, and a new conversation’s objects are a
+copy taken at the <code>/clear</code>.</p>
+<p>In a room or a thread, <code>/clear</code> does the same for that
+conversation’s worker: the R objects stay and the next job starts from
+an empty conversation. A job still running finishes and posts its
+result, marked as asked before the <code>/clear</code>. After a restart
+the bot seeds each conversation, the room’s and each thread’s, with
+nothing from before its own <code>/clear</code>.</p>
+<p>A checkpoint saved before 0.8.1 does not say which conversation it
+belongs to, so the first job after upgrading keeps the worker’s R
+objects and starts its history over.</p>
 <h2 id="incomplete-worker-jobs">Incomplete worker jobs</h2>
 <p>A worker that exhausts its tool-turn or output budget is recorded as
 <code>incomplete</code>, with its stop reason and usage, rather than
@@ -1886,18 +3080,18 @@ using <code>delegate_to(bot, task, review)</code>. This works with split
 talkers and unsplit bots. It uses the bot’s existing chat client and
 poll cursor. No extra Matrix login or listener is started. Configure
 outgoing destinations in the account config:</p>
-<div class="sourceCode" id="cb15"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;delegates&quot;:</span> <span class="fu">{</span></span>
-<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;helper&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
-<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;bot&quot;</span><span class="fu">:</span> <span class="st">&quot;@helper:example.org&quot;</span><span class="fu">,</span></span>
-<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;channel&quot;</span><span class="fu">:</span> <span class="st">&quot;!project:example.org&quot;</span><span class="fu">,</span></span>
-<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;transport&quot;</span><span class="fu">:</span> <span class="st">&quot;matrix&quot;</span></span>
-<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
-<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb29"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;delegates&quot;:</span> <span class="fu">{</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;helper&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;bot&quot;</span><span class="fu">:</span> <span class="st">&quot;@helper:example.org&quot;</span><span class="fu">,</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;channel&quot;</span><span class="fu">:</span> <span class="st">&quot;!project:example.org&quot;</span><span class="fu">,</span></span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;transport&quot;</span><span class="fu">:</span> <span class="st">&quot;matrix&quot;</span></span>
+<span id="cb29-6"><a href="#cb29-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb29-7"><a href="#cb29-7" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
 <p>The receiving account must explicitly allow the requester. An entry
 may narrow the worker’s tools or require a review:</p>
-<div class="sourceCode" id="cb16"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;delegators&quot;:</span> <span class="ot">[</span></span>
-<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;bot&quot;</span><span class="fu">:</span> <span class="st">&quot;@requester:example.org&quot;</span><span class="fu">,</span> <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;read_file&quot;</span><span class="ot">,</span> <span class="st">&quot;grep_files&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="dt">&quot;review&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span></span>
-<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<div class="sourceCode" id="cb30"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="er">&quot;delegators&quot;:</span> <span class="ot">[</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;bot&quot;</span><span class="fu">:</span> <span class="st">&quot;@requester:example.org&quot;</span><span class="fu">,</span> <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;read_file&quot;</span><span class="ot">,</span> <span class="st">&quot;grep_files&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="dt">&quot;review&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
 <p>A string entry allows the worker’s usual tools. Both lists default to
 empty. The originating conversation must be answering a configured human
 operator. The receiving room determines the project directory, doer
@@ -1952,24 +3146,24 @@ type or filename extension.</p>
 <h2 id="systemd-service">systemd service</h2>
 <p><code>bot_run()</code> is designed for a systemd user unit.</p>
 <p><code>~/.config/systemd/user/corteza-matrix.service</code>:</p>
-<div class="sourceCode" id="cb17"><pre class="sourceCode ini"><code class="sourceCode ini"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
-<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">corteza chat bot</span></span>
-<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network.target</span></span>
-<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
-<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">simple</span></span>
-<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">Rscript -e &#39;corteza::bot_run()&#39;</span></span>
-<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
-<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="dv">5</span></span>
-<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
-<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">default.target</span></span></code></pre></div>
+<div class="sourceCode" id="cb31"><pre class="sourceCode ini"><code class="sourceCode ini"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">corteza chat bot</span></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network.target</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">simple</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">Rscript -e &#39;corteza::bot_run()&#39;</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="dv">5</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">default.target</span></span></code></pre></div>
 <p>Enable and start:</p>
-<div class="sourceCode" id="cb18"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
-<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable corteza-matrix.service</span>
-<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> start corteza-matrix.service</span></code></pre></div>
+<div class="sourceCode" id="cb32"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> daemon-reload</span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> enable corteza-matrix.service</span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> <span class="at">--user</span> start corteza-matrix.service</span></code></pre></div>
 <p>View logs:</p>
-<div class="sourceCode" id="cb19"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--user</span> <span class="at">-u</span> corteza-matrix.service <span class="at">-f</span></span></code></pre></div>
+<div class="sourceCode" id="cb33"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="ex">journalctl</span> <span class="at">--user</span> <span class="at">-u</span> corteza-matrix.service <span class="at">-f</span></span></code></pre></div>
 <h2 id="environment-variables">Environment variables</h2>
 <table>
 <thead>
@@ -2034,9 +3228,13 @@ text.</p>
 <p>Room conversations offer <code>send_room_file(path)</code> to
 configured bot operators. It sends an existing file to the current room
 using the host’s chat identity; the model does not load credentials or
-select another destination. Tool policy and supervision still apply.
-Credential files and runtime configuration files are refused, and the
-file limit is 25 MiB. Workers do not receive this tool.</p>
+select another destination. Tool policy and supervision still apply: it
+is a write, so each send asks, and goes to the monitor where
+<code>auto_approve_asks</code> is on.
+<code>&quot;permissions&quot;: {&quot;send_room_file&quot;: &quot;allow&quot;}</code> in your config
+lets it send unasked. Credential files and runtime configuration files
+are refused, and the file limit is 25 MiB. Workers do not receive this
+tool.</p>
 <p>Encrypted Matrix attachments require chat.api 0.1.0.4, mx.client
 0.2.1.4, and mx.crypto 0.2.2.2. Uploads contain ciphertext; the file
 metadata travels inside the encrypted room event. Older adapters report

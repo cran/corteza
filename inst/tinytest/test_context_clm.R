@@ -70,8 +70,11 @@ local({
     expect_false(any(startsWith(names(f(".context_edit_state")(s)$messages), "u")))
     expect_null(f(".context_archive_write")(s, before, list()))
     s$provider <- "openai_codex"
-    expect_error(f(".context_edit_require")(s), "supported provider")
+    f(".context_edit_prepare")(s)
+    expect_true(f(".context_edit_pure")(s))
+    expect_identical(f(".context_management")(s), "clm")
     s$provider <- "anthropic"
+    s$context_active_request <- NULL
     s$journal_enabled <- FALSE
     expect_error(f(".context_edit_require")(s), "enabled journal")
 
@@ -86,7 +89,7 @@ local({
     expect_identical(spec$context_edit, pure)
     expect_false(f(".context_edit_config")(parent$config, parent$context_edit)$enabled)
     expect_null(f("job_worker_spec")(parent, "reviewer")$context_edit)
-    expect_null(f("job_worker_spec")(parent, "monitor")$context_edit)
+    expect_identical(f("job_worker_spec")(parent, "monitor")$context_edit$strategy, "clm")
     expect_warning(f("talker_enable")(parent, list(context_edit = pure)), "explicit context_vault")
     expect_false(f(".context_edit_enabled")(parent))
     expect_false(f(".context_edit_pure")(parent))
@@ -150,7 +153,8 @@ local({
     expect_null(lifecycle$vault)
     expect_true(any(vapply(lifecycle$history, function(m) identical(m$content, "First job."), logical(1))))
 
-    # Unsupported fallbacks never silently turn pure CLM off.
+    # An unsupported route uses ordinary compaction without losing the
+    # configured CLM preference. The reply explains the selected strategy.
     s <- make()
     s$fallback <- c("fixture openai_codex", "fixture openai")
     old_limits <- as.list(f(".fallback_state"))
@@ -167,7 +171,10 @@ local({
             if (args$provider == "anthropic") stop("HTTP 429 rate limit")
             list(content = "done", history = args$history)
         })
-    expect_identical(calls, c("anthropic", "openai"))
+    expect_identical(calls, c("anthropic", "openai_codex"))
+    expect_identical(result$corteza_route$context_management, "clm")
+    expect_null(result$corteza_route$context_notice)
+    expect_identical(s$context_edit$strategy, "clm")
     f(".fallback_reset")()
 
     if (requireNamespace("pensar", quietly = TRUE)) {
@@ -412,13 +419,15 @@ local({
             expect_true(grepl("New main-timeline message.", rendered(main), fixed = TRUE))
             expect_true(grepl("Earlier topic, original words.", rendered(thread), fixed = TRUE))
             expect_false(grepl("Current request", rendered(thread), fixed = TRUE))
-            cleared <- f("bot_reset_session")(restarted, room, cfg, "$clear", "Cleared.", system = "Pinned")
+            cleared <- f("bot_reset_session")(restarted, room, cfg, "$clear", "Cleared.",
+                                              f("bot_conversation_new")(), system = "Pinned")
             expect_equal(length(cleared$history), 0L)
             expect_true("$clear" %in% cleared$seen_event_ids)
 
             # An unsplit bot owns its conversation without becoming a
             # talker or changing its model/tools. Its workers never file.
-            cfg$talker <- NULL
+            # A room is a talker unless its config says otherwise (WP20b).
+            cfg$talker <- list(enabled = FALSE)
             cfg$user_id <- "@unsplit:example.invalid"
             cfg$context_edit <- pure
             cfg$context_vault <- vault
@@ -446,7 +455,7 @@ local({
             expect_identical(f("job_worker_spec")(unified)$context_edit, pure)
             expect_null(f("job_worker_spec")(unified)$context_vault)
             expect_null(f("job_worker_spec")(unified, "reviewer")$context_edit)
-            expect_null(f("job_worker_spec")(unified, "monitor")$context_edit)
+            expect_identical(f("job_worker_spec")(unified, "monitor")$context_edit$strategy, "clm")
 
             # Invalid conversation configuration must not escape the real
             # room factory and terminate the bot's poll loop.

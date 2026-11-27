@@ -1,3 +1,11 @@
+# Slow. Skipped on CRAN for check time; CI sets NOT_CRAN.
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
+    exit_file("slow; runs at home and in CI")
+}
+
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 # Exercise turn() with the real dispatcher, checkpoint and journal, replacing
 # only the remote model. No API keys, services, or live user state required.
 local({
@@ -146,8 +154,7 @@ local({
     expect_equal(length(requests), 4L)
 })
 
-# Provider fallback must remove the edit schema on the Responses shape and
-# journal the bridge before native messages disappear from the live window.
+# Codex fallback keeps the edit schema and journals the history bridge.
 local({
     corteza:::.fallback_reset()
     on.exit(corteza:::.fallback_reset(), add = TRUE)
@@ -172,9 +179,9 @@ local({
         system = s$context_edit_system), s, .call = function(args) {
             attempts <<- attempts + 1L
             if (args$provider == "anthropic") stop("API error (429): rate limit")
-            expect_equal(length(args$tools), 0L)
-            expect_identical(args$system, "instructions")
-            expect_false(corteza:::.context_edit_enabled(s))
+            expect_true(any(vapply(args$tools, function(tool) identical(tool$name, "edit_context"), logical(1))))
+            expect_true(grepl("Conversation context management", args$system))
+            expect_true(corteza:::.context_edit_enabled(s))
             s$history <- c(args$history, list(list(role = "user", content = args$prompt)))
             corteza:::journal_snapshot(s)
             list(content = "fallback reply", history = s$history)
@@ -202,6 +209,8 @@ local({
     global <- corteza:::corteza_config_path("config.json")
     dir.create(dirname(global), recursive = TRUE)
     writeLines('{"context_edit":{"enabled":true,"cadence":"always"}}', global)
+    # A project's config is read from a trusted directory only (R/trust.R).
+    corteza:::project_trust_add(project)
     writeLines('{"context_edit":{"enabled":false}}', file.path(project, ".corteza", "config.json"))
     cfg <- corteza:::load_config(project)
     expect_identical(cfg$context_edit, list(enabled = FALSE, cadence = "always"))
@@ -219,7 +228,7 @@ local({
     expect_equal(corteza:::.context_edit_parse_command("/context-edit"), "")
     expect_true(grepl("Usage", corteza:::.context_edit_command(s, "on extra")))
     s$provider <- "openai_codex"
-    expect_true(grepl("unavailable", corteza:::.context_edit_command(s, "status")))
+    expect_true(grepl("Context editing: on", corteza:::.context_edit_command(s, "status")))
 
     expressions <- parse(system.file("bin", "corteza", package = "corteza"))
     definition <- Filter(function(e) is.call(e) && identical(e[[1]], as.name("<-")) &&
@@ -237,7 +246,6 @@ local({
     ctx <- new.env(parent = emptyenv())
     ctx$session <- s
     ctx$config <- cfg
-    ctx$ws_enabled <- FALSE
     ctx$palette <- list(dim = "", reset = "")
     lines <- c("/context-edit off", "/context-edit status", "/context-edit on")
     n <- 0L

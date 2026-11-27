@@ -15,7 +15,8 @@ job_resume_path <- function(id) {
     }
     attrs <- attributes(x)
     if (length(attrs) && any(vapply(attrs, .job_resume_unsafe, TRUE,
-        root = root, seen = seen, depth = depth + 1L))) {
+                                    root = root, seen = seen,
+                                    depth = depth + 1L))) {
         return(TRUE)
     }
     if (is.function(x)) {
@@ -122,8 +123,7 @@ job_resume_snapshot <- function(id, identity) {
     }
     # Journal failure blocks replacement. Fresh workers never restore the
     # shared checkpoint for resume, so unrelated job objects cannot leak in.
-    journal_rewrite(session, session$history %||% list(), history, reason = "job_resume")
-    session$history <- history
+    history_replace(session, history, reason = "job_resume")
     for (name in names(values)) {
         assign(name, values[[name]], envir = env)
     }

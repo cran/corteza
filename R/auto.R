@@ -156,7 +156,6 @@ auto_spend_since <- function(session, baseline) {
     main_cost <- sum(vapply(segs, function(s) s$cost %||% 0, numeric(1)))
     seg_tok <- vapply(segs, function(s) as.numeric(s$total_tokens %||% 0),
                       numeric(1))
-    seg_missing <- vapply(segs, function(s) isTRUE(s$cost_missing), logical(1))
     main_tok <- sum(seg_tok)
     sub <- tryCatch(subagent_spend_total(), error = function(e) list())
 
@@ -332,7 +331,9 @@ auto_autonomy_policy <- function() {
            "the usual posture of checking in whenever a task could go more than\n",
            "one way: here, pick the reasonable option and proceed within the\n",
            "existing permissions and approved scope. Use the available tools;\n",
-           "the supervisor still checks calls and can require a person.\n\n",
+           "the supervisor still checks calls and can require a person.\n",
+           "Each tool argument must fit in 2,000 characters as JSON.\n",
+           "A larger argument is refused. You can continue with a smaller call.\n\n",
            "Stop only for a genuine blocker: if you hit an ambiguity that\n",
            "would materially change the intended outcome -- a public interface\n",
            "or a behaviour choice -- do not guess, and do not report continue\n",
@@ -497,10 +498,13 @@ auto_validate_bounds <- function(auto) {
 #'   iteration cap is lifted: the run governs on the monitor envelope and
 #'   the resource caps (tool calls, tokens, time, cost, stall) instead of
 #'   a loop count -- the Codex "Auto" model. `max_loops` still wins if set.
+#' @param typed Character. What the person typed to start the run, after
+#'   `/auto`: the goal, unless corteza wrote the goal (a bare `/auto`) or
+#'   took it from the last run (`/auto resume`).
 #' @return Invisibly, the final loop state.
 #' @noRd
 run_auto_loop <- function(ctx, goal, max_loops = NULL, allow_exec = NULL,
-                          continuous = FALSE) {
+                          continuous = FALSE, typed = goal) {
     cwd <- ctx$cwd %||% getwd()
     palette <- ctx$palette %||% list()
     say <- function(fmt, ...) {
@@ -679,6 +683,12 @@ run_auto_loop <- function(ctx, goal, max_loops = NULL, allow_exec = NULL,
     # every record keeps ids from colliding across runs.
     ctx$session$auto_call_seq <- 0L
     on.exit(ctx$session$auto_run_id <- prev_run_id, add = TRUE)
+    # What the person typed to start the run is what they typed of each
+    # prompt the driver writes, and the transcript keeps it so
+    # (run_repl_loop()). The reviewer (R/review.R) reads it after the run.
+    prev_typed <- ctx$session$auto_typed
+    ctx$session$auto_typed <- typed
+    on.exit(ctx$session$auto_typed <- prev_typed, add = TRUE)
 
     # A spawn failure is an ordinary error the operator will see, but
     # the run record must say it too -- this is the named case where "no

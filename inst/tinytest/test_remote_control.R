@@ -5,12 +5,16 @@ if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
 if (!requireNamespace("chat.api", quietly = TRUE)) exit_file("chat.api unavailable")
 
 local({
-    root <- tempfile("remote-control-")
+    # Short names: under R CMD check on Windows the temporary folder is
+    # deep, and a room's conversation record (a 64-character key, then
+    # its own name) passed the 260 characters a path may have there.
+    root <- tempfile("rc-")
     dir.create(root)
     vars <- c("CORTEZA_REMOTE_DIR", "CORTEZA_STATE_DIR", "R_USER_DATA_DIR",
               "R_USER_CONFIG_DIR", "R_USER_CACHE_DIR")
     old <- Sys.getenv(vars, unset = NA)
-    do.call(Sys.setenv, setNames(as.list(file.path(root, vars)), vars))
+    dirs <- file.path(root, c("remote", "state", "data", "config", "cache"))
+    do.call(Sys.setenv, setNames(as.list(dirs), vars))
     on.exit({
         for (i in seq_along(vars)) if (is.na(old[[i]])) Sys.unsetenv(vars[[i]]) else
             do.call(Sys.setenv, setNames(list(old[[i]]), vars[[i]]))
@@ -151,8 +155,8 @@ local({
     }, "corteza")
     ctx <- new.env(parent = emptyenv())
     ctx$cwd <- root
-    ctx$ws_enabled <- FALSE
-    ctx$config <- list(context_compact_pct = 100)
+    # The task list is on: the turn below sends a plan to the room for approval.
+    ctx$config <- list(context_compact_pct = 100, task_list_enabled = TRUE)
     ctx$provider <- "ollama"
     ctx$model <- "fixture"
     ctx$session <- corteza::new_session("cli", provider = "ollama")
@@ -208,9 +212,9 @@ local({
         grepl("Continue the fixture", x$content, fixed = TRUE), entries)
     expect_identical(length(prompt_entries), 1L)
     expect_true(grepl("@owner:example", prompt_entries[[1L]]$content, fixed = TRUE))
-    archive <- corteza:::bot_session_to_markdown(room_session, "next-room")
-    expect_true(grepl("Continue the fixture", archive, fixed = TRUE))
-    expect_true(grepl("Finished the fixture", archive, fixed = TRUE))
+    archive <- vapply(entries, function(x) x$content, "")
+    expect_true(any(grepl("Continue the fixture", archive, fixed = TRUE)))
+    expect_true(any(grepl("Finished the fixture", archive, fixed = TRUE)))
     prompt_message <- Filter(function(m) identical(m$body, "Continue the fixture"), messages)[[1L]]
     corteza:::.remote_bot_record(room_session, corteza:::bot_msg_record(prompt_message))
     expect_identical(room_session$transcript, entries)

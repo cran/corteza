@@ -94,7 +94,7 @@ restore_config <- function(iso) {
 # varies with the per-test HOME.
 base_cfg <- function(sync_token = "s1", e2ee = FALSE,
                      user_id = "@bot:example") {
-    cfg <- list(server = "https://example", user = "bot", password = "pw",
+    cfg <- list(server = "https://ex.invalid", user = "bot", password = "pw",
                 token = "tok", user_id = user_id, device_id = "DEV",
                 room_id = "!room:example")
     if (!is.null(sync_token)) {
@@ -568,7 +568,7 @@ local({
 
 # corteza no longer computes a store path at all -- that briefly lived
 # here, keyed on user_id alone, which is the right shape for telling
-# cornelius and tiny apart and the wrong one for an Olm account, since an
+# two bots apart and the wrong one for an Olm account, since an
 # account belongs to a device.
 expect_false("bot_crypto_store" %in% ls(asNamespace("corteza"),
                                            all.names = TRUE))
@@ -712,7 +712,7 @@ local({
             expect_equal(seen[[length(seen)]]$msgtype, mt)
         }
         # markdown survives both routes, including pipe tables. This is the
-        # executable guard for the Cornelius table-rendering regression: text
+        # executable guard for a table-rendering regression: text
         # m.room.message goes corteza -> chat.api -> mx.client, while msgtypes
         # outside chat.api's vocabulary still go corteza -> mx.client direct.
         table_md <- paste(c(
@@ -1210,6 +1210,41 @@ if ("chat_invite" %in% getNamespaceExports("chat.api")) {
             type = "message")
         expect_identical(joined, character())
         expect_true(any(grepl("refusing invite", msgs)))
+    })
+
+    # A bot with no operators joins nothing, whoever sent the invite,
+    # and its log says what would change that. Up to 0.8.0 it joined.
+    local({
+        iso <- isolate_config(base_cfg())
+        on.exit(restore_config(iso), add = TRUE)
+        joined <- character()
+        seams <- list(
+            .sync = function(client, timeout = 0L, save = TRUE, ...) {
+                sync_saved(client, save)
+                client$sync_token <- "s2"
+                list(sync = list(rooms = list(invite = list(
+                         `!new:example` = list(invite_state = list(events = list(
+                             list(type = "m.room.member",
+                                  state_key = "@bot:example",
+                                  sender = "@troy:example",
+                                  content = list(membership = "invite")))))))),
+                     client = client, first_run = FALSE)
+            },
+            .extract = function(...) list(),
+            .join = function(session, room_id) {
+                joined <<- c(joined, room_id)
+                room_id
+            })
+        expect_identical(
+            corteza:::bot_operators(corteza:::bot_load_config()), character())
+        msgs <- capture.output(with_seamed_client(
+            seams, corteza::bot_poll(timeout = 0L,
+                                        sessions = seeded_sessions(character()))),
+            type = "message")
+        expect_identical(joined, character())
+        expect_true(any(grepl("refusing invite to !new:example", msgs,
+                              fixed = TRUE)))
+        expect_true(any(grepl("has no operators", msgs, fixed = TRUE)))
     })
 
     # A join that fails does not take the others with it: one revoked

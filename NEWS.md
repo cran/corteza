@@ -1,3 +1,841 @@
+# corteza 0.8.1
+
+Resubmission after the archival of 0.8.0, batching the 0.8.0.1 to
+0.8.0.53 development cycles below.
+
+## The archival
+
+- No function creates a directory in the home filespace. A chat room
+  with no directory worked in `~/<bot name>`, which corteza created on
+  first use, and a test made one on CRAN's check machine. A room now
+  works in a directory its bot's operator names, which must already
+  exist, or else in a scratch folder under the session's temporary
+  directory (0.8.0.1, 0.8.0.19, 0.8.0.31).
+- `install_cli()` with no `path` installs under
+  `tools::R_user_dir("corteza", "data")` and no longer writes to
+  `~/bin` (0.8.0.2).
+
+## Changed defaults
+
+- A bot's room works in the bot's `cwd`, or where an operator binds it
+  with `/cd` inside the bot's `project_roots`. A path in a room's topic
+  names no directory. A room with no directory reads and talks only
+  (0.8.0.1, 0.8.0.19, 0.8.0.31).
+- A bot with no `operators` accepts no invites (0.8.0.5).
+- A project's own files load only in a directory you trust:
+  `.corteza/config.json`, its skills, `AGENTS.md` or `CLAUDE.md`, its
+  lessons and the briefing (0.8.0.6).
+- "Allow always for this project" is kept in the user's config, by
+  directory. A project's `.corteza/approvals.json` is not read
+  (0.8.0.12).
+- Every tool has a class. A tool with no class asks, and plan mode
+  refuses it. `send_room_file` asks, as a write does (0.8.0.11).
+- No package function is registered as a tool unless a config lists it:
+  `skill_packages` is empty (0.8.0.15).
+- With no `on_archive` hook, nothing of a room's conversation is filed.
+  corteza no longer calls `pensar::ingest()` (0.8.0.13).
+- Once a day, the journal and tool trace of each session unused for 90
+  days are removed, with finished job chains, idle worker folders and
+  closed remote-control sessions. Setting `retention.session_days` to 0
+  disables idle-session cleanup. Earlier rewrites, audit payloads and
+  legacy workspace snapshots each have a separate opt-in lifetime.
+  Running turns retain all their entries across history expiry.
+- `--resume`, `--list`, `/sessions` and `chat(session = TRUE)` look at
+  the sessions of the current directory. `--all` covers every directory
+  (0.8.0.4).
+- A session compacts at the smaller of `context_compact_pct` of its
+  window and 200,000 tokens (`context_compact_tokens`), and before a
+  request that follows 60 idle minutes with 100,000 tokens of context
+  (0.8.0.8).
+- A bot's bound room uses a talker by default with unrestricted tools.
+  The terminal and `chat()` run tools directly by default. In a
+  talker session `/model`, `/effort`, `/provider` and `/max-tokens` act
+  on the doer, and `/auto` needs talker mode off (0.8.0.30, 0.8.0.34).
+- At the terminal, `/clear` starts a new conversation for a job's worker
+  too: its R objects stay, and its history goes (0.8.0.24).
+- A session's system text and tool list stay fixed for the session.
+  Plan mode, an `/auto` run and the task list reach the model as notes
+  (0.8.0.32).
+- The task list is off (`task_list_enabled`), and so is the memory flush
+  ahead of an automatic compaction (`memory_flush_enabled`) (0.8.0.42).
+- A session on `anthropic` or `anthropic_claude` caches its prompt for 5
+  minutes (`cache`), and a turn's token total counts the cached input
+  (0.8.0.42).
+
+## New features
+
+- `corteza guide` and `/guide` explain subscriptions, approvals,
+  delegation, context and storage. The guide works before sign-in.
+- Set `context_window_cap` to use a smaller working window across providers.
+  A cap of 400,000 leaves smaller models at their own limit.
+- The Codex subscription route supports model-managed history. Approval
+  reviewers can continue a verified conversation across decisions.
+- `corteza acp` serves an Agent Client Protocol client on standard input
+  and output, with cancellation that reaches a running tool and the
+  session's commands. Not on Windows (0.8.0.39 to 0.8.0.41).
+- `approval_mode: "review"` at the terminal and in `chat()`: a reviewer
+  model rules on what would prompt, reading the conversation (0.8.0.14).
+- `bot_run_init()` takes the hooks `on_message` and `on_archive`, so a
+  host can take a room's messages and file its conversation (0.8.0.10,
+  0.8.0.13).
+- A picture sent to a room is kept where the session's tools can read it
+  (0.8.0.9).
+- `session$stop_requested` lets a program stop a turn (0.8.0.26).
+- A job's worker follows its conversation's plan mode, approval mode and
+  dry run while it runs (0.8.0.21).
+- `sessions_prune()` removes what old sessions no longer need, and
+  reports it with `dry_run = TRUE` (0.8.0.3).
+
+## Fixes
+
+- A Claude model that thinks by default no longer stops answering after
+  a compaction, a context edit, a restart or a task-list change
+  (0.8.0.7).
+- A turn that ends on an error no longer leaves a tool call without a
+  result, which made every later request fail (0.8.0.23).
+- A tool's time limit stays inside the tool, and `grep_files` reads
+  within bounds (0.8.0.28).
+- A call `policy()` refused is refused before any gate (0.8.0.33).
+- A job whose worker exits as its reply is read is settled
+  `indeterminate`, not `failed` (0.8.0.37).
+- On Windows, retention of the state stores removed nothing (0.8.0.38).
+
+## Changes
+
+- No exported function was removed, and 1 was added:
+  `sessions_prune()`. Arguments added, each last: `cwd` and
+  `project_roots` to `bot_configure()`, `bot_run()`, `bot_run_init()`
+  and `bot_poll()`; `operators` to `bot_configure()`; `on_archive` and
+  `cfg` to `bot_archive_all()`; `class` to `register_skill_from_fn()`.
+  The `matrix_*` aliases take the same.
+
+# corteza 0.8.0.53
+
+- The terminal and `chat()` offer `/guide` at startup. It explains model
+  subscriptions, tool approval, delegation, history, caching and storage.
+  Run `corteza guide` before choosing a provider or signing in.
+- Personal retention settings can expire unpinned audit payloads, older
+  committed journal segments and legacy workspace snapshots. Each new age
+  defaults to zero. Preview eligible files with `sessions_prune(dry_run = TRUE)`.
+- Warm approval reviewers can use a measured token count for a verified
+  request prefix. New inputs retain the conservative byte bound.
+- Idle subagents report their context usage in `/agents`. The runtime no
+  longer scans the global R environment or writes unused workspace copies
+  on exit. Old RDS snapshots can be recovered with `readRDS()`.
+- Removed the unused experimental context index, heartbeat, rate-limit
+  settings and their dedicated tests. The configuration vignette lists
+  the supported settings.
+
+# corteza 0.8.0.52
+
+- Foreground and background archive summaries and room consultation workers
+  skip the working directory's `.Rprofile` at startup.
+
+# corteza 0.8.0.51
+
+- Subagents spawned without a preset use the read-only tools, including
+  `read_file`, `web_search` and `fetch_url`. An explicit tool list still applies.
+- Tool calls no longer copy their results or new R bindings into the shared
+  workspace. R bindings still persist between calls in the same evaluator.
+  This removes the package's `codetools` import.
+- Job workers, supervised `run_r` workers and spawned subagents skip the
+  working directory's `.Rprofile` by default, including any `corteza.policy`
+  option it sets. Job and `run_r` workers can opt in with `user_profile = "project"`.
+  For `renv`, their `libpath` must include the project library followed by the
+  libraries containing corteza and its dependencies.
+
+# corteza 0.8.0.50
+
+- An approval reviewer reads the full transcript afresh when journaling is off.
+  A call too large to review goes to a person, and the next eligible call
+  can reuse the verified conversation.
+- In `/auto`, a tool argument over 2,000 characters as JSON is refused before
+  the monitor is asked. The worker can continue with a smaller call.
+- When switching providers, corteza keeps tool output distinct from the
+  person's words and assigns fresh context IDs to the converted history.
+- Skill discovery skips dot-prefixed subdirectories such as `.archive/`.
+  An explicitly configured hidden directory can still serve as a skill root.
+
+# corteza 0.8.0.49
+
+- Codex subscription sessions can edit their native Responses history with CLM.
+  A tool call and its result stay together when a session retires them.
+- Approval reviewers can keep working notes between decisions in a conversation.
+  A warm reviewer accepts up to 100,000 new characters after verifying its
+  earlier inputs. An incomplete record or a request over budget goes to a person.
+- Anthropic sessions using CLM now use the same 5-minute prompt cache as other
+  Anthropic sessions. The 1-hour and off settings still apply.
+
+# corteza 0.8.0.48
+
+- The CLI runs tools directly by default, matching `chat()`. Talker/doer
+  mode remains available with `"talker": {"enabled": true}`. Bot-room
+  defaults are unchanged.
+
+# corteza 0.8.0.47
+
+- Provider switches and quota fallbacks keep a talker and its doer on
+  the same provider, using remembered or configured model pairs. The
+  model menu includes configured fallback routes.
+- Routes that cannot edit their native history, including Codex's
+  Responses format, use standard compaction when CLM is requested.
+  Compaction uses the selected route's model and context limits.
+
+# corteza 0.8.0.46
+
+- Leaving plan mode requires the person's approval. Saved approvals,
+  permissive settings, and model reviewers cannot answer for them.
+  Refusing a plan keeps plan mode on.
+
+# corteza 0.8.0.45
+
+- `r_help` finds a requested package without scanning every installed
+  package. An unsupported provider leaves an attached `llm.api` alone
+  and asks for an R restart.
+- The offline flush example runs for the deprecated alias too. Help
+  pages describe return values and live-service requirements, and the
+  sample systemd unit calls `bot_run()`.
+- Examples and tests use generic host, account and project names.
+
+# corteza 0.8.0.44
+
+- An empty `CORTEZA_REMOTE_DIR` counts as unset, as `CORTEZA_STATE_DIR`
+  does. Read as a folder, it put remote control's records at the root
+  of the file system, and the package's own tests tried to write there
+  after tinytest had left the variable empty.
+
+# corteza 0.8.0.43
+
+- A history's token estimate counts tool calls and their results in
+  full. It read a block list for its text alone, so an Anthropic tool
+  result counted as one line: a session whose tools returned long text
+  compacted far past `context_compact_tokens`, and `/context`
+  understated it. A chat-completions call's `tool_calls` count too, and
+  so does a plain-text document's text.
+
+# corteza 0.8.0.42
+
+- The task list is off by default: no `task_create` or `task_update`
+  tool and no task text in the system prompt. `"task_list_enabled": true`
+  in the config turns it on, and `/tasks` says so.
+- The memory flush ahead of an automatic compaction in the terminal is
+  off by default (`"memory_flush_enabled": true` turns it on). `/flush`
+  runs it by hand, as before.
+- A session on `anthropic` or `anthropic_claude` caches its prompt for 5
+  minutes unless `cache` says otherwise (`"none"` turns it off). A
+  session that edits its own context gets no default cache.
+- On those providers a turn's token total counts the input read from
+  the cache and written to it, so `/spent`, `/auto`'s token cap and
+  `subagents.mcp_spend_cap_tokens` count all a session sends.
+
+# corteza 0.8.0.41
+
+- An ACP client is offered the session's commands: `/help`, `/trust`,
+  `/status`, `/tools`, `/tasks`, `/spent` and `/compact`. A prompt that
+  starts with one runs it in place of a turn, and a cancel reaches
+  `/compact`.
+
+# corteza 0.8.0.40
+
+- Over ACP, a cancel reaches a tool while it runs. `bash` and `cmd` end
+  the command and its children, and `run_r_script` ends its process.
+  `run_r`, which runs in a worker under ACP, interrupts it: the worker
+  keeps its R objects, and one that does not answer within 5 seconds is
+  ended and loses them. Other tools finish first. Elsewhere a tool runs
+  as before.
+- `bash` and `cmd` run their command through processx, and
+  `run_r_script` through `callr::rscript_process()`. Their output and
+  their time limits are as before.
+
+# corteza 0.8.0.39
+
+- `corteza acp` serves an Agent Client Protocol client (protocol
+  version 1) on standard input and output: a session for each directory
+  the client names, prompts of text and file links, the reply streamed,
+  tool calls and their results, the terminal's approval answers, and the
+  `ask` and `review` modes. A session keeps the terminal's records, so
+  `corteza --resume` and a client's resume take up each other's
+  conversations in the same directory. Sessions in one process share no
+  R objects: each session's `run_r` runs in a worker of its own. Not on
+  Windows.
+- The reviewer (`approval_mode: "review"`) is shown everything the agent
+  said since the prompt before the call, a job's result included. A
+  reply missing from the transcript hands the call to the person.
+- The terminal writes a failed turn's error to the transcript, so every
+  prompt there has an answer.
+- A compaction asked to stop before or during its summary leaves the
+  conversation as it was.
+
+# corteza 0.8.0.38
+
+- On Windows, retention of the state stores removed nothing: no job
+  chain, worker folder or remote-control session ever went. A path
+  there mixes `\` and `/`, and the check that it lies inside the data
+  folder compared it as text with one that does not. The check now
+  compares with forward slashes, and on Windows in any case.
+
+# corteza 0.8.0.37
+
+- A job whose worker exits as its reply is read is settled
+  `indeterminate`, as one whose worker is seen dead first: it may have
+  acted before it stopped. It was settled `failed`, as though the job
+  had reported an error.
+
+# corteza 0.8.0.36
+
+- A talker's job takes the terminal's "allow always" answers, as the
+  session's own calls do, before the reviewer is asked. Never for a
+  call the credential rule asks about: the rule now goes with the
+  job's request, through the supervisor too.
+- The job's prompt offers "always" (`Approve? [y/a(lways)/N]`): the
+  terminal saves it for the directory, and `chat()` holds it for the
+  session. A room's jobs are answered in the room, as before.
+
+# corteza 0.8.0.35
+
+- Retention removes a worker's folder with a checkpoint once the folder
+  and the session its checkpoint belongs to have both gone unused for
+  `retention$session_days`: the terminal session, or the room. A folder
+  whose checkpoint names no session of its own stays and is listed as
+  `"unknown"`.
+- A worker folder stays while its worker is alive, its session is open
+  in the process that prunes, or a job is open in it. A worker writes
+  `worker.json` when it starts and with each checkpoint, so the folder a
+  `/clear` moves it to is marked too.
+
+# corteza 0.8.0.34
+
+- The terminal answers through a talker by default, as a bot's room
+  does: its own session only reads and hands work to a doer, a worker
+  process of the conversation's own. It says so when it starts.
+  `"talker": {"enabled": false}` in the corteza config turns it off, and
+  a session whose tools are restricted (`--tools`, the config's `tools`)
+  is no talker unless the config turns it on. `chat()` stays without
+  talker mode unless its config turns it on.
+- After a turn that hands work off, the terminal stays with the job: it
+  prints the worker's steps, its questions and its result as they come.
+  Ctrl+C returns the prompt and leaves the job running; `/jobs` lists
+  the jobs and stays with an open one again. A Ctrl+C at a job's
+  question is a no.
+- `approval_mode: "review"` covers the doer's calls at the terminal and
+  in `chat()`: the reviewer judges a job's call by the conversation that
+  asked for the job and the task the talker wrote, and `/permissions`
+  typed while a job runs reaches its next call.
+- In a talker session `/provider` and `/max-tokens` change the doer's,
+  as `/model` and `/effort` do; `/review`, `/doctor` and `/config` use
+  the doer's model and provider. `/spent` counts each job in the
+  conversation that asked for it, and a job's result goes into that
+  conversation's transcript, so `--resume` brings it back. `/auto`
+  starts no run in a talker session and says how to turn talker mode
+  off. `/r` runs R in the terminal's own process. A resumed
+  conversation's doer starts on the `jobs` block's model where the
+  config names one.
+- The command table's `talker` column covers every command of the
+  terminal.
+
+# corteza 0.8.0.33
+
+- A call `policy()` denied is refused before any gate (a room's
+  supervisor, the terminal's reviewer, an `/auto` run's monitor). The
+  rule that nothing after `policy()` lifts a deny lived in each gate,
+  and a gate that answered otherwise would have let a denied call run.
+  A gate is still shown the call, so an `/auto` run's decision log keeps
+  the deny, but its answer is not read.
+
+# corteza 0.8.0.32
+
+- A session's system text and tool list stay fixed for the session. A
+  change to either made the provider read the whole history again, and
+  a model that signs its thinking against the request refused the
+  replay. Plan mode, an `/auto` run and the task list now change
+  neither: each change reaches the model as a note at the head of the
+  next prompt, and permission is checked at the call. `exit_plan_mode`
+  is refused outside plan mode, and what an `/auto` run may not call is
+  refused when called.
+- `send_room_file` and `ask_room` stay listed in a room's session
+  whoever sent the message, and refuse anyone but an operator at the
+  call.
+- The git and search tools are looked for once per session, so a
+  `git init` mid-session adds no tool.
+- The terminal's `/clear` builds the next conversation's config, tool
+  table and system text again, so `/trust yes` takes effect at the next
+  conversation. What a flag or a command set in this process
+  (`--dry-run`, `--base-url`, `/permissions`, `/dryrun`,
+  `/context-edit`) carries over. A talker keeps its guidance when
+  `/clear` or the archival runtime builds the text again.
+- `/context`, `/status`, `/tools`, `/doctor` and the meter count the
+  system text and tools the request sends.
+
+# corteza 0.8.0.31
+
+- A bot's room works where an operator binds it with `/cd`, inside the
+  bot's project roots, and no longer in a directory its topic names.
+  Anyone allowed to change a topic could change that directory, and with
+  it the checkout where the supervisor lets writes through.
+  `project_roots`, a new last argument of `bot_configure()`, `bot_run()`,
+  `bot_run_init()` and `bot_poll()` and a key of the bot config, names
+  the roots. Each must exist; corteza creates none.
+- An operator's `/cd` in a room says where the room works, and binds it:
+  `/cd <dir>` to an existing directory inside a root, `/cd none` to no
+  directory, `/cd default` back to the bot's `cwd`. `/ls` lists the
+  roots, and `/ls <dir>` the directories in one. A move refuses while a
+  job of the room is open, files each conversation as `/clear` does, and
+  starts each conversation again in the new directory, with a new doer.
+- A room's directory is its binding, else the bot's `cwd`, else the
+  scratch folder. A binding to a directory that is gone, or outside every
+  root, gives the scratch folder. A room whose topic starts with a path
+  works in the bot's `cwd` until an operator binds it, and is told so
+  once.
+- A room state file that is there and cannot be read is set aside, and
+  the room works in the scratch folder until an operator's `/cd` binds it
+  again; it does not fall back to the bot's `cwd`.
+
+# corteza 0.8.0.30
+
+- A bot's room answers through a talker by default: a session with
+  read-only tools that hands work needing edits, commands or tests to a
+  doer, a worker process of the conversation's own. `"talker":
+  {"enabled": false}` in the bot's config turns it off. A bot whose
+  tools are restricted (`tools_filter`) and a room with no directory
+  are no talker unless the config turns talker mode on.
+- The talker runs on `talker.model`, else on the bot's own model;
+  `talker.provider` without a model takes that provider's default.
+  Up to 0.8.0 it ran on a fast model of its provider's and stopped with
+  an error on any other provider. A `talker` entry that is no object
+  stops with a message saying what it should be.
+- In a talker session `/model` and `/effort` change the doer's model
+  and effort, which the next job runs with. The doer starts on the
+  model, provider and reasoning settings the config's `jobs` block
+  names, where it names them. The talker follows `/model` unless its
+  config names a model or a provider of its own, and takes its
+  reasoning settings from the `talker` block alone. `/status` names
+  both models. Up to 0.8.0 both commands changed the talker's alone.
+- The command table (`corteza:::corteza_commands()`) has a `talker`
+  column: what a command acts on in a talker session.
+
+# corteza 0.8.0.29
+
+- The command table (`corteza:::corteza_commands()`) says that a bot's
+  room takes `/effort` and `/context-edit`, as it does; it listed both
+  for the terminal alone.
+
+# corteza 0.8.0.28
+
+- A tool's time limit (`skill_timeout`) stays inside the tool. R checks
+  the limit only between R calls, so a limit passed inside `readLines()`
+  or `grep()` fired at the next R code; when that was a warning handler
+  outside the tool, it ended the turn and left the call open. Now the
+  tool's warnings and messages wait until the tool returns or fails and
+  then pass on, in order. Where warnings are errors (`options(warn =
+  2)`), a warning stops the tool where it is raised, and the error is
+  the tool's result.
+- `grep_files` reads within bounds. It skips a binary file (a NUL byte
+  in the first 8000 bytes) and a file over 10 MB, matches a line that is
+  not UTF-8 by its bytes, cuts lines at 500 characters, and stops at 500
+  matches or after 20 seconds. The result says what it skipped and
+  where it stopped.
+
+# corteza 0.8.0.27
+
+- A room's monitor (`auto_approve_asks: true`) reads the room's
+  conversation, as the terminal's reviewer does, where it was told the
+  task in one line. Each conversation keeps a record in the room's
+  journal folder that a flush, `/clear` or restart leaves whole. The
+  monitor sends the call to a person when it cannot read the record
+  whole: nobody may approve, the record has a break (a restart whose
+  backfill did not reach its last event, or failed), or it is too long.
+
+# corteza 0.8.0.26
+
+- A program that runs turns for someone else can let them stop one:
+  `session$stop_requested`, a function the turn asks before each
+  request to the model, before each tool call, again just before a call
+  runs and on each streamed piece of the reply. A stop ends the turn
+  with status `cancelled` and a history the next turn can use. A
+  cancelled job's reason says what it leaves: the files it wrote stay,
+  and the next job starts from its worker's last checkpoint.
+
+# corteza 0.8.0.25
+
+- A Matrix room and each of its threads keep a record of the
+  conversation they hold, so a restart goes on with it and seeds
+  nothing from before its `/clear`. A room's `/clear` saves the new
+  record before it answers or replaces the session; when it cannot,
+  nothing is cleared and the room is told. A job the room asked for
+  finishes in the conversation that asked, and its result is posted
+  marked as asked before the `/clear`.
+
+# corteza 0.8.0.24
+
+- At the terminal, `/clear` starts a new conversation for a job's
+  worker too: its R objects stay and its history does not, and the
+  next job gets the instructions and tools a session started now would
+  have. A job still running finishes, and its result goes to the
+  conversation that asked for it; a job still queued runs under the
+  settings its conversation had when it ended. Each conversation keeps
+  its own checkpoint, so `--resume` brings back that conversation's
+  worker as its last job left it.
+
+# corteza 0.8.0.23
+
+- A turn that ends on an error no longer leaves a tool call without a
+  result. Every later request from that history failed (Anthropic
+  answers 400), so a room stayed broken until `/reset`. Before the
+  error leaves `turn()`, each call with no result gets a placeholder
+  and a note says the turn stopped on that error; a turn also closes,
+  before its first request, any call an earlier turn or process left
+  open. Anthropic, OpenAI and Responses histories alike.
+
+# corteza 0.8.0.22
+
+- Retention also clears corteza's state stores, in the same daily run
+  and in `sessions_prune()`: a chain of jobs once every job in it has
+  ended and none of its folders has changed for `retention.session_days`
+  (an incomplete job nothing resumed waits `retention.incomplete_days`,
+  180 by default), a worker's folder with no checkpoint, and a
+  remote-control session that was closed or whose process is gone. An
+  open job keeps its chain, and audit records, checkout lock numbers,
+  room state, the archive's files and transcripts stay. A folder whose
+  name or record corteza did not make is listed and left, and nothing is
+  read or removed through a link.
+
+# corteza 0.8.0.21
+
+- A job's worker obeys its conversation's plan mode, approval mode and
+  dry run. Each job applies its whole spec when it starts (provider,
+  model, reasoning settings, plan mode, tools, turn limit), and the
+  worker reads what its conversation allows before each tool call and
+  again just before the call runs, so a `/plan`, `/permissions` or
+  `/dryrun` typed while a job runs reaches its next call. A record the
+  worker cannot read refuses every call. A worker cannot end plan mode;
+  the person does.
+
+# corteza 0.8.0.20
+
+- Each session takes its tools once, when it starts: corteza's own and
+  any a host registered, the user's skills, the config's package tools
+  and, in a trusted directory, the project's skills. A bot's rooms
+  share one process, and each now sees only its own project's tools. A
+  name is taken once: a later source never replaces an earlier one's
+  tool, so a skill named like a built-in tool is skipped, with a
+  message. Policy, the supervisor, the monitors, the reviewer and the
+  approval prompt judge the class of the tool that runs, as does the
+  gate of a room with no directory. A child process (a subagent, a
+  job's worker) now gets the config's package tools, as its parent
+  does.
+
+# corteza 0.8.0.19
+
+- A Matrix room with no directory (its topic names none, and the bot
+  has no `cwd`) reads and talks only. It works in a scratch folder, and
+  until now it could write files there, run commands, start subagents
+  and hand off or take jobs. Writes, commands, work in a child, a
+  worker or another room, and tools with no class are refused before
+  they run, and no later rule, setting or approval lifts the refusal,
+  which says how the room gets a directory. Room listings say "no
+  directory" in place of the scratch folder's path.
+
+# corteza 0.8.0.18
+
+- A compaction's summary ends with the names of the R objects `run_r`
+  made that are still in the session, and the handles still open, so
+  the model does not rebuild what it has. Names only, read with `ls()`,
+  so no object's code runs; at most 30 names. The terminal, `chat()`
+  and a child process list them; a room, whose objects are the bot's,
+  and a session whose `run_r` runs in a worker do not.
+
+# corteza 0.8.0.17
+
+- A room's trust messages go out as Markdown, with what a session left
+  alone as a list: the notice a room gets once, the `/trust` reply and
+  the trust lines of `status`. A client that renders Markdown had run
+  the indented items together. The terminal and `chat()` are unchanged.
+
+# corteza 0.8.0.16
+
+- `/help` lists every command. The terminal's had left out `/q`,
+  `/reset` and `/new` (the same as `/quit` and `/clear`), `/refine`,
+  `/job resume` and `/skills`, and `chat()`'s had left out `/skills`.
+  corteza keeps a table of the commands of each surface, and a test
+  holds both help texts and the dispatchers to it.
+
+# corteza 0.8.0.15
+
+- **Changed default: no package functions are registered as tools
+  unless a config lists them.** `skill_packages` is now empty. Up to
+  0.8.0 the default registered 8 functions of base and utils in every
+  session: `file.exists`, `Sys.glob`, `read.csv`, `head` and `tail`,
+  and `file.copy`, `file.remove` and `dir.create`. To keep any of them,
+  list it with its class, as in `{"skill_packages": [{"package":
+  "utils", "functions": ["head"], "class": "read"}]}`. A config that
+  sets `skill_packages` is unchanged.
+
+# corteza 0.8.0.14
+
+- **A reviewer can answer what would prompt, at the terminal and in
+  `chat()`.** With `approval_mode: "review"`, from `/permissions
+  review` or the user's config, a call that would prompt goes to the
+  rules in code, then to a reviewer, then to the person. The reviewer
+  is a model in a process of its own with read-only tools, set by the
+  `supervisor` settings. It approves, refuses and tells the model why,
+  or passes the call on. It rules on reads, writes and commands; a
+  call the rules flag, a tool with no class and a credential path
+  still prompt, and a call allowed always runs without it. A reviewer
+  that fails or has not ruled within `supervisor.timeout_sec` passes
+  the call on, and an interrupt cancels its request. A project's config
+  cannot set `"review"`.
+- The reviewer reads the conversation from the session's transcript:
+  every prompt whole, each after the whole reply it answers. It never
+  reads a compaction's summary, output staged with `/r` or `!`, or an
+  `/auto` run's driver prompts. A conversation it cannot read whole
+  goes to the person: one past 100,000 characters, one with a line it
+  cannot read, or one with prompts written before this version.
+- Each prompt in a transcript says how it was sent: `staged`, and
+  `typed` when more went with it than the person typed.
+- The approval prompt says why it asks when the reviewer passed a call
+  on or the rules flagged it.
+
+# corteza 0.8.0.13
+
+- **The host files a room's conversation.** `bot_run_init()` takes a
+  fourth hook, `on_archive(chat, cfg, room_id, archive)`, handed each
+  range of a room's or thread's conversation that nothing has filed, at
+  `/clear` and at a flush (`bot_request_flush()`). `list(archived =
+  TRUE, ref)` takes the range, and `ref` goes to `on_clear`. Anything
+  else, an error included, leaves the range waiting in
+  `<state>/archive/<session id>.pending.json`, written before the host
+  is asked, and the next `/clear` or flush offers it again.
+- **Changed default: with no `on_archive` hook, nothing is filed.**
+  corteza no longer calls `pensar::ingest()`.
+- `/clear` keeps a session whose conversation is neither with the host
+  nor on disk, and says so in the room.
+- After each flush the log says how many ranges wait for the host, the
+  size of their files and how long ago the oldest was first kept.
+  Retention never removes a waiting range.
+- `thread_context` may return `kind = "summary"`, and a thread restored
+  from one is told it continues a conversation archived as a summary.
+- `bot_archive_all()` and `matrix_archive_all()` take `on_archive` and
+  `cfg`.
+
+# corteza 0.8.0.12
+
+- **"Allow always for this project" is kept in the user's config, by
+  directory.** The terminal keeps those answers in `approvals.json`
+  under `tools::R_user_dir("corteza", "config")`, keyed by the
+  directory with links resolved, and no longer reads a project's own
+  `.corteza/approvals.json`, trusted or not, so a repository cannot
+  arrive with answers already given. A tool allowed always through the
+  project's file asks once more.
+- The terminal offers "Allow always for this project" in every
+  directory, an untrusted one included. Saving makes no folder in the
+  project.
+- Where a project holds the old file, the terminal says at start that
+  it is not read. `/permissions` and `/status` list what is saved for
+  the directory.
+- Terminals that save at once each keep their answer. A store that
+  cannot be read is set aside as `approvals.json.unreadable`, and an
+  answer that cannot be saved holds for the session.
+- In a room, a worker's R code that names the approvals file goes to a
+  person.
+
+# corteza 0.8.0.11
+
+- **Every tool has a class, and approvals follow it.** A tool reads,
+  writes, runs code (`exec`), acts on the session's own work
+  (`control`), or runs work in a child, a worker or another room
+  (`continue`).
+  `skill_spec()` and `register_skill_from_fn()` take `class`, and a
+  `skill_packages` entry takes one for all its functions. A tool that
+  names none is `unknown` and asks: a skill, or a package tool whose
+  entry names no class, used to run unasked.
+- **Changed default: `send_room_file` asks**, as any write does. A
+  person answers by reaction, or the monitor where `auto_approve_asks`
+  is on. `"permissions": {"send_room_file": "allow"}` in the user's
+  config lets it send unasked.
+- Plan mode refuses `write`, `exec`, `continue` and `unknown` tools,
+  among them `query_subagent`, `delegate`, `job_resume` and
+  `harness_note`, and a write under a credential path, which used to
+  ask.
+- A read or write under a credential path asks each time. No saved
+  "always" answers it, and its prompt offers none.
+- `base::file.copy`, `base::file.remove`, `base::dir.create` and `cmd`
+  ask, as `write_file` does. For a tool corteza did not write, every
+  string argument counts as a path.
+- A `permissions` entry replaces its tool's verdict, unless that
+  verdict refuses: nothing in the config lifts a refusal. Taking a tool
+  off `dangerous_tools` no longer stops it asking; a `permissions`
+  entry does.
+- In a room, `harness_note` and a tool with no class go to a person,
+  never to the monitor.
+
+# corteza 0.8.0.10
+
+- **A host can take a room's messages for itself.** `bot_run_init()`
+  takes a third hook, `on_message(chat, cfg, room_id, message, session,
+  backfill)`, offered each message from someone else before the loop
+  does anything else with it. When it returns `list(handled = TRUE)`,
+  corteza marks the message seen and does nothing more: no turn, no
+  history entry, no read receipt. Anything else, an error included,
+  takes the normal path.
+- Once a host has taken a message in a room, the bot's own messages
+  there are recorded nowhere for the life of the process, so the
+  host's posts do not fill a history no turn reads.
+- A restart's backfill offers each message it would record with
+  `backfill = TRUE`.
+
+# corteza 0.8.0.9
+
+- **A picture sent to a bot's room is kept where its tools can read it.**
+  It used to be given to the model and removed, so no tool could use it.
+  A room's session now keeps each picture in `<id>.attachments/` beside
+  its journal, readable by this user alone, and the receipt the model
+  gets names the file and the size actually downloaded. A picture the
+  model is not shown, too big for the provider or with no vision, is
+  kept all the same, up to 25 MiB. `keep_attachments: false` in the bot
+  config turns keeping off.
+- A picture in the history a restart reads back is kept the same way,
+  and the history gets its receipt; the model is not shown it and
+  nothing is posted. chat.api 0.2.0's Matrix history does not yet
+  return pictures.
+- Retention removes a session's kept pictures with its journal. It
+  removes no link, wherever one is in a session's folders, and counts
+  no link's target in a size.
+
+# corteza 0.8.0.8
+
+- **Compaction follows the windows of current models, with a cap.** The
+  table of context windows had stopped at Claude Opus 4.7 and gpt-5.6, and a
+  model it did not know compacted at 115,200 tokens. It now holds the
+  current models of each provider, and `context_compact_tokens` (200,000 by
+  default) caps the trigger: a session compacts at the smaller of
+  `context_compact_pct` of its window and the cap. `0` turns the cap off.
+- A session that comes back after `context_idle_minutes` (60) with at least
+  `context_idle_tokens` (100,000) of context compacts before its next
+  request. `"context_idle_minutes": 0` turns that off.
+- `/context` says where compaction starts and which rule set it. A
+  `context_window` in the config now shows there and in the context meter.
+- A `context_window` that is not a number above 0 is ignored. A quoted
+  number there stopped every turn.
+- A compaction's summary reads more of what it replaces on a model with a
+  large window: up to 937,500 characters at 1M, which holds a context at the
+  default cap. It read the newest 120,000 characters on any model, and still
+  does in a recovery from a request refused for its size and after a summary
+  that failed.
+- On the Codex backend the summary's request keeps `context_compact_bytes`
+  (900,000 by default), measured as it is sent. A request that cannot fit,
+  or has room for no message of the conversation, is not sent, and the
+  history stays as it is.
+- `context_limit_for_model()` resolves a dated or suffixed id to its
+  family's row, and an ambiguous short id to the smallest window among its
+  matches. The OpenAI rows hold the input limit.
+
+# corteza 0.8.0.7
+
+- **A session on a Claude model that thinks by default no longer stops
+  answering after a compaction, a context edit, a restart or a change to its
+  task list.** Those models sign each thinking block against the
+  conversation that produced it, and the provider refuses a request that
+  replays one after the system text, the tools or an earlier message
+  changed. corteza now removes the thinking blocks from a history whenever
+  it replaces one. When a provider refuses replayed thinking all the same,
+  the turn removes the blocks, records that in the journal and continues
+  once, without running a tool twice.
+- A session that sets `thinking_budget_tokens` keeps its thinking blocks
+  through a rewrite.
+- `new_session(history = )` removes the thinking blocks of the history it
+  is given.
+- A fallback to another provider converts a Claude reply to plain text
+  whether or not it came with thinking.
+- A request-buffer error on a turn's first request sends the prompt again.
+  The retry went out without it.
+
+# corteza 0.8.0.6
+
+- **A project's own files load only from a directory you have trusted.**
+  That covers `.corteza/config.json`, the skills under `.corteza/skills/`,
+  `AGENTS.md` or `CLAUDE.md`, the stored lessons and the briefing. Trust a
+  directory with `/trust yes`, or list it under `trusted_projects` in your
+  config; every directory inside it is trusted with it. The command and
+  `chat()` ask once at start. A room is told once, and only an operator may
+  trust its directory. `serve()` reports an untrusted directory on stderr.
+  `/trust` and `/status` show where a directory stands and what was not
+  loaded. Up to 0.8.0 a cloned repository could set the approval mode and
+  the provider for a session started in it, and ran its own R files at
+  start.
+- In an untrusted directory the terminal's "Allow always" lasts for the
+  session and writes no file.
+- An unattended session's write to a project's `.corteza` folder goes to a
+  person, and so does R code that names the list of trusted directories. Up
+  to now only `.corteza/config.json` did.
+- `harness_trust_project` is no longer read. A trusted directory's lessons
+  are trusted.
+
+# corteza 0.8.0.5
+
+- **A bot with no `operators` accepts no invites.** Up to 0.8.0 it accepted
+  every one, which gave a session with tools to anyone who could invite it.
+  Rooms it is already in work as before. Each refused invite is reported in
+  the log with what would change it.
+- `bot_configure()` gains `operators`: the people a bot answers to, each by
+  a full Matrix id. Before, the key could only be added to the bot config by
+  hand. A bot that should go on accepting invites needs it.
+
+# corteza 0.8.0.4
+
+- `corteza --resume`, `corteza --list`, `/sessions` and
+  `chat(session = TRUE)` look at the sessions started in the current
+  directory. `--all`, or `/sessions all`, covers every directory.
+  `corteza --resume --all` is what `--resume` did before.
+- A session's entry in `sessions.json` records its directory, where it runs
+  and a title, the first prompt cut to 100 characters. A list shows the
+  title. Sessions from earlier versions get their directory from the
+  transcript the first time sessions are listed.
+- A session started with `--session <key>` is listed. Only keys beginning
+  with `corteza:` were.
+- A Matrix room's session has an entry too, under agent `matrix`.
+- `vignette("configuration")` has a "Session records" section that states
+  the fields for programs that read the file.
+- `sessions.json` is written through a temporary file with mode 0600, and a
+  store that cannot be read is set aside as `sessions.json.unreadable` where
+  it used to be replaced by the entry being written.
+
+# corteza 0.8.0.3
+
+- corteza now removes what old sessions no longer need. Once a day, when a
+  terminal session starts and while a bot runs, the journal and the tool
+  trace of every session unused for 90 days are removed. Transcripts, session
+  stores, workspaces and audit records stay, and a session whose journal is
+  gone still resumes. Set `retention$session_days` in the user's config to
+  change the number of days; 0 keeps everything.
+  `sessions_prune(dry_run = TRUE)` reports what a run would remove. Nothing
+  reached through a link is removed.
+- A room that restores its context from its journal, and has been silent for
+  90 days, starts its next conversation fresh.
+- A journal removed while its session is running starts again from nothing.
+  Before, the session's next compaction was refused.
+
+# corteza 0.8.0.2
+
+- `install_cli()` no longer writes to `~/bin` by default. With no `path`, the
+  command goes to `tools::R_user_dir("corteza", "data")/bin` on every system,
+  as it already did on Windows, and the function prints the line that puts
+  that directory on `PATH`. A named directory works as before. An install
+  made by 0.8.0 or earlier stays in `~/bin`: `install_cli()` and
+  `uninstall_cli()` say so and leave it alone, and
+  `install_cli("~/bin", force = TRUE)` refreshes it.
+
+# corteza 0.8.0.1
+
+- corteza no longer creates a directory in the home directory for a chat bot.
+  Up to 0.8.0 a room whose topic named no directory worked in `~/<bot name>`,
+  created on first use; a test did the same on CRAN's check machine. Such a
+  room now works in the bot's `cwd`, a new last argument of `bot_configure()`,
+  `bot_run()`, `bot_run_init()` and `bot_poll()`, and of the `matrix_*` names
+  that forward to them. It must name an existing directory. With no `cwd`,
+  the room works in a scratch folder under the session's temporary directory
+  and is told it has no project directory. A bot that relied on
+  `~/<bot name>` now needs `cwd`.
+
 # corteza 0.8.0
 
 CRAN release, batching the 0.7.1.1 to 0.7.1.94 development cycles below.
@@ -222,7 +1060,7 @@ CRAN release, batching the 0.7.1.1 to 0.7.1.94 development cycles below.
   made that decision and read that index here, are gone: a bare bot
   (`bot_run()`, or no `hooks`) archives and resets at `/clear` and never
   rehydrates. The `segment_rooms` config gate moves with the segment code
-  into the host (cerebro).
+  into the host.
 
 # corteza 0.7.1.76
 
@@ -723,10 +1561,10 @@ CRAN release, batching the 0.7.1.1 to 0.7.1.94 development cycles below.
 
 - **The default room workspace uses the bot's localpart as written.**
   `bot_default_cwd()` capitalised the Matrix localpart, so a bot logged in
-  as `@cornelius:cornball.ai` fell back to an empty `~/Cornelius` beside the
-  `~/cornelius` instance directory cerebro runs it from, and created it.
-  The fallback is now `~/cornelius`. An instance directory with other
-  capitalisation, such as `~/LilCasey`, was mismatched before and still is.
+  as `@helper:example.org` fell back to an empty `~/Helper` beside the
+  `~/helper` instance directory its host runs it from, and created it.
+  The fallback is now `~/helper`. An instance directory with other
+  capitalisation, such as `~/MyHelper`, was mismatched before and still is.
 
 # corteza 0.7.1.47
 
@@ -2183,7 +3021,7 @@ Alt+Enter) to the two corteza addins. Override the built-in
 * The tool-approval prompt is much tighter. The `Reason` section
   (gate text + `Policy:` + `Model route:`) is gone; `Access` collapses
   to a single line that names the path or command (e.g. `Write to
-  CLAUDE.md`, `Run command in /home/troy/corteza`); the redundant
+  CLAUDE.md`, `Run command in /srv/work/repo`); the redundant
   `Path:` detail line above `Access` is suppressed when it would just
   repeat the same path. Choices 1 and 3 carry key hints: `(Enter)` and
   `(Esc)`.

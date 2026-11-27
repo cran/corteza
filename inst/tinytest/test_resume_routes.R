@@ -9,9 +9,7 @@ local({
     old_env <- Sys.getenv(env_names, unset = NA_character_)
     do.call(Sys.setenv, as.list(setNames(file.path(root, env_names), env_names)))
     old_wd <- setwd(root)
-    old_opts <- options(corteza.experimental_ce = FALSE,
-                        corteza.experimental_heartbeat = FALSE,
-                        corteza.trace = FALSE)
+    old_opts <- options(corteza.trace = FALSE)
     old_tools <- getOption("corteza.tools")
     on.exit({
         setwd(old_wd)
@@ -24,8 +22,11 @@ local({
         unlink(root, recursive = TRUE)
     }, add = TRUE)
     dir.create(".corteza")
+    # A project's config is read from a trusted directory only
+    # (R/trust.R). The list is kept in the config directory set above.
+    corteza:::project_trust_add(root)
     writeLines('{"provider":"anthropic","model":"claude-config", "web_search":false,
-        "workspace":{"enabled":false}, "context_edit":{"enabled":false}}',
+        "context_edit":{"enabled":false}}',
         ".corteza/config.json")
 
     ns <- asNamespace("corteza")
@@ -86,7 +87,6 @@ local({
         args$validate_api_key <- FALSE
         do.call(corteza::session_setup, args)
     }
-    console$chat_workspace_init <- function(...) invisible(NULL)
     chat <- corteza::chat
     environment(chat) <- console
 
@@ -138,6 +138,69 @@ local({
     fresh <- ns$session_load("corteza:fresh-fixture")
     expect_equal(c(fresh$provider, fresh$model), c("anthropic", "claude-config"))
 
+    # A session belongs to the directory it was started in. From another
+    # directory --list and --resume find none and say how many there are,
+    # and --all reaches them.
+    elsewhere <- file.path(root, "elsewhere")
+    dir.create(elsewhere)
+    setwd(elsewhere)
+    run_cli <- function(...) {
+        flags <- c(...)
+        cli$commandArgs <- function(...) flags
+        capture.output(cli$run_agent(cli$parse_args()))
+    }
+    said <- function(out, text) any(grepl(text, out, fixed = TRUE))
+    started_here <- c("corteza:resume-fixture", "corteza:fresh-fixture")
+
+    before <- loops
+    out <- run_cli("--list")
+    expect_true(said(out, paste("No session was started in this directory.",
+                                "2 are elsewhere (corteza --list --all).")))
+    expect_false(said(out, "corteza:resume-fixture"))
+    out <- run_cli("--list", "--all")
+    expect_true(said(out, "corteza:resume-fixture"))
+    expect_true(said(out, "corteza:fresh-fixture"))
+    # Listing starts no conversation.
+    expect_equal(loops, before)
+
+    # --resume --all takes the latest there is, and says where it is from.
+    out <- run_cli("--resume", "--all")
+    expect_equal(seen$disk_session$session$sessionKey, "corteza:fresh-fixture")
+    expect_true(said(out, sprintf("This session was started in %s.",
+                                  ns$session_dir_show(ns$session_cwd(root)))))
+    # So does a session named by its key.
+    out <- run_cli("--session", "corteza:resume-fixture")
+    expect_equal(seen$disk_session$session$sessionKey, "corteza:resume-fixture")
+    expect_true(said(out, "This session was started in "))
+
+    # --resume alone starts fresh here, as the terminal's own session.
+    out <- run_cli("--resume")
+    expect_true(said(out, paste("No session was started in this directory.",
+                                "2 are elsewhere (corteza --resume --all).",
+                                "Starting fresh.")))
+    made_key <- seen$disk_session$session$sessionKey
+    expect_false(made_key %in% started_here)
+    made <- ns$store_load()[[made_key]]
+    expect_equal(made$surface, "cli")
+    expect_equal(made$cwd, ns$session_cwd(elsewhere))
+    # And the next --resume here finds that one, with nothing to add.
+    out <- run_cli("--resume")
+    expect_equal(seen$disk_session$session$sessionKey, made_key)
+    expect_false(said(out, "This session was started in "))
+    expect_false(said(out, "No session was started"))
+
+    # What /clear keeps over the config file is what a flag on the
+    # command line set (ctx$config_set, .repl_session_rebuild()): with no
+    # flag, nothing, so the file's dry_run and base_url are read again.
+    run_cli("--session", "corteza:no-flags")
+    expect_identical(seen$config_set, character())
+    run_cli("--session", "corteza:flags", "--dry-run",
+            "--base-url", "https://gateway.invalid/v1")
+    expect_identical(sort(seen$config_set), c("base_url", "dry_run"))
+    expect_true(isTRUE(seen$config$dry_run))
+    expect_identical(seen$config$base_url, "https://gateway.invalid/v1")
+    setwd(root)
+
     # Shared setup must not reintroduce the unrelated config model, including
     # a gateway that has no built-in model default.
     for (provider in c("openai", "openai_compatible")) {
@@ -145,4 +208,15 @@ local({
             system = "fixture", load_project_context = FALSE, validate_api_key = FALSE)
         expect_null(s$model_map$cloud)
     }
+
+    # The resume banner uses the same working window as /context. Exercise
+    # a model on each side of the cap through startup with a saved history.
+    writeLines('{"context_window_cap":400000,"context_warn_pct":0}', ".corteza/config.json")
+    for (model in c("claude-haiku-4-5", "claude-sonnet-4-6")) {
+        out <- run_cli("--session", "corteza:resume-fixture", "--provider", "anthropic",
+                       "--model", model)
+        window <- if (model == "claude-haiku-4-5") "200.0K" else "400.0K"
+        expect_true(said(out, paste("/", window, "tokens")))
+    }
+
 })

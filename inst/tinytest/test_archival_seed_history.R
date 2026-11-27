@@ -1,8 +1,13 @@
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 # subagent_seed_history round-trips a history slice into a child's
 # .subagent_state. No LLM call. Gated at_home() because spawning a
 # callr session adds ~250ms.
 
-if (!tinytest::at_home()) exit_file("subagent seed test is slow; at_home only")
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
+    exit_file("subagent seed test runs at home and in CI")
+}
 
 # Clean registry up-front.
 for (id in ls(corteza:::.subagent_registry)) {

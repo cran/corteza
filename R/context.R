@@ -25,8 +25,9 @@ load_context <- function(cwd = getwd()) {
 #' that only need a system prompt. Session constructors retain the manifest
 #' from this bundle for /context diagnostics.
 #' @param cwd Working directory.
-#' @param prefix_sources Optional consumer-owned source descriptors rendered
-#'   before corteza's normal preamble (used by the Matrix adapter).
+#' @param prefix_sources Optional consumer-owned source descriptors, rendered
+#'   at their `order` among corteza's: the Matrix adapter's guidance before
+#'   the preamble, a talker's guidance after everything else.
 #' @param instruction_catalog Optional prebuilt session catalog.
 #' @param include_instruction_catalog Whether to render its compact header.
 #' @param instructions_only Render only `prefix_sources` and what the
@@ -41,13 +42,14 @@ load_context_bundle <- function(cwd = getwd(), prefix_sources = list(),
                                 include_instruction_catalog = TRUE,
                                 instructions_only = FALSE) {
     config <- load_config(cwd)
+    trusted <- project_trusted(cwd)
     if (is.null(instruction_catalog) && !isTRUE(instructions_only)) {
         instruction_catalog <- build_instruction_catalog(cwd)
     }
     if (isTRUE(instructions_only)) {
         sources <- prefix_sources
     } else {
-        sources <- c(prefix_sources, context_base_sources(cwd),
+        sources <- c(prefix_sources, context_base_sources(cwd, trusted),
                      context_workspace_sources(config),
                      context_custom_sources(cwd, config),
                      context_dynamic_sources(
@@ -55,13 +57,23 @@ load_context_bundle <- function(cwd = getwd(), prefix_sources = list(),
                 include_instruction_catalog = include_instruction_catalog
             ))
     }
-    manifest <- saber::context_manifest(
-                                        agent = "corteza",
-                                        project_dir = cwd,
+    if (isFALSE(config$context_include_user)) {
+        shared_path <- FALSE
+    } else {
+        shared_path <- NULL
+    }
+    if (!trusted) {
+        # saber's discovery adds the shared file and the project's
+        # AGENTS.md or CLAUDE.md together. An untrusted project's
+        # instruction file must not reach the prompt, so discovery is off
+        # for it and the shared file is named here.
+        sources <- c(context_shared_source(shared_path), sources)
+    }
+    manifest <- saber::context_manifest(agent = "corteza", project_dir = cwd,
                                         workspace_dir = NULL,
-                                        shared_path = if (isFALSE(config$context_include_user)) FALSE else NULL,
-                                        extra_sources = sources
-    )
+                                        shared_path = shared_path,
+                                        extra_sources = sources,
+                                        discover = trusted)
     system <- saber::context_render(manifest)
     if (!nzchar(trimws(system))) {
         system <- NULL
@@ -89,9 +101,40 @@ context_text_source <- function(id, kind, text, order, origin, scope = "",
          scope = scope, config_path = config_path)
 }
 
-#' Static and project-generated context sources
+#' The shared instructions file as an explicit source
+#'
+#' The source saber's discovery adds for the shared file, for a manifest
+#' built with discovery off: the file \code{AGENTS_GLOBAL_MD} names, else
+#' \code{~/.config/agents/GLOBAL.md}, at the order discovery gives it.
+#' A test compares this with what saber discovers, so a change of
+#' saber's rule fails there.
+#' @param shared_path NULL for the default file, FALSE for none.
 #' @noRd
-context_base_sources <- function(cwd) {
+context_shared_source <- function(shared_path = NULL) {
+    if (isFALSE(shared_path)) {
+        return(list())
+    }
+    if (is.null(shared_path)) {
+        shared_path <- Sys.getenv("AGENTS_GLOBAL_MD", unset = "")
+        if (!nzchar(shared_path)) {
+            shared_path <- "~/.config/agents/GLOBAL.md"
+        }
+    }
+    list(list(id = "shared", kind = "shared", path = shared_path,
+              order = 1L, scope = "global"))
+}
+
+#' Static and project-generated context sources
+#'
+#' The briefing is built from the project's own DESCRIPTION and commit
+#' subjects, so it is a source only where the directory is trusted.
+#' @noRd
+context_base_sources <- function(cwd, trusted = project_trusted(cwd)) {
+    if (isTRUE(trusted)) {
+        briefing <- load_saber_briefing(cwd)
+    } else {
+        briefing <- NULL
+    }
     Filter(Negate(is.null), list(
                                  context_text_source("corteza_preamble", "runtime",
                 corteza_preamble(), -300,
@@ -101,7 +144,7 @@ context_base_sources <- function(cwd) {
                 "corteza::corteza_runtime_guidance", "session"
             ),
                                  context_text_source(
-                "project_briefing", "briefing", load_saber_briefing(cwd), -100,
+                "project_briefing", "briefing", briefing, -100,
                 "saber::briefing", cwd
             )
         ))
@@ -152,10 +195,9 @@ context_custom_sources <- function(cwd, config) {
 #' having a project config file must not misattribute an inherited global value.
 #' @noRd
 context_config_origin <- function(cwd, key) {
-    project_path <- file.path(cwd, ".corteza", "config.json")
-    project <- load_config_file(project_path)
+    project <- project_config(cwd)
     if (key %in% names(project)) {
-        return(project_path)
+        return(project_config_path(cwd))
     }
 
     global_path <- corteza_config_path("config.json")

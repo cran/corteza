@@ -1,3 +1,6 @@
+# Temporary user folders for this file, however it is run (isolate.R).
+source("isolate.R", local = TRUE)
+
 # Subagent transport: spawn / query / kill via callr::r_session.
 # Gated at_home() purely for the per-test budget: the single
 # subagent_spawn() call cold-starts an r_session and loads corteza
@@ -13,7 +16,7 @@
 # spawn/run/run(stop())/close all complete in under a second on both
 # pre-fix and post-fix callr.
 
-if (!tinytest::at_home()) {
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
     exit_file("Gated: spawning r_session + corteza load is slow per test")
 }
 
@@ -32,6 +35,8 @@ active <- corteza::subagent_list()
 expect_equal(length(active), 1L)
 expect_equal(active[[1]]$id, id)
 expect_equal(active[[1]]$task, "test task")
+expect_true(is.finite(active[[1]]$live_tokens) && active[[1]]$live_tokens > 0)
+expect_true(is.finite(active[[1]]$context_limit) && active[[1]]$context_limit > 0)
 
 # Spawn creates a durable transcript file. The file is the on-disk
 # record of the child's history — append-only, never rewritten, so
@@ -47,7 +52,7 @@ expect_true(grepl('"type":"session"', header_line, fixed = TRUE),
 # Query: runs through turn() inside the child, which needs a live
 # LLM API key. Skip this check if no provider key is available —
 # the spawn+registry+kill round-trip is what matters here.
-if (nzchar(Sys.getenv("ANTHROPIC_API_KEY"))) {
+if (tinytest::at_home() && nzchar(Sys.getenv("ANTHROPIC_API_KEY"))) {
     res <- corteza::subagent_query(id, "Reply with exactly the word 'pong'.")
     expect_true(is.character(res))
     expect_true(nzchar(res))

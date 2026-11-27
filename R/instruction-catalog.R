@@ -98,9 +98,9 @@ instruction_root_entries <- function(value, base, origin, config_path) {
 instruction_session_config <- function(cwd = getwd()) {
     cwd <- normalizePath(cwd, winslash = "/", mustWork = FALSE)
     global_path <- corteza_config_path("config.json")
-    project_path <- file.path(cwd, ".corteza", "config.json")
+    project_path <- project_config_path(cwd)
     global <- load_config_file(global_path)
-    project <- load_config_file(project_path)
+    project <- project_config(cwd)
 
     g <- instruction_root_entries(global$instruction_roots,
                                   dirname(global_path), "global", global_path)
@@ -115,10 +115,14 @@ instruction_session_config <- function(cwd = getwd()) {
                                     id = "corteza-data", path = corteza_data_path("skills"),
                                     origin = "builtin", config_path = ""
     )
-    roots[["project"]] <- list(
-                               id = "project", path = file.path(cwd, ".corteza", "skills"),
-                               origin = "builtin", config_path = ""
-    )
+    # The project's own skills folder is a root only where the directory
+    # is trusted. Otherwise no file in it is opened.
+    if (project_trusted(cwd)) {
+        roots[["project"]] <- list(
+                                   id = "project", path = project_skills_dir(cwd),
+                                   origin = "builtin", config_path = ""
+        )
+    }
 
     gd <- instruction_config_values(global$instruction_disabled, global_path)
     pd <- instruction_config_values(project$instruction_disabled, project_path)
@@ -194,6 +198,9 @@ instruction_walk_root <- function(root, aliases = FALSE) {
         children <- sort(list.files(dir, all.files = TRUE, no.. = TRUE,
                                     full.names = TRUE))
         for (child in children) {
+            # Catalog discovery skips hidden subdirectories. A skill's resource
+            # snapshot includes them, and an explicitly named root can be hidden.
+            if (aliases && startsWith(basename(child), ".") && dir.exists(child)) next
             real <- tryCatch(
                              normalizePath(child, winslash = "/", mustWork = TRUE),
                              error = function(e) NULL

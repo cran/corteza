@@ -100,18 +100,6 @@ expect_equal(loaded$inputTokens, 100L)
 missing <- corteza:::session_load("nonexistent-key", test_agent_id)
 expect_null(missing)
 
-# Test session_add_message (in-memory) - stores in content block format
-session <- corteza:::session_add_message(session, "user", "Hello")
-expect_equal(length(session$messages), 1)
-expect_equal(session$messages[[1]]$role, "user")
-# Content is now a list of content blocks
-expect_equal(session$messages[[1]]$content[[1]]$type, "text")
-expect_equal(session$messages[[1]]$content[[1]]$text, "Hello")
-
-session <- corteza:::session_add_message(session, "assistant", "Hi there")
-expect_equal(length(session$messages), 2)
-expect_equal(session$messages[[2]]$role, "assistant")
-
 # Test transcript_append
 corteza:::transcript_append(session, "user", "Hello", agent_id = test_agent_id)
 corteza:::transcript_append(session, "assistant", "Hi there", agent_id = test_agent_id)
@@ -187,7 +175,7 @@ expect_null(no_latest)
 
 # Test format_session_list
 formatted <- corteza:::format_session_list(sessions)
-expect_true(grepl("Sessions:", formatted))
+expect_true(grepl("^Sessions in ", formatted))
 expect_true(grepl(session$sessionKey, formatted))
 expect_true(grepl("2 msgs", formatted))
 

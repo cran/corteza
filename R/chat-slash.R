@@ -70,16 +70,6 @@ run_bang_shell <- function(cmd, cwd = getwd()) {
     list(text = text, staged = staged)
 }
 
-#' setwd() inside a function and restore on exit. Tiny base-R
-#' equivalent of withr::with_dir to avoid a Suggests entry just for
-#' `! <cmd>`.
-#' @noRd
-withr_local_dir <- function(dir, expr) {
-    old <- setwd(dir)
-    on.exit(setwd(old), add = TRUE)
-    force(expr)
-}
-
 #' Is `code` a syntactically complete R expression?
 #'
 #' Returns TRUE when `parse(text = code)` succeeds, or when it
@@ -232,6 +222,7 @@ run_memory_flush <- function(ctx) {
                                  max_turns = 20L
     )
     flush_session$config <- config
+    flush_session$tool_table <- session$tool_table
     .audit_safe({
         flush_session$audit_enabled <- session$audit_enabled
         flush_session$config$audit <- session$config$audit %||% config$audit
@@ -277,6 +268,7 @@ chat_help_text <- function() {
           "  /quit, /exit, /q              Exit chat",
           "  /clear, /reset, /new          Clear conversation, keep transcript",
           "  /help                         Show this help",
+          "  /guide [topic]                Explore settings and alternatives",
           "  /tools                        List active tools",
           "  /model [name [provider] | N]  List models or switch by name/number",
           "  /effort [level | default]    Show or set reasoning effort",
@@ -291,9 +283,10 @@ chat_help_text <- function() {
           "  /last [N]                     Show tool output (1=most recent)",
           "  /outputs                      List recent tool outputs",
           "  /refine [list|rollback <id>|promote <id>]  Review the conversation into one-line lessons (continual harness)",
-          "  /sessions                     List sessions for this directory",
+          "  /sessions [all]               List this directory's sessions, or every directory's",
           "  /trace [N]                    Show last N tool executions (default 20)",
           "  /permissions [allow|ask|deny] Show, or switch, tool approval for this session",
+          "  /trust [yes]                  Show whether this directory is trusted, or trust it",
           "  /auto [--exec] [goal]         Continue the current task unattended, or start a new goal",
           "  /auto status|resume           Inspect or resume a stopped unattended run",
           "  /max-tokens [N|default]        Show or change the response output budget",
@@ -328,11 +321,12 @@ chat_help_text <- function() {
           "  /skill install <path|url>     Install a skill (--force to reinstall)",
           "  /skill remove <name>          Remove a skill",
           "  /skill test <path>            Run skill tests",
+          "  /skills ...                   Same as /skill",
           "",
           "Keys:",
           "  Esc                           Interrupt the current turn and return to the prompt.",
           "                                (RStudio's console intercepts Ctrl+C for copy. In the",
-          "                                terminal ~/bin/corteza CLI the split is reversed:",
+          "                                terminal corteza CLI the split is reversed:",
           "                                Ctrl+C interrupts, Esc does nothing.)",
           "",
           sep = "\n"
@@ -471,8 +465,11 @@ chat_handle_copy <- function(text) {
 #' Format the active tool list for /tools.
 #' @noRd
 chat_format_tools_list <- function(turn_session) {
-    api_tools <- tryCatch(skills_as_api_tools(turn_session$tools_filter),
+    # The tools the next request carries (R/request-prefix.R).
+    api_tools <- tryCatch(session_request_parts(turn_session)$tools,
                           error = function(e) list())
+    # The task tools are offered only where the task list is on.
+    api_tools <- .task_filter_tools(api_tools, .task_list_on(turn_session))
     if (length(api_tools) == 0L) {
         return("No tools active.\n")
     }

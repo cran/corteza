@@ -48,18 +48,23 @@
 # Deterministic output notice: modest for a subscription-to-subscription hop,
 # deliberately loud before any reply whose provider consumes an API key.
 .fallback_notice <- function(route) {
-    if (!is.list(route) || !isTRUE(route$fallback)) {
+    if (!is.list(route)) {
         return(NULL)
+    }
+    if (!isTRUE(route$fallback)) {
+        return(route$context_notice)
     }
     model <- .fallback_route_label(route$model, 80L)
     provider <- .fallback_route_label(route$provider, 40L)
     if (isTRUE(route$api_key)) {
-        return(paste0(
+        notice <- paste0(
                       "\U{1F6A8}\U{1F6A8}\U{1F6A8} PAID API KEY FALLBACK \u2014 BILLABLE USAGE \U{1F6A8}\U{1F6A8}\U{1F6A8}\n",
                       "Subscriptions are limited; using ", model, " via ", provider, "."
-            ))
+            )
+    } else {
+        notice <- sprintf("\u26a1 Automatic subscription failover: %s via %s.", model, provider)
     }
-    sprintf("\u26a1 Automatic subscription failover: %s via %s.", model, provider)
+    paste(c(notice, route$context_notice), collapse = "\n")
 }
 
 .fallback_reply <- function(response) {
@@ -188,11 +193,6 @@
         grepl("exceeded request buffer", msg, ignore.case = TRUE))
 }
 
-.fallback_mark <- function(provider, minutes, now = Sys.time()) {
-    assign(provider, now + minutes * 60, envir = .fallback_state)
-    invisible(NULL)
-}
-
 .fallback_mark_until <- function(provider, until) {
     assign(provider, until, envir = .fallback_state)
     invisible(NULL)
@@ -251,9 +251,19 @@
         }
         content <- msg$content
         if (is.list(content) && !inherits(content, "llm_content")) {
+            # A reply in typed `text` blocks is Anthropic's as well: the
+            # Responses wire takes `output_text` there. Such a reply is
+            # all that is left of one whose thinking blocks were removed
+            # (R/history-replace.R), and it has to be bridged like the
+            # reply it was.
+            marks <- if (identical(msg$role, "assistant")) {
+                c(anthropic_blocks, "text")
+            } else {
+                anthropic_blocks
+            }
             for (b in content) {
                 if (is.list(b) && is.character(b$type) &&
-                    length(b$type) == 1L && b$type %in% anthropic_blocks) {
+                    length(b$type) == 1L && b$type %in% marks) {
                     return("anthropic")
                 }
             }
@@ -275,33 +285,68 @@
 # shapes. Reasoning payloads are omitted; tool names and completed results are
 # kept, which is the information a fallback needs to continue safely.
 
-.fallback_portable_history <- function(history) {
+.fallback_portable_history <- function(history, edit = NULL) {
     out <- list()
+    append_text <- function(role, body) {
+        if (!nzchar(trimws(body))) return()
+        n <- length(out)
+        if (n && identical(out[[n]]$role, role)) {
+            out[[n]]$content <<- paste(out[[n]]$content, body, sep = "\n\n")
+        } else {
+            out[[n + 1L]] <<- list(role = role, content = body)
+        }
+    }
+
+    # The portable wire has no tool-result role. Keep observations with
+    # the assistant's work and retire only labels registered for that call.
+    labels <- list()
+    if (length(edit$calls)) {
+        for (call in llm.api::history_tool_calls(history)) {
+            key <- digest::digest(list(call$id, call$name, call$arguments))
+            labels[[call$id]] <- edit$calls[[key]]
+        }
+    }
+    tool_result <- function(body, id) {
+        label <- if (length(id) == 1L) labels[[id]]
+        if (!is.null(label) && identical(.context_edit_label(body, "r"), label)) {
+            body <- substring(body, nchar(label) + 4L)
+        }
+        append_text("assistant", paste0("<tool result>\n", body))
+    }
     for (entry in history %||% list()) {
         if (!is.list(entry)) {
             next
         }
-        role <- if (identical(entry$type, ".openai_codex_output")) {
-            "assistant"
-        } else if (identical(entry$type, "function_call_output") ||
+        if (identical(entry$type, "function_call_output") ||
             identical(entry$role, "tool")) {
-            "user"
-        } else {
-            entry$role %||% ""
+            tool_result(.compact_entry_body(entry), entry$call_id %||% entry$tool_call_id)
+            next
         }
+        if (identical(entry$role, "user") && is.list(entry$content) &&
+            any(vapply(entry$content, function(b) is.list(b) && identical(b$type, "tool_result"),
+                       logical(1)))) {
+            for (block in entry$content) {
+                body <- .compact_block_text(block)
+                if (is.list(block) && identical(block$type, "tool_result")) {
+                    tool_result(body, block$tool_use_id)
+                } else {
+                    append_text("user", body)
+                }
+            }
+            next
+        }
+        role <- if (identical(entry$type, ".openai_codex_output")) "assistant" else entry$role %||% ""
         if (!role %in% c("user", "assistant")) {
             next
         }
-        body <- trimws(.compact_entry_body(entry))
-        if (!nzchar(body)) {
-            next
+        body <- .compact_entry_body(entry)
+        if (identical(role, "assistant")) {
+            label <- .context_edit_label(body, "m")
+            if (!is.null(label) && identical(edit$messages[[label]], entry)) {
+                body <- substring(body, nchar(label) + 4L)
+            }
         }
-        n <- length(out)
-        if (n > 0L && identical(out[[n]]$role, role)) {
-            out[[n]]$content <- paste(out[[n]]$content, body, sep = "\n\n")
-        } else {
-            out[[n + 1L]] <- list(role = role, content = body)
-        }
+        append_text(role, body)
     }
     out
 }
@@ -310,11 +355,11 @@
 # current user prompt and completed tool results are already in the callback
 # snapshot, so turn the final user entry into the continuation prompt rather
 # than appending a duplicate or replaying the original request.
-.fallback_resume_args <- function(args, history) {
-    portable <- .fallback_portable_history(history)
+.fallback_resume_args <- function(args, history, edit = NULL) {
+    portable <- .fallback_portable_history(history, edit)
     instruction <- paste(
                          "Continue the interrupted request from the completed tool results",
-                         "included below. Do not repeat any completed tool call."
+                         "in the conversation. Do not repeat any completed tool call."
     )
     n <- length(portable)
     if (n > 0L && identical(portable[[n]]$role, "user")) {
@@ -330,7 +375,8 @@
 # Run llm.api::agent with agent_args, walking the session's fallback
 # chain on limit errors. `.call` is the seam tests replace; production
 # leaves it at the real agent.
-.agent_with_fallback <- function(agent_args, session, .call = .agent_call) {
+.agent_with_fallback <- function(agent_args, session, .call = .agent_call,
+                                 .prepare = NULL) {
     previous_edit_provider <- session$context_edit_provider
     previous_edit_request <- session$context_edit_request
     on.exit({
@@ -339,6 +385,7 @@
     }, add = TRUE)
     primary <- list(model = agent_args$model, provider = agent_args$provider)
     chain <- c(list(primary), .session_fallback(session))
+    .remember_model_pair(session)
     resume <- FALSE
     last_error <- NULL
     recovered_usage <- list()
@@ -346,14 +393,26 @@
 
     for (i in seq_along(chain)) {
         cand <- chain[[i]]
-        if (.context_edit_pure(session) &&
-            !.context_edit_provider_supported(cand$provider)) {
-            next
-        }
         if (.fallback_limited(cand$provider)) {
             next
         }
         args <- agent_args
+        pair <- NULL
+        if (isTRUE(session$talker)) {
+            pair <- .model_pair(session, cand$provider,
+                if (i == 1L) session$.model_pairs[[cand$provider]]$doer$model %||%
+                    session$doer_model %||% cand$model else cand$model)
+            if (i == 1L) pair$talker$model <- cand$model
+            cand$model <- pair$talker$model
+            # A delegate can be submitted inside .call(), and dispatched
+            # after it returns. Keep the selected doer route for both.
+            .apply_model_pair(session, pair, replies = FALSE)
+            session$.model_pairs[[cand$provider]] <- pair
+            args$reasoning_effort <- pair$talker$reasoning_effort
+            args$output_config <- NULL
+            args$thinking_budget_tokens <- pair$talker$thinking_budget_tokens
+            args[["thinking"]] <- pair$talker[["thinking"]]
+        }
         if (resume) {
             history <- session$history
         } else {
@@ -365,31 +424,23 @@
             } else {
                 FALSE
             })
-        if (.context_edit_pure(session) &&
-            .context_edit_responses(cand$provider, cand$model,
-                                    request$web_search, history)) {
-            next
-        }
         shape <- .history_shape(history)
         if (resume) {
-            args <- .fallback_resume_args(args, history)
+            args <- .fallback_resume_args(args, history, session$.context_edit)
             message(sprintf("turn: resuming interrupted run on %s/%s",
                             cand$provider, cand$model))
         } else if (!.history_compatible(shape, cand$provider)) {
-            args$history <- .fallback_portable_history(history)
+            args$history <- .fallback_portable_history(history, session$.context_edit)
             message(sprintf("turn: bridged %s-shaped history for %s/%s",
                             shape, cand$provider, cand$model))
         }
         args$model <- cand$model
         args$provider <- cand$provider
         session$context_edit_provider <- cand$provider
+        request$configured_provider <- session$provider
+        request$configured_model <- .resolve_model(session)
         session$context_edit_request <- request
-        if ("tools" %in% names(args)) {
-            args$tools <- .context_edit_tools(args$tools, session)
-        }
-        if (identical(agent_args$system, session$context_edit_system)) {
-            args$system <- .context_edit_system(session$context_edit_base_system, session)
-        }
+        session$context_active_request <- request
         if (!is.null(args$web_search) &&
             !.web_search_supported(cand$provider)) {
             args$web_search <- NULL
@@ -405,15 +456,39 @@
         # "between_tools" that turns thinking off on Claude Sonnet 5.5 is
         # a 400 on Claude Haiku 4.5. Another model answers on its own
         # default.
-        if (!identical(cand$model, primary$model)) {
+        if (is.null(pair) && !identical(cand$model, primary$model)) {
             args[["thinking"]] <- NULL
         }
 
         # A provider bridge is a history rewrite too. Preserve completed
         # native traffic before the next callback replaces the live snapshot.
         if (!identical(history, args$history)) {
-            journal_rewrite(session, history, args$history, "provider_bridge")
-            session$history <- args$history
+            history_replace(session, args$history, "provider_bridge", before = history)
+            if (!is.null(session$.context_edit)) {
+                last_id <- session$.context_edit$next_id
+                session$.context_edit <- NULL
+                state <- .context_edit_state(session)
+                state$next_id <- max(last_id, state$next_id)
+                if (.context_edit_enabled(session)) {
+                    indexed <- .context_edit_index(session, session$history, length(session$history) + 1L)
+                    if (!identical(indexed, session$history)) {
+                        history_replace(session, indexed, "context_index")
+                    }
+                }
+            }
+            args$history <- session$history
+        }
+        # A bridge back from Responses makes CLM available again. Decide
+        # from the history this candidate will receive, not the old wire.
+        .context_edit_require(session)
+        if ("tools" %in% names(args)) {
+            args$tools <- .context_edit_tools(args$tools, session)
+        }
+        if (identical(agent_args$system, session$context_edit_system)) {
+            args$system <- .context_edit_system(session$context_edit_base_system, session)
+        }
+        if (is.function(.prepare)) {
+            args <- .prepare(args)
         }
 
         checkpoint_usage <- list()
@@ -421,6 +496,12 @@
         checkpoint <- args$checkpoint_callback
         if (is.function(checkpoint)) {
             args$checkpoint_callback <- function(history, context) {
+                # This candidate's provider says how its usage counts
+                # cached input (.usage_count_cached()). The callback
+                # under this one adds the same usage up, so it gets the
+                # corrected one.
+                context$usage <- .usage_count_cached(context$usage,
+                    cand$provider)
                 usage <- context$usage %||% list()
                 if (is.null(usage$total_tokens) &&
                     is.numeric(usage$input_tokens) &&
@@ -432,14 +513,21 @@
                 checkpoint(history, context)
             }
         }
-        before <- length(session$history %||% list())
+        before <- session$history %||% list()
         result <- tryCatch(.call(args), error = function(e) e)
         if (!inherits(result, "error")) {
+            # Before another candidate's usage is added to it.
+            result$usage <- .usage_count_cached(result$usage, cand$provider)
+            .review_measure_request(session, args, result$usage)
             if (length(recovered_usage) || recovered_turns > 0L) {
                 result$usage <- .turn_add_usage(recovered_usage, result$usage)
                 result$turns <- recovered_turns + as.integer(result$turns %||% 0L)
             }
             route <- .fallback_route(cand, i)
+            route$context_management <- .context_management(session)
+            if (!identical(route$context_management, session$last_route$context_management)) {
+                route$context_notice <- .context_management_notice(session)
+            }
             result$corteza_route <- route
             session$last_route <- route
             if (i > 1L) {
@@ -470,7 +558,7 @@
                         substr(conditionMessage(result), 1L, 120L),
                         cand$provider,
                         format(deadline, "%a %Y-%m-%d %H:%M %Z")))
-        progressed <- length(session$history %||% list()) > before
+        progressed <- !identical(session$history %||% list(), before)
         if (progressed) {
             resume <- TRUE
         }

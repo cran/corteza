@@ -22,9 +22,13 @@
 #'   - required: TRUE/FALSE (default FALSE)
 #'   - enum: Optional list of allowed values
 #' @param handler Function(args, ctx) that returns a result
+#' @param class What the tool does, which decides who approves a call to
+#'   it (R/policy.R): "read", "write", "exec", "control" or "continue".
+#'   NULL leaves it "unknown", which asks.
 #' @return Skill specification list
 #' @noRd
-skill_spec <- function(name, description, params = list(), handler) {
+skill_spec <- function(name, description, params = list(), handler,
+                       class = NULL) {
     # Build required list from params
     required <- names(params)[vapply(params, function(p) {
         isTRUE(p$required)
@@ -49,7 +53,8 @@ skill_spec <- function(name, description, params = list(), handler) {
                             properties = properties,
                             required = if (length(required) > 0) as.list(required) else list()
         ),
-         handler = handler
+         handler = handler,
+         class = tool_class_check(class, name)
     )
 }
 
@@ -71,6 +76,70 @@ skill_spec <- function(name, description, params = list(), handler) {
 # Process-global, mirroring setTimeLimit()'s own scope.
 .timelimit_armed <- new.env(parent = emptyenv())
 .timelimit_armed$pending <- FALSE
+
+# A tool's warnings and messages, held while its time limit is armed.
+# R runs a calling handler with the handlers established inside it out
+# of reach, so a handler outside the tool (.agent_call()'s, a host's
+# suppressMessages()) runs where skill_run()'s tryCatch cannot catch.
+# A limit that fires there ends the turn instead of the tool, with the
+# call left open. R checks the limit only between R calls, never inside
+# readLines() or grep(), so a limit passed in a long one fires at the
+# next R code, and grep() over binary lines warns once a line. The
+# tool's conditions are held under a handler inside the tryCatch and
+# passed on once the limit is off, the first `max` of them.
+#
+# Where warnings are errors (options(warn = 2)), a warning stops the tool
+# where it is raised, as R would stop it, with R's own words, inside the
+# tryCatch. Let go instead, it would reach the handlers outside the tool
+# first, with the limit armed. A held warning passes on under the warn
+# setting it was raised under, so a tool that makes warnings errors
+# after one does not turn it into an error outside the tool.
+.held_conditions <- function(max = 100L) {
+    kept <- list()
+    dropped <- 0L
+    hold <- function(cond) {
+        if (length(kept) < max) {
+            kept[[length(kept) + 1L]] <<- list(cond = cond,
+                warn = getOption("warn"))
+        } else {
+            dropped <<- dropped + 1L
+        }
+    }
+    run <- function(expr) {
+        withCallingHandlers(expr, warning = function(w) {
+            if (isTRUE(getOption("warn", 0) >= 2)) {
+                stop(simpleError(paste("(converted from warning)",
+                                       conditionMessage(w)),
+                                 conditionCall(w)))
+            }
+            hold(w)
+            invokeRestart("muffleWarning")
+        }, message = function(m) {
+            hold(m)
+            invokeRestart("muffleMessage")
+        })
+    }
+    resignal <- function(item) {
+        if (!inherits(item$cond, "warning")) {
+            message(item$cond)
+            return(invisible(NULL))
+        }
+        op <- options(warn = item$warn)
+        on.exit(options(op), add = TRUE)
+        warning(item$cond)
+    }
+    release <- function(tool) {
+        for (item in kept) {
+            resignal(item)
+        }
+        if (dropped > 0L) {
+            log_event("tool_conditions_dropped", tool = tool,
+                      conditions = dropped, level = "warn")
+        }
+        invisible(NULL)
+    }
+    list(run = run, release = release)
+}
 
 #' Executes a skill's handler with validation and optional timeout.
 #' Logs tool calls and results for observability.
@@ -131,6 +200,7 @@ skill_run <- function(skill, args, ctx = list(), timeout = 30L,
     use_time_limit <- !is.null(timeout) && timeout > 0 &&
     !(skill$name %in% .self_bounded_tools)
     if (use_time_limit) {
+        held <- .held_conditions()
         result <- tryCatch({
             setTimeLimit(cpu = timeout, elapsed = timeout, transient = TRUE)
             # Mark before the handler runs so the flag survives an interrupt;
@@ -138,8 +208,11 @@ skill_run <- function(skill, args, ctx = list(), timeout = 30L,
             # call flushes any interrupt this one may have left queued.
             .timelimit_armed$pending <- TRUE
             on.exit(setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE))
-            skill$handler(args, ctx)
+            value <- held$run(skill$handler(args, ctx))
+            setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
+            value
         }, error = function(e) {
+            setTimeLimit(cpu = Inf, elapsed = Inf, transient = FALSE)
             if (grepl("time limit|elapsed time", e$message,
                       ignore.case = TRUE)) {
                 log_error(sprintf("Skill timed out after %s seconds", timeout),
@@ -151,6 +224,7 @@ skill_run <- function(skill, args, ctx = list(), timeout = 30L,
                 err(paste("Skill error:", e$message))
             }
         })
+        held$release(skill$name)
     } else {
         result <- tryCatch(
                            skill$handler(args, ctx),
@@ -171,22 +245,6 @@ skill_run <- function(skill, args, ctx = list(), timeout = 30L,
     }
     log_tool_result(skill$name, success = success, result_lines = result_lines,
                     elapsed_ms = round(elapsed_ms))
-
-    # Capture result into workspace (skip run_r, it handles its own capture)
-    if (skill$name != "run_r" && !is.null(result$content[[1]]$text)) {
-        result_text_ws <- result$content[[1]]$text
-        ws_capture_tool_result(skill$name, args, result_text_ws,
-                               ws_current_turn())
-
-        # File write invalidation
-        if (skill$name == "base::writeLines" && !is.null(args$con)) {
-            ws_invalidate_file(args$con)
-        }
-        if (skill$name %in% c("write_file", "replace_in_file") &&
-            !is.null(args$path)) {
-            ws_invalidate_file(args$path)
-        }
-    }
 
     # Add trace entry if session context available
     if (!is.null(ctx$session_id)) {
@@ -355,13 +413,21 @@ get_dry_run_hint <- function(tool_name, args) {
 #' Load skills from a directory
 #'
 #' Sources all .R files in the directory. Each file should call
-#' register_skill() to add skills to the registry.
+#' register_skill() to add skills. With a session's \code{table}
+#' (R/tool-table.R), each file's register_skill() adds to that table
+#' with \code{origin}; without one, to the registry.
 #'
 #' @param path Directory path containing skill files
 #' @param pattern File pattern to match (default "*.R")
+#' @param table A session's tool table, or NULL for the registry.
+#' @param origin Where the tools come from (tool_origin()), with a table.
 #' @return Character vector of loaded file names (invisible)
 #' @noRd
-load_skills <- function(path, pattern = "*.R") {
+load_skills <- function(path, pattern = "*.R", table = NULL, origin = NULL) {
+    if (!is.null(table) && is.null(origin)) {
+        stop("load_skills() needs the origin of what it adds to a table",
+             call. = FALSE)
+    }
     path <- path.expand(path)
     if (!dir.exists(path)) {
         return(invisible(character()))
@@ -372,7 +438,14 @@ load_skills <- function(path, pattern = "*.R") {
     # Create environment with skill functions available
     skill_env <- new.env(parent = globalenv())
     skill_env$skill_spec <- skill_spec
-    skill_env$register_skill <- register_skill
+    skill_env$register_skill <- if (is.null(table)) {
+        register_skill
+    } else {
+        function(skill) {
+            tool_table_add(table, skill, origin)
+            invisible(skill$name)
+        }
+    }
     skill_env$ok <- ok
     skill_env$err <- err
 
@@ -392,12 +465,13 @@ load_skills <- function(path, pattern = "*.R") {
 #'
 #' Returns skills in the format expected by MCP tools/list.
 #'
+#' @param table A session's tool table, or NULL for the registry.
 #' @return List of tool definitions (name, description, inputSchema)
 #' @noRd
-skills_as_tools <- function() {
-    skill_names <- list_skills()
+skills_as_tools <- function(table = NULL) {
+    skill_names <- tool_names(table)
     lapply(skill_names, function(name) {
-        skill <- get_skill(name)
+        skill <- tool_entry(name, table)
         list(name = skill$name, description = skill$description,
              inputSchema = skill$inputSchema)
     })
@@ -405,18 +479,21 @@ skills_as_tools <- function() {
 
 #' Call a skill by name
 #'
-#' Looks up skill in registry and executes it.
+#' Looks the skill up in the session's table, or in the registry when
+#' there is none, and executes it. A name the table does not hold is
+#' unknown, whatever the registry holds.
 #'
 #' @param name Skill name
 #' @param args Named list of arguments
 #' @param ctx Context list
 #' @param timeout Timeout in seconds
 #' @param dry_run If TRUE, validate only without executing
+#' @param table A session's tool table, or NULL for the registry.
 #' @return Result from skill handler
 #' @noRd
 call_skill <- function(name, args, ctx = list(), timeout = NULL,
-                       dry_run = FALSE) {
-    skill <- get_skill(name)
+                       dry_run = FALSE, table = NULL) {
+    skill <- tool_entry(name, table)
     if (is.null(skill)) {
         return(err(paste("Unknown skill:", name)))
     }
@@ -588,65 +665,6 @@ load_skill_docs <- function(path) {
 #' @noRd
 list_skill_docs <- function() {
     ls(.skill_docs)
-}
-
-#' Get a skill doc by name
-#'
-#' @param name Skill name
-#' @return Skill doc list or NULL
-#' @noRd
-get_skill_doc <- function(name) {
-    if (exists(name, envir = .skill_docs, inherits = FALSE)) {
-        .skill_docs[[name]]
-    } else {
-        NULL
-    }
-}
-
-#' Clear all skill docs
-#'
-#' @return Invisible NULL
-#' @noRd
-clear_skill_docs <- function() {
-    rm(list = ls(.skill_docs), envir = .skill_docs)
-    invisible(NULL)
-}
-
-#' Format skill docs for context injection
-#'
-#' Creates markdown text suitable for system prompt.
-#'
-#' @param names Optional character vector of skill names to include.
-#'   If NULL, includes all loaded skills.
-#' @return Character string with formatted skill docs
-#' @noRd
-format_skill_docs <- function(names = NULL) {
-    if (is.null(names)) {
-        names <- list_skill_docs()
-    }
-
-    if (length(names) == 0) {
-        return("")
-    }
-
-    parts <- character()
-
-    for (name in names) {
-        skill <- get_skill_doc(name)
-        if (is.null(skill)) {
-            next
-        }
-
-        # Format as markdown section
-        header <- sprintf("## Skill: %s", skill$name)
-        if (nchar(skill$description) > 0) {
-            header <- paste0(header, "\n\n", skill$description)
-        }
-
-        parts <- c(parts, header, "", skill$body, "")
-    }
-
-    paste(parts, collapse = "\n")
 }
 
 # ============================================================================

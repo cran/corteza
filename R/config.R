@@ -42,7 +42,8 @@ load_config_file <- function(path) {
 #'
 #' Merges global config from \code{tools::R_user_dir("corteza", "config")}
 #' with project config (\code{.corteza/config.json}). Project config
-#' takes precedence.
+#' takes precedence, where the directory is trusted: an untrusted
+#' project's config is not read (\code{project_config()}).
 #'
 #' @param cwd Working directory for project config
 #' @return List with merged configuration
@@ -51,10 +52,8 @@ load_config <- function(cwd = getwd()) {
     global_path <- corteza_config_path("config.json")
     global <- load_config_file(global_path)
 
-    # Project config
-
-    project_path <- file.path(cwd, ".corteza", "config.json")
-    project <- load_config_file(project_path)
+    # Project config, from a trusted directory only.
+    project <- project_config(cwd)
 
     # Merge (project overrides global)
     config <- global
@@ -62,13 +61,23 @@ load_config <- function(cwd = getwd()) {
         config[[name]] <- project[[name]]
     }
     if (is.list(global$context_edit) && is.list(project$context_edit)) {
-        config$context_edit <- utils::modifyList(global$context_edit, project$context_edit)
+        config$context_edit <- utils::modifyList(global$context_edit,
+            project$context_edit)
+    }
+    # Who approves the agent's calls is the user's to choose, never the
+    # project's: a project's "review" is ignored (R/review.R), and the
+    # user's own setting stands.
+    if (identical(project$approval_mode, "review")) {
+        config$approval_mode <- global$approval_mode
     }
 
     # Apply defaults
     if (is.null(config$context_files)) {
         config$context_files <- character(0)
     }
+    # From an untrusted directory, a context file named through the
+    # project does not load: the name is the user's, the content is not.
+    config$context_files <- project_context_files(cwd, config$context_files)
     if (is.null(config$provider)) {
         config$provider <- "anthropic"
     }
@@ -89,6 +98,17 @@ load_config <- function(cwd = getwd()) {
     # Auto-compaction threshold (percentage)
     if (is.null(config$context_compact_pct)) {
         config$context_compact_pct <- 90L
+    }
+    # A cap on that threshold in tokens, and the idle trigger
+    # (R/compact-trigger.R). 0 turns either off.
+    if (is.null(config$context_compact_tokens)) {
+        config$context_compact_tokens <- CONTEXT_COMPACT_TOKENS
+    }
+    if (is.null(config$context_idle_minutes)) {
+        config$context_idle_minutes <- CONTEXT_IDLE_MINUTES
+    }
+    if (is.null(config$context_idle_tokens)) {
+        config$context_idle_tokens <- CONTEXT_IDLE_TOKENS
     }
     # The Codex Responses transport can reject a provider-native history on
     # serialized request size before the model's token window is full. This is
@@ -112,7 +132,7 @@ load_config <- function(cwd = getwd()) {
     }
     # Tool approval settings
     if (is.null(config$approval_mode)) {
-        config$approval_mode <- "ask" # "ask", "allow", "deny"
+        config$approval_mode <- "ask" # "ask", "allow", "deny", "review"
     }
     if (is.null(config$dangerous_tools)) {
         config$dangerous_tools <- default_dangerous_tools()
@@ -131,18 +151,11 @@ load_config <- function(cwd = getwd()) {
     }
     # Note: allowed_paths is NULL by default (no restriction)
 
-    # Skill paths (additional directories to load skills from)
-    if (is.null(config$skill_paths)) {
-        config$skill_paths <- character()
-    }
-
-    # Default skill packages (R packages registered as tools)
+    # R package functions registered as tools: none unless the config
+    # lists them. Each entry names the class of its functions, which
+    # decides who approves a call (R/policy.R).
     if (is.null(config$skill_packages)) {
-        config$skill_packages <- list(
-                                      list(package = "base", functions = c("file.exists", "file.copy",
-                    "file.remove", "dir.create", "Sys.glob")),
-                                      list(package = "utils", functions = c("read.csv", "head", "tail"))
-        )
+        config$skill_packages <- list()
     }
 
     # Default timeout for skill execution (seconds)
@@ -179,13 +192,18 @@ load_config <- function(cwd = getwd()) {
         .context_edit_config()
     })
 
-    # Legacy memory tools (slash commands /remember /recall /flush)
-    if (is.null(config$legacy_memory_tools_enabled)) {
-        config$legacy_memory_tools_enabled <- FALSE
-    }
-    # Auto-flush memories before context compaction
+    # Flush memories ahead of an automatic compaction. Off unless a
+    # config turns it on: the flush is a model request of its own that
+    # writes memory/YYYY-MM-DD.md, and nothing reads those notes by
+    # default. /flush runs it by hand either way.
     if (is.null(config$memory_flush_enabled)) {
-        config$memory_flush_enabled <- TRUE
+        config$memory_flush_enabled <- FALSE
+    }
+    # The task list: the task_create and task_update tools and the
+    # text that tells the model how to use them (R/tasks.R). Off unless
+    # a config turns it on.
+    if (is.null(config$task_list_enabled)) {
+        config$task_list_enabled <- FALSE
     }
     # Prompt sent to the model during the pre-compaction memory flush.
     if (is.null(config$memory_flush_prompt)) {
@@ -228,12 +246,6 @@ load_config <- function(cwd = getwd()) {
         }
     }
 
-    # Rate limits per provider
-    # Example: { "anthropic": { "tokens_per_hour": 100000, "requests_per_minute": 60 } }
-    if (is.null(config$rate_limits)) {
-        config$rate_limits <- list()
-    }
-
     # Subagent configuration
     if (is.null(config$subagents)) {
         config$subagents <- list()
@@ -265,13 +277,6 @@ load_config <- function(cwd = getwd()) {
     }
     if (is.null(sub$mcp_spend_cap_tokens)) {
         sub$mcp_spend_cap_tokens <- NA_integer_
-    }
-    if (is.null(sub$default_tools)) {
-        sub$default_tools <- c("base::readLines", "base::writeLines",
-                               "bash", "skill_instructions", "grep_files")
-    }
-    if (is.null(sub$base_port)) {
-        sub$base_port <- 7851L
     }
     # Child context compaction. Working subagents (not archive holders)
     # may compact their own in-memory history when it grows past the
@@ -357,43 +362,5 @@ load_config <- function(cwd = getwd()) {
              call. = FALSE)
     }
 
-    # Workspace config (managed runtime state)
-    if (is.null(config$workspace)) {
-        config$workspace <- list()
-    }
-    ws <- config$workspace
-    if (is.null(ws$enabled)) {
-        ws$enabled <- TRUE
-    }
-    if (is.null(ws$budget_chars)) {
-        ws$budget_chars <- 32000L
-    }
-    if (is.null(ws$capture_results)) {
-        ws$capture_results <- TRUE
-    }
-    if (is.null(ws$max_result_size)) {
-        ws$max_result_size <- 50000L
-    }
-    if (is.null(ws$scan_globalenv)) {
-        ws$scan_globalenv <- TRUE
-    }
-    if (is.null(ws$scan_max_bytes)) {
-        ws$scan_max_bytes <- 52428800L # 50MB
-    }
-    if (is.null(ws$max_object_summary_chars)) {
-        ws$max_object_summary_chars <- 2000L
-    }
-    config$workspace <- ws
-
     config
-}
-
-#' Get context files from config
-#'
-#' @param cwd Working directory
-#' @return Character vector of context file names to look for
-#' @noRd
-get_context_files <- function(cwd = getwd()) {
-    config <- load_config(cwd)
-    config$context_files
 }

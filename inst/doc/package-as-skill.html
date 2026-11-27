@@ -262,9 +262,16 @@ at <code>tools::R_user_dir(&quot;corteza&quot;, &quot;config&quot;)/config.json<
 packages, the object form picks specific functions:</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;skill_packages&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;package&quot;</span><span class="fu">:</span> <span class="st">&quot;fortunes&quot;</span><span class="fu">,</span> <span class="dt">&quot;functions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;fortune&quot;</span><span class="ot">]</span><span class="fu">}</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;package&quot;</span><span class="fu">:</span> <span class="st">&quot;fortunes&quot;</span><span class="fu">,</span> <span class="dt">&quot;functions&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;fortune&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="dt">&quot;class&quot;</span><span class="fu">:</span> <span class="st">&quot;read&quot;</span><span class="fu">}</span></span>
 <span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
 <span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p><code>class</code> says what the functions do: <code>&quot;read&quot;</code>,
+<code>&quot;write&quot;</code> or <code>&quot;exec&quot;</code>. It decides who approves a
+call. A read runs; a write or an exec asks, and plan mode refuses it. An
+entry without a class, and the string form, leave each function asking
+before every call, since nothing says what it touches. Name a class only
+for what every function of the entry does, and give functions that
+differ entries of their own.</p>
 <h2 id="use">Use</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>corteza<span class="sc">::</span><span class="fu">chat</span>()</span></code></pre></div>
 <p>The startup banner shows the tool count climbing —
@@ -333,8 +340,15 @@ because its URL no longer resolves reliably.</li>
 <code>Rscript --vanilla -e &#39;saber::pkg_help(&quot;fortune&quot;, &quot;fortunes&quot;)&#39;</code>.</li>
 <li>For your own functions, drop an <code>.R</code> file in
 <code>&lt;project&gt;/.corteza/skills/</code> calling
-<code>register_skill_from_fn(&quot;name&quot;, my_fn)</code>. Loaded on every
-session start, no installation required.</li>
+<code>register_skill(skill_spec(&quot;name&quot;, &quot;What it does.&quot;, params = list(), handler = function(args, ctx) ok(&quot;done&quot;), class = &quot;read&quot;))</code>.
+Loaded on every session start in a directory you have trusted
+(<code>/trust yes</code>), no installation required. Without
+<code>class</code>, each call asks. The tool belongs to the sessions
+started in that directory: a bot’s other rooms, in the same R process,
+do not see it. A name already taken, by a built-in tool or by one of
+your own skills in
+<code>tools::R_user_dir(&quot;corteza&quot;, &quot;data&quot;)/skills/</code>, is skipped,
+and the session says so when it starts.</li>
 </ul>
 </body>
 </html>

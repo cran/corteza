@@ -360,12 +360,18 @@ loading on them.</p>
 </tr>
 </tbody>
 </table>
+<p>The project folder is read in a trusted directory only: send
+<code>/trust yes</code> there, or see “Trusted projects” in
+<code>vignette(&quot;configuration&quot;)</code>.</p>
 <p>Discovery is recursive and includes only files named exactly
-<code>SKILL.md</code>. Names do not override each other: lookup uses the
-stable id derived from the configured root id plus the skill directory’s
-relative path. Additional roots are configured explicitly through
-<code>instruction_roots</code>; corteza does not scan
-<code>~/skills</code> implicitly.</p>
+<code>SKILL.md</code>. It skips dot-prefixed subdirectories such as
+<code>.archive/</code>, including inside linked directories. You can
+still name a hidden directory as a root. A discovered skill can also
+have resources in hidden subdirectories. Names do not override each
+other: lookup uses the stable id derived from the configured root id
+plus the skill directory’s relative path. Additional roots are
+configured explicitly through <code>instruction_roots</code>; corteza
+does not scan <code>~/skills</code> implicitly.</p>
 <p>A symlink directly under a configured root may point at a skill
 directory elsewhere, such as a package’s
 <code>inst/skills/&lt;skill&gt;</code>. corteza walks that target as an

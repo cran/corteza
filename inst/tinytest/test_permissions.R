@@ -1,13 +1,17 @@
+# Slow. Skipped on CRAN for check time; CI sets NOT_CRAN.
+if (!tinytest::at_home() && !identical(Sys.getenv("NOT_CRAN"), "true")) {
+    exit_file("slow; runs at home and in CI")
+}
+
 # Test permission system
 
-# Test get_tool_permission with defaults
+# get_tool_permission is a tool's permissions entry, or NULL. It allows
+# nothing by itself: what a tool with no entry gets is the policy table's.
 config <- list()
-expect_equal(corteza:::get_tool_permission("bash", config), "ask")
-expect_equal(corteza:::get_tool_permission("base::writeLines", config), "ask")
-expect_equal(corteza:::get_tool_permission("base::readLines", config), "allow")
-expect_equal(corteza:::get_tool_permission("grep_files", config), "allow")
+expect_null(corteza:::get_tool_permission("bash", config))
+expect_null(corteza:::get_tool_permission("base::readLines", config))
+expect_null(corteza:::get_tool_permission("grep_files", config))
 
-# Test get_tool_permission with per-tool config
 config <- list(
     permissions = list(
         bash = "deny",
@@ -16,26 +20,22 @@ config <- list(
 )
 expect_equal(corteza:::get_tool_permission("bash", config), "deny")
 expect_equal(corteza:::get_tool_permission("base::readLines", config), "ask")
-expect_equal(corteza:::get_tool_permission("base::writeLines", config), "ask")  # Falls back
+expect_null(corteza:::get_tool_permission("base::writeLines", config))
+expect_null(corteza:::get_tool_permission("bash",
+                                          list(permissions = list(bash = 1))))
 
-# Test get_tool_permission with custom dangerous tools
-config <- list(
-    dangerous_tools = c("custom_tool"),
-    approval_mode = "deny"
-)
-expect_equal(corteza:::get_tool_permission("custom_tool", config), "deny")
-expect_equal(corteza:::get_tool_permission("bash", config), "allow")  # Not in list
-
-# Test requires_approval
-config <- list()
-expect_true(corteza:::requires_approval("bash", config))
-expect_true(corteza:::requires_approval("run_r", config))
-expect_false(corteza:::requires_approval("base::readLines", config))
-
-# Test is_tool_denied
-config <- list(permissions = list(bash = "deny"))
-expect_true(corteza:::is_tool_denied("bash", config))
-expect_false(corteza:::is_tool_denied("base::readLines", config))
+# dangerous_tools and approval_mode make no entry of their own.
+config <- list(dangerous_tools = c("custom_tool"), approval_mode = "deny")
+expect_null(corteza:::get_tool_permission("custom_tool", config))
+# Through policy(): the listed tool and the unclassified one both ask,
+# and approval_mode "deny" refuses both. bash is a command, whether or
+# not the list names it.
+verdict <- function(tool) {
+    corteza::policy(list(tool = tool, channel = "cli"), config)$approval
+}
+expect_equal(verdict("custom_tool"), "deny")
+expect_equal(verdict("bash"), "deny")
+expect_equal(verdict("grep_files"), "allow")
 
 # Test normalize_path_for_check
 path <- corteza:::normalize_path_for_check("~")
@@ -82,14 +82,6 @@ result <- corteza:::validate_path("", list())
 expect_false(result$ok)
 
 result <- corteza:::validate_path(NULL, list())
-expect_false(result$ok)
-
-# Test validate_paths
-config <- list(denied_paths = c("/etc"))
-result <- corteza:::validate_paths(c("/home/user/a", "/home/user/b"), config)
-expect_true(result$ok)
-
-result <- corteza:::validate_paths(c("/home/user/a", "/etc/passwd"), config)
 expect_false(result$ok)
 
 # Test validate_command

@@ -79,7 +79,9 @@ default_local_model <- function() {
 #' calling \code{\link{turn}}.
 #'
 #' @param channel Character, one of "cli", "console", "matrix".
-#' @param history List of prior messages, or NULL.
+#' @param history List of prior messages, or NULL. Thinking blocks are
+#'   removed from it: a provider accepts one only in the conversation
+#'   that produced it.
 #' @param model_map Named list with \code{cloud} and \code{local} model
 #'   names. Defaults to configured defaults.
 #' @param provider LLM provider passed to \code{llm.api::agent}.
@@ -91,10 +93,11 @@ default_local_model <- function() {
 #' @param max_turns Maximum LLM turns per call.
 #' @param verbose Print tool call progress.
 #' @param plan_mode Logical. When TRUE, the session is in plan mode:
-#'   the LLM is told to research and propose without acting, the policy
-#'   engine denies write/exec tool calls (except \code{exit_plan_mode}),
-#'   and \code{exit_plan_mode} is added to the tool list. A successful
-#'   \code{exit_plan_mode} call flips this back to FALSE.
+#'   the next prompt opens with a note telling the LLM to research and
+#'   propose without acting, and the policy engine denies write/exec
+#'   tool calls. \code{exit_plan_mode} is in the tool list of a session
+#'   that can be in plan mode, whatever its mode, so the list stays the
+#'   same; a successful call flips this back to FALSE.
 #' @param web_search Logical or NULL. When TRUE and the provider
 #'   supports it, \code{\link{turn}} enables \code{llm.api::agent}'s
 #'   provider-native (server-side) web search for the session: the
@@ -138,8 +141,14 @@ default_local_model <- function() {
 #' @param cache Character or NULL. Anthropic prompt-cache TTL:
 #'   \code{"none"}, \code{"5m"} or \code{"1h"}. Anthropic-only, and
 #'   dropped for other providers so they never see a field their wire
-#'   rejects. NULL falls back to \code{config$cache}, then llm.api's
-#'   default (\code{"none"}). Caching is a billing setting, not a
+#'   rejects. NULL falls back to \code{config$cache}. Where neither
+#'   sets one, a session on an Anthropic provider caches for 5 minutes
+#'   (\code{"5m"}), including sessions that edit their own context.
+#'   \code{"none"} turns the cache off. A 5-minute write is billed at
+#'   1.25 times an uncached input token and a read at a tenth or less:
+#'   a request with none before it in the last 5 minutes costs a quarter
+#'   more on its input, and each request after it in that time costs
+#'   far less. Caching is a billing setting, not a
 #'   behavioural one: the model receives byte-identical input either
 #'   way, so turning it on cannot change a result. llm.api (>= 0.1.9.6,
 #'   the Imports floor) marks both the system prompt and the tail of the
@@ -149,7 +158,8 @@ default_local_model <- function() {
 #'   the input bill. The floor is there because an older llm.api marks
 #'   the system prompt alone and would silently deliver a fraction of
 #'   that with this set. \code{turn()$usage} reports what was read and
-#'   written.
+#'   written. Anthropic leaves cached input out of \code{input_tokens};
+#'   \code{total_tokens} counts it.
 #' @param compaction_prompt Character or NULL. Optional domain-specific
 #'   instructions for summarizing older history during context compaction.
 #'   NULL uses corteza's general coding-agent summary brief. The prompt
@@ -189,7 +199,12 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 
     s <- new.env(parent = emptyenv())
     s$channel <- channel
-    s$history <- history
+    # A history handed to a new session came from another conversation,
+    # with its own system text and tools, so its thinking blocks would be
+    # refused here (R/history-replace.R).
+    s$history <- if (!is.null(history)) {
+        history_strip_thinking(history)$history
+    }
     s$model_map <- model_map
     s$provider <- provider
     s$tools_filter <- tools_filter
@@ -389,11 +404,26 @@ new_session <- function(channel = c("cli", "console", "matrix"),
                             "session/config reasoning_effort")
 }
 
+# The prompt cache of a session that sets none, on an Anthropic
+# provider. A 5-minute write costs 1.25 times an uncached token and a
+# read a tenth or less, so it pays from the second request that starts
+# inside 5 minutes of the one before it, which every tool loop has.
+.cache_default <- "5m"
+
 # Resolve the prompt-cache TTL: explicit session field wins, then
-# config. NULL means "llm.api's default", which is "none".
+# config ("none" turns the cache off). Where neither sets one, a
+# session on an Anthropic provider gets .cache_default and any other
+# gets NULL, which leaves llm.api's default ("none") in place.
 .session_cache <- function(session) {
-    .check_cache(session$cache %||% session$config$cache,
-                 "session/config cache")
+    set <- .check_cache(session$cache %||% session$config$cache,
+                        "session/config cache")
+    if (!is.null(set)) {
+        return(set)
+    }
+    if (!(session$provider %||% "") %in% .anthropic_providers) {
+        return(NULL)
+    }
+    .cache_default
 }
 
 # Resolve the Anthropic extended-thinking budget. llm.api enforces the
@@ -527,6 +557,16 @@ new_session <- function(channel = c("cli", "console", "matrix"),
     invisible(NULL)
 }
 
+# The ids a call carries to a session's gate: the run-local alias
+# (`auto_call_id`), and the canonical id where the turn minted none
+# (a bare handler caller without a turn keeps the alias as its id).
+.gate_call_ids <- function(session, call) {
+    session$auto_call_seq <- (session$auto_call_seq %||% 0L) + 1L
+    call$auto_call_id <- sprintf("c%d", session$auto_call_seq)
+    call$call_id <- call$call_id %||% call$auto_call_id
+    call
+}
+
 .make_tool_handler <- function(session, tool_executor = NULL) {
     .secret_environment(session)
     .validate_tool_output_caps(session$config)
@@ -552,10 +592,14 @@ new_session <- function(channel = c("cli", "console", "matrix"),
             # embedded session rarely shares the process working
             # directory. Falls back to getwd() when the session
             # doesn't carry one.
-            call_skill(name, as.list(args),
-                       ctx = list(session = session, cwd = session$cwd %||% getwd()),
-                       timeout = session$config$skill_timeout %||% 30L,
-                       dry_run = session_dry_run())
+            # The handler that runs is the session's (R/tool-table.R),
+            # the one whose definition was offered. A tool that waits
+            # long asks this session whether to stop (R/tool-stop.R).
+            .tool_stop_with(session, call_skill(name, as.list(args),
+                    ctx = list(session = session,
+                               cwd = session$cwd %||% getwd()),
+                    timeout = session$config$skill_timeout %||% 30L,
+                    dry_run = session_dry_run(), table = session$tool_table))
         }
     }
     # A custom executor may need the provider's read-only call metadata to
@@ -604,6 +648,47 @@ new_session <- function(channel = c("cli", "console", "matrix"),
         internal_name <- unsanitize_tool_name(name)
         ids <- .audit_safe(.audit_tool_call(session, internal_name, args)) %||% list()
         .remote_check_stop(session)
+        # A stop asked for ends the turn before the call (R/turn-stop.R).
+        .turn_stop_check(session)
+        # A worker reads what its conversation allows before each call
+        # (R/job-authority.R). A record it cannot use refuses the call.
+        authority <- .authority_apply(session)
+        if (!isTRUE(authority$ok)) {
+            .audit_safe(.audit_tool_event(session, list(call = c(list(tool = internal_name), ids),
+                        outcome = "deny", decision = list(approval = "deny", reason = "job_authority"),
+                        success = FALSE)))
+            return(sprintf("[job policy denied: %s; nothing ran]",
+                           .sanitize_inline(authority$reason %||% "no reason given")))
+        }
+        # Plan mode is the conversation's, so a worker cannot end it.
+        if (identical(internal_name, "exit_plan_mode") &&
+            isTRUE(session$plan_mode_locked)) {
+            .audit_safe(.audit_tool_event(session, list(call = c(list(tool = internal_name), ids),
+                        outcome = "deny", decision = list(approval = "deny", reason = "plan_mode_locked"),
+                        success = FALSE)))
+            return(paste("[job policy denied: plan mode belongs to the",
+                         "conversation, and only the person can end it]"))
+        }
+        # The tool list stays the session's whatever its mode (WP14,
+        # R/request-prefix.R), so a call the mode rules out is refused
+        # here rather than hidden: exit_plan_mode outside plan mode, and
+        # what an /auto run may not call.
+        if (identical(internal_name, "exit_plan_mode") &&
+            !isTRUE(session$plan_mode)) {
+            .audit_safe(.audit_tool_event(session, list(call = c(list(tool = internal_name), ids),
+                        outcome = "deny", decision = list(approval = "deny", reason = "not_in_plan_mode"),
+                        success = FALSE)))
+            return("[exit_plan_mode refused: plan mode is not on, so there is nothing to exit]")
+        }
+        if (!is.null(session$auto_config) &&
+            !.auto_tool_allowed(internal_name, session$auto_config,
+                                session$tool_table, .prefix_tool(session, name))) {
+            .audit_safe(.audit_tool_event(session, list(call = c(list(tool = internal_name), ids),
+                        outcome = "deny", decision = list(approval = "deny", reason = "auto_scope"),
+                        success = FALSE)))
+            return(sprintf(paste("[refused during this /auto run: %s is outside what the",
+                                 "run may call; nothing ran]"), internal_name))
+        }
         if (!is.null(session$job_allowed_tools) &&
             !internal_name %in% session$job_allowed_tools) {
             .audit_safe(.audit_tool_event(session, list(call = c(list(tool = internal_name), ids),
@@ -616,14 +701,27 @@ new_session <- function(channel = c("cli", "console", "matrix"),
                      args = as.list(args),
                      channel = session$channel,
                      context = list(recent_classes = session$recent_classes,
-                                    plan_mode = isTRUE(session$plan_mode)),
+                                    plan_mode = isTRUE(session$plan_mode),
+                                    unbound = isTRUE(session$unbound)),
                      # Read-only per-call snapshot from llm.api::agent (NULL
                      # with a two-arg call or older llm.api): assistant_text,
                      # agent_turn, call_index, call_count, provider. Drives the
                      # approval rationale and the silent-streak narration guard.
                      model_context = context
         )
+        # The class and origin of the entry this call runs, from the
+        # session's table (R/tool-table.R). Every reader of the call
+        # asks these (call_class(), R/policy.R).
+        entry <- tool_entry(internal_name, session$tool_table)
+        call$class <- classify_op(internal_name, session$tool_table)
+        if (!is.null(entry)) {
+            call$origin <- tool_origin_kind(entry)
+        }
         call <- c(call, ids)
+        # A worker's plan mode is its conversation's (R/job-authority.R).
+        if (isTRUE(session$plan_mode_locked)) {
+            call$context$plan_mode_locked <- TRUE
+        }
 
         # Silent-streak narration guard: bookkeep once per model turn
         # (the first dispatched call of the batch, call_index == 1). A
@@ -737,14 +835,21 @@ new_session <- function(channel = c("cli", "console", "matrix"),
             text
         }
 
-        # Policy denial, attended path. In auto mode the same denial
-        # routes through the gate below instead -- not so the monitor
-        # can weigh in (it cannot; the gate's deny branch is mechanical
-        # and first) but so the denial leaves the same structured,
-        # call_id-carrying record as every other decision. The
-        # model-visible message is identical on both paths.
-        if (identical(decision$approval, "deny") &&
-            !is.function(session$auto_gate)) {
+        # Policy denial is final: nothing after policy() lifts it, a gate
+        # included, so the handler refuses here whatever a gate would
+        # answer. A session with a gate still shows it the call, so the
+        # denial leaves the same structured, call_id-carrying record as
+        # every other decision (an /auto run's decision log). Its answer
+        # is not read, and its failure changes nothing.
+        if (identical(decision$approval, "deny")) {
+            if (is.function(session$auto_gate)) {
+                call <- .gate_call_ids(session, call)
+                tryCatch(session$auto_gate(call, decision),
+                         error = function(e) NULL)
+                .audit_safe(.audit_tool_event(session, list(call = call,
+                            outcome = "gate", decision = list(action = "deny",
+                                reason = decision$reason))))
+            }
             return(outcome_text(
                                 "deny",
                                 nudge(sprintf("[corteza policy denied: %s]",
@@ -767,18 +872,13 @@ new_session <- function(channel = c("cli", "console", "matrix"),
         # here. A supervisor wired to approval_cb would be decorative
         # in exactly the repos people run this in.
         #
-        # So the gate sees every call that survived policy, whatever
-        # the verdict, and it is the thing that decides. It returns
+        # So the gate sees every call that survived policy, "allow"
+        # verdicts included, and it is the thing that decides. It returns
         # "proceed", "refuse" (tell the model no, keep the turn alive),
         # or "escalate" (abort the whole turn for a human).
         gate_approved <- FALSE
         if (is.function(session$auto_gate)) {
-            # Retain the run-local alias. The canonical call_id was minted
-            # before policy; bare handler callers without a turn keep the
-            # older alias as their ID.
-            session$auto_call_seq <- (session$auto_call_seq %||% 0L) + 1L
-            call$auto_call_id <- sprintf("c%d", session$auto_call_seq)
-            call$call_id <- call$call_id %||% call$auto_call_id
+            call <- .gate_call_ids(session, call)
             gate <- tryCatch(
                              session$auto_gate(call, decision),
                              # A gate that errored did not approve anything.
@@ -792,8 +892,9 @@ new_session <- function(channel = c("cli", "console", "matrix"),
             .audit_safe(.audit_tool_event(session, list(call = call,
                         outcome = "gate", decision = gate)))
             if (identical(action, "deny")) {
-                # Policy's verdict, surfaced through the gate purely so
-                # it was recorded; same message as the attended branch.
+                # A gate answers deny for a call policy() denied, which
+                # never gets here; one that answers it for another call
+                # is refused all the same.
                 return(outcome_text(
                                     "deny",
                                     nudge(sprintf("[corteza policy denied: %s]",
@@ -845,6 +946,33 @@ new_session <- function(channel = c("cli", "console", "matrix"),
             }
         }
 
+        # A worker reads its record again just before the call runs: the
+        # person may have changed a setting while it waited for an
+        # approval, and a call judged by the old settings does not run.
+        if (is.function(session$authority)) {
+            again <- .authority_apply(session)
+            if (!isTRUE(again$ok) || !identical(again$seq, authority$seq)) {
+                why <- if (isTRUE(again$ok)) {
+                    "the conversation's settings changed while this call waited"
+                } else {
+                    again$reason %||% "no reason given"
+                }
+                msg <- sprintf(paste("[job policy denied: %s; it did not run, and",
+                                     "a call made now meets the new settings]"),
+                               .sanitize_inline(why))
+                return(outcome_text("deny", nudge(msg), FALSE))
+            }
+        }
+
+        # A stop asked for while the call waited for the gate (a review,
+        # the monitor, a person in the room) or at the approval prompt
+        # ends the turn here, before the call runs (R/turn-stop.R).
+        if (.turn_stop_requested(session)) {
+            .audit_safe(.audit_tool_event(session, list(call = call,
+                        outcome = "stopped", success = FALSE)))
+            stop(.turn_stop_condition())
+        }
+
         .fire_observers(session, list(
                                       call = call,
                                       decision = decision,
@@ -862,6 +990,8 @@ new_session <- function(channel = c("cli", "console", "matrix"),
         success <- !isTRUE(raw$isError)
         if (identical(internal_name, "exit_plan_mode") && isTRUE(success)) {
             session$plan_mode <- FALSE
+            # The result told the model, so the next prompt does not.
+            .prefix_seen_set(session, "plan_mode", FALSE)
         }
         result_text <- nudge(.admit_tool_result_for(
                 session, .flatten_mcp_result(raw), internal_name))
@@ -872,8 +1002,7 @@ new_session <- function(channel = c("cli", "console", "matrix"),
 }
 
 # Silent-streak narration guard -------------------------------------
-# corteza-owned and session-scoped (never the package-global .heartbeat,
-# which can't serve concurrent console/Matrix/subagent sessions). Uses
+# Each session counts its own silent turns, using
 # the llm.api per-call context snapshot (call$model_context): a model
 # turn is "silent" when it made tool calls with no assistant narration.
 # Keyed on call_index == 1 so a multi-call batch counts once; the nudge
@@ -1141,6 +1270,26 @@ observer_progress <- function() {
 #' their actual model/provider; API-key fallbacks carry a prominent billable
 #' usage warning. Errors that are not limits are rethrown untouched.
 #'
+#' A program that runs turns for someone else can let them stop one. It
+#' sets \code{session$stop_requested} to a function of no arguments that
+#' returns \code{TRUE} once a stop is asked for. The turn asks it before
+#' each request to the model, before each tool call, again just before the
+#' call runs (a call can wait for an approval or a review in between) and,
+#' when the turn streams (\code{session$on_delta}), before each piece of
+#' the reply goes out. A stop ends the turn with status
+#' \code{cancelled}: a tool call that got no result is given a
+#' placeholder, and the history ends on a note that the turn was stopped,
+#' so the next turn can go on from it. A stop cannot cut short a request
+#' already waiting for its first word, nor the reply of a provider that
+#' does not stream.
+#'
+#' A turn that ends on an error leaves a history the next request can
+#' use. Before the error leaves \code{turn()}, each tool call the model
+#' made that has no result gets a placeholder result, and a note says
+#' the turn stopped on that error. A turn also closes, before its first
+#' request, any call that an earlier turn or an earlier process left
+#' without a result.
+#'
 #' @param prompt Character. User prompt.
 #' @param session A session environment created by \code{\link{new_session}}.
 #' @param tool_executor Function or NULL. Dispatcher with signature
@@ -1180,15 +1329,26 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
         if (is.environment(session)) session$.audit_turn <- previous
         .audit_runtime$active <- previous_active
     }, add = TRUE)
+    # A call mirrored into the history before an error has no result,
+    # and the provider refuses every request made from a history that
+    # holds one (R/turn-repair.R).
+    on_error <- function(e) {
+        .turn_close_open_calls(session, .turn_error_marker(e), "turn_error")
+        .audit_safe(.audit_turn_end(session, audit, condition = e))
+    }
+    on_interrupt <- function(e) {
+        .audit_safe(.audit_turn_end(session, audit, condition = e))
+    }
     result <- withCallingHandlers(
                                   .turn_impl(prompt, session, tool_executor, tools),
-                                  error = function(e) .audit_safe(.audit_turn_end(session, audit,
-                condition = e)),
-                                  interrupt = function(e) .audit_safe(.audit_turn_end(session, audit, condition = e)))
+                                  error = on_error,
+                                  interrupt = on_interrupt)
     .audit_safe(.audit_turn_end(session, audit, result))
     if (!is.null(audit) && isTRUE(audit$request_seen)) {
         result$usage_coverage <- .audit_request_coverage(audit)
-        if (identical(result$usage_coverage, "complete")) result$usage <- audit$request_usage
+        if (identical(result$usage_coverage, "complete")) {
+            result$usage <- audit$request_usage
+        }
     }
     result$audit <- if (!is.null(audit)) audit$ref
     result
@@ -1212,18 +1372,12 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     session$silent_streak <- 0L
     .progress_reset(session)
 
-    if (is.null(tools)) {
-        ensure_skills()
-        tools <- skills_as_api_tools(session$tools_filter)
-    }
-    tools <- .plan_mode_filter_tools(tools, isTRUE(session$plan_mode))
-    tools <- .task_filter_tools(tools, session$channel)
-    tools <- .talker_filter_tools(tools, isTRUE(session$talker))
-    tools <- .context_edit_tools(tools, session)
-    tools <- .delegation_tools(tools, session)
-    tools <- .room_consult_tools(tools, session)
-    tools <- .room_media_tools(tools, session)
-    tools <- .auto_filter_tools(tools, session$auto_config)
+    # The system text and tools are the session's, composed once
+    # (R/request-prefix.R, WP14): plan mode, an /auto run and the task
+    # list change neither. A context-editing session edits what it sends
+    # on every turn, the stated exception.
+    prefix <- session_request_prefix(session, tools)
+    tools <- .context_edit_tools(prefix$tools, session)
 
     # Provider-native (server-side) web search: enable it when the session
     # asks for it (default on), the provider supports it, and the llm.api
@@ -1233,15 +1387,9 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     # supersedes Tavily for supported providers; local models (ollama) keep
     # the Tavily tool as their only web search.
     ws <- .session_web_search(session)
-    ws_active <- !identical(ws, FALSE) &&
-    .web_search_supported(session$provider) &&
-    "web_search" %in% names(formals(llm.api::agent))
+    ws_active <- .session_ws_active(session, ws)
     tools <- .drop_redundant_web_search(tools, ws_active)
-    system <- .plan_mode_compose_system(session$system,
-                                        isTRUE(session$plan_mode))
-    system <- task_compose_system(system, session$tasks %||% list(),
-                                  channel = session$channel,
-                                  auto = !is.null(session$auto_run_id))
+    system <- prefix$system
     session$context_edit_base_system <- system
     system <- .context_edit_system(system, session)
     session$context_edit_system <- system
@@ -1258,22 +1406,45 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     compact_session_history <- function(history, force = FALSE,
                                         reason = "threshold") {
         session$history <- history %||% list()
-        args <- list(
-                     session = session,
-                     config = compact_config,
-                     kind = session$kind %||% NULL,
-                     tools = tools,
-                     system = system,
-                     reason = reason
-        )
+        args <- list(session = session, config = compact_config,
+                     kind = session$kind %||% NULL, tools = tools,
+                     system = system, reason = reason)
         if (isTRUE(force)) {
             args$threshold <- 0
             args$min_messages <- 2L
         }
-        isTRUE(do.call(maybe_compact_turn_session, args))
+        isTRUE(.with_context_route(session, function() {
+            do.call(maybe_compact_turn_session, args)
+        }))
     }
+    # A call left without its result (a turn that ended on an error, a
+    # process stopped mid-call, a history restored from either) fails the
+    # first request and every turn after it. Close it before anything
+    # reads the history; compaction will not touch one that has it.
+    .turn_close_open_calls(session, .open_calls_marker(), "open_calls")
     .context_edit_prepare(session)
-    compact_session_history(session$history %||% list(), reason = "preflight")
+
+    # A stop asked for ends the run (R/turn-stop.R). The repair after it
+    # is scoped to what the run adds to the history.
+    pre_turn_len <- length(session$history %||% list())
+    stopped <- FALSE
+    note_stop <- function() stopped <<- TRUE
+
+    # A change of mode or of the task list reaches the model as a note at
+    # the head of this prompt (R/request-prefix.R); after the preflight
+    # compaction, which may have taken earlier notes with it. What the
+    # model was told is recorded once the prompt is in the history, so a
+    # turn that fails before that says it again next time. A NULL prompt
+    # continues the history and carries no note: the next prompt does.
+    noted <- .prefix_notes(session)
+    pending_seen <- if (!is.null(prompt)) noted$seen
+    prompt <- .prefix_prompt(prompt, noted$notes)
+    seen_now <- function() {
+        if (!is.null(pending_seen)) {
+            session$.prefix_seen <- pending_seen
+            pending_seen <<- NULL
+        }
+    }
 
     # Pass a history_callback to llm.api so session$history mirrors
     # intermediate state continuously: after each assistant message
@@ -1298,8 +1469,18 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
                        verbose = session$verbose,
                        history = session$history
     )
+    # Whether llm.api has handed a history back in this turn. It has once
+    # the model's first reply is in, and from then on session$history
+    # holds the prompt and the result of every tool that ran. A recovery
+    # reads this, never the history's length: a compaction inside the
+    # loop makes a longer run shorter.
+    turn_mirrored <- FALSE
     if ("history_callback" %in% names(formals(llm.api::agent))) {
         agent_args$history_callback <- function(history) {
+            turn_mirrored <<- TRUE
+            seen_now()
+            # What the idle trigger measures from (R/compact-trigger.R).
+            session$last_response_at <- Sys.time()
             session$history <- history
             .context_room_record(session)
             # The journal's live snapshot follows the mirror, so what the
@@ -1310,7 +1491,8 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     }
     attempt_checkpoint_usage <- list()
     if ("request_callback" %in% names(formals(llm.api::agent))) {
-        agent_args$request_callback <- .audit_request_callback(session, session$.audit_turn)
+        agent_args$request_callback <- .turn_request_callback(session,
+            .audit_request_callback(session, session$.audit_turn))
     }
     attempt_checkpoint_turns <- 0L
     if ("checkpoint_callback" %in% names(formals(llm.api::agent))) {
@@ -1329,6 +1511,9 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
                 as.integer(context$agent_turn %||% 0L))
             compacted <- compact_session_history(history, reason = "checkpoint")
             edited <- .context_edit_checkpoint(session)
+            if (isTRUE(session$.protect_review_inputs)) {
+                .review_check_size(session, session$history)
+            }
             if (compacted || edited) {
                 return(list(history = session$history))
             }
@@ -1343,7 +1528,8 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     if (is.function(session$on_delta) &&
         "on_delta" %in% names(formals(llm.api::agent))) {
         redacted_stream <- .redact_stream(session$on_delta, function() session$secret_values)
-        agent_args$on_delta <- redacted_stream$push
+        agent_args$on_delta <- .turn_stop_sink(session, redacted_stream$push,
+            note_stop)
     }
 
     if (ws_active) {
@@ -1429,45 +1615,74 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     call_agent <- function(args) {
         attempt_checkpoint_usage <<- list()
         attempt_checkpoint_turns <<- 0L
-        tryCatch(.agent_with_fallback(args, session), error = function(e) e)
+        tryCatch(.agent_with_fallback(args, session,
+            .prepare = function(args) .prepare_route_context(args, session, compact_config)),
+            error = function(e) e)
     }
+    # A provider that enforces preserved thinking refuses a request that
+    # replays a thinking block after the system text, the tool set or an
+    # earlier message changed, and refuses every retry of it. The answer
+    # is to remove the thinking blocks for good and go on
+    # (R/history-replace.R). Once a turn: a second refusal has another
+    # cause, and is raised.
+    thinking_recovered <- FALSE
     call_agent_request_safe <- function(args) {
         recovered_usage <- list()
         recovered_turns <- 0L
         request_buffer_retries <- 0L
+        thinking_removed <- 0L
         max_turns <- as.integer(args$max_turns)
         response <- call_agent(args)
-        while (inherits(response, "error") &&
-            .is_request_buffer_error(response)) {
-            if (request_buffer_retries >= max_request_buffer_retries) {
-                stop(response)
-            }
-            if (!compact_session_history(session$history, force = TRUE,
-                    reason = "request_buffer_overflow")) {
+        while (inherits(response, "error")) {
+            if (.is_request_buffer_error(response)) {
+                if (request_buffer_retries >= max_request_buffer_retries) {
+                    stop(response)
+                }
+                if (!compact_session_history(session$history, force = TRUE,
+                        reason = "request_buffer_overflow")) {
+                    stop(response)
+                }
+                request_buffer_retries <- request_buffer_retries + 1L
+            } else if (!thinking_recovered &&
+                .is_bound_thinking_error(response)) {
+                thinking_removed <- .bound_thinking_recover(session, response)
+                if (thinking_removed == 0L) {
+                    stop(response)
+                }
+                thinking_recovered <<- TRUE
+            } else {
                 stop(response)
             }
             recovered_usage <- .turn_add_usage(recovered_usage,
                 attempt_checkpoint_usage)
             recovered_turns <- recovered_turns + attempt_checkpoint_turns
-            request_buffer_retries <- request_buffer_retries + 1L
-            # Preserve a named NULL: llm.api treats it as continuation and
-            # does not append the original user prompt a second time.
-            args["prompt"] <- list(NULL)
+            # Continue, never replay: the model call wraps the whole agent
+            # loop, so sending the prompt again after tools have run would
+            # run them again. Once llm.api has mirrored a history, the
+            # prompt and every result are in session$history, and a named
+            # NULL prompt tells llm.api to go on from there. Before that,
+            # nothing has run and the history holds no prompt, so the
+            # prompt goes out as it is.
+            if (turn_mirrored) {
+                args["prompt"] <- list(NULL)
+            }
             args$history <- session$history
             args$max_turns <- max(1L, max_turns - recovered_turns)
             response <- call_agent(args)
         }
-        if (inherits(response, "error")) {
-            stop(response)
-        }
-        if (request_buffer_retries > 0L) {
+        if (request_buffer_retries > 0L || thinking_removed > 0L) {
             response$usage <- .turn_add_usage(recovered_usage, response$usage)
             response$turns <- recovered_turns +
             as.integer(response$turns %||% 0L)
+        }
+        if (request_buffer_retries > 0L) {
             response$corteza_request_buffer_retries <-
             request_buffer_retries
             response$corteza_overflow_retry <- TRUE
             response$corteza_overflow_recovered <- TRUE
+        }
+        if (thinking_removed > 0L) {
+            response$corteza_thinking_removed <- thinking_removed
         }
         response
     }
@@ -1475,7 +1690,7 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
         .recover_output(call_agent_request_safe(args), args, session,
                         call_agent_request_safe)
     }
-    response <- call_agent_output_safe(agent_args)
+    response <- .turn_stop_catch(call_agent_output_safe(agent_args), note_stop)
 
     # Pi pairs proactive threshold compaction with one compact-and-retry on an
     # actual context overflow. llm.api deliberately excludes the incomplete
@@ -1502,7 +1717,8 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
             retry_args$max_turns <- max(
                                         1L, as.integer(agent_args$max_turns) -
                                         as.integer(overflow_response$turns %||% 0L))
-            response <- call_agent_output_safe(retry_args)
+            response <- .turn_stop_catch(call_agent_output_safe(retry_args),
+                note_stop)
             response$usage <- .turn_add_usage(overflow_response$usage,
                 response$usage)
             response$turns <- as.integer(overflow_response$turns %||% 0L) +
@@ -1515,6 +1731,10 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
             as.integer(overflow_response$corteza_request_buffer_retries %||%
                        0L) +
             as.integer(response$corteza_request_buffer_retries %||% 0L)
+            if (!is.null(overflow_response$corteza_thinking_removed)) {
+                response$corteza_thinking_removed <-
+                overflow_response$corteza_thinking_removed
+            }
             response$corteza_overflow_retry <- TRUE
             response$corteza_overflow_recovered <- !(
                 isTRUE(response$truncated) &&
@@ -1526,6 +1746,15 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
 
     if (!is.null(response$history)) {
         session$history <- response$history
+        # An llm.api without history_callback mirrors nothing mid-turn.
+        seen_now()
+    }
+    # Stopped: the history as last mirrored, each call that got no result
+    # given a placeholder, and the interrupt marker after it, as the
+    # terminal leaves it after Ctrl+C.
+    if (stopped) {
+        apply_exit_marker(session, prompt, pre_turn_len,
+                          user_interrupt_marker())
     }
     reply <- .fallback_reply(response)
     if (.output_keep_reply(session, response, reply)) {
@@ -1533,7 +1762,9 @@ turn <- function(prompt, session, tool_executor = NULL, tools = NULL) {
     }
     .context_room_snapshot(session)
 
-    if (exists("redacted_stream", inherits = FALSE)) {
+    # Nothing more reaches the sink after a stop: what it held back to
+    # check for secrets is in the reply.
+    if (exists("redacted_stream", inherits = FALSE) && !stopped) {
         redacted_stream$flush()
     }
     termination <- .turn_termination(response)

@@ -27,7 +27,9 @@ new_session(
 \arguments{
 \item{channel}{Character, one of "cli", "console", "matrix".}
 
-\item{history}{List of prior messages, or NULL.}
+\item{history}{List of prior messages, or NULL. Thinking blocks are
+removed from it: a provider accepts one only in the conversation
+that produced it.}
 
 \item{model_map}{Named list with \code{cloud} and \code{local} model
 names. Defaults to configured defaults.}
@@ -47,10 +49,11 @@ denies (safe fallback).}
 \item{verbose}{Print tool call progress.}
 
 \item{plan_mode}{Logical. When TRUE, the session is in plan mode:
-the LLM is told to research and propose without acting, the policy
-engine denies write/exec tool calls (except \code{exit_plan_mode}),
-and \code{exit_plan_mode} is added to the tool list. A successful
-\code{exit_plan_mode} call flips this back to FALSE.}
+the next prompt opens with a note telling the LLM to research and
+propose without acting, and the policy engine denies write/exec
+tool calls. \code{exit_plan_mode} is in the tool list of a session
+that can be in plan mode, whatever its mode, so the list stays the
+same; a successful call flips this back to FALSE.}
 
 \item{web_search}{Logical or NULL. When TRUE and the provider
 supports it, \code{\link{turn}} enables \code{llm.api::agent}'s
@@ -100,8 +103,14 @@ providers only. Must be at least 1024 and below
 \item{cache}{Character or NULL. Anthropic prompt-cache TTL:
 \code{"none"}, \code{"5m"} or \code{"1h"}. Anthropic-only, and
 dropped for other providers so they never see a field their wire
-rejects. NULL falls back to \code{config$cache}, then llm.api's
-default (\code{"none"}). Caching is a billing setting, not a
+rejects. NULL falls back to \code{config$cache}. Where neither
+sets one, a session on an Anthropic provider caches for 5 minutes
+(\code{"5m"}), including sessions that edit their own context.
+\code{"none"} turns the cache off. A 5-minute write is billed at
+1.25 times an uncached input token and a read at a tenth or less:
+a request with none before it in the last 5 minutes costs a quarter
+more on its input, and each request after it in that time costs
+far less. Caching is a billing setting, not a
 behavioural one: the model receives byte-identical input either
 way, so turning it on cannot change a result. llm.api (>= 0.1.9.6,
 the Imports floor) marks both the system prompt and the tail of the
@@ -111,7 +120,8 @@ for what was appended since; on a long tool loop that is most of
 the input bill. The floor is there because an older llm.api marks
 the system prompt alone and would silently deliver a fraction of
 that with this set. \code{turn()$usage} reports what was read and
-written.}
+written. Anthropic leaves cached input out of \code{input_tokens};
+\code{total_tokens} counts it.}
 
 \item{compaction_prompt}{Character or NULL. Optional domain-specific
 instructions for summarizing older history during context compaction.

@@ -65,6 +65,78 @@
     num(usage$input_tokens) + num(usage$output_tokens)
 }
 
+#' Input tokens a provider counts outside `input_tokens`.
+#'
+#' Anthropic reports the input of a request as 3 counts: what it read
+#' from the prompt cache (`cache_read_input_tokens`), what it wrote to
+#' it (`cache_creation_input_tokens`), and `input_tokens`, which holds
+#' only the rest. Every other provider corteza talks to counts cached
+#' input inside its input count, so the answer for those is 0.
+#' @noRd
+.usage_cached_input <- function(usage, provider) {
+    if (!is.list(usage) || !isTRUE(provider %in% .anthropic_providers)) {
+        return(0)
+    }
+    count <- function(name) {
+        value <- usage[[name]]
+        if (is.numeric(value) && length(value) == 1L && !is.na(value) &&
+            value > 0) {
+            value
+        } else {
+            0
+        }
+    }
+    count("cache_read_input_tokens") + count("cache_creation_input_tokens")
+}
+
+#' A usage list whose `total_tokens` counts every token.
+#'
+#' llm.api's total, and the one .audit_usage() computes, is input plus
+#' output. With a prompt cache on, that leaves out nearly all the input
+#' of a request to an Anthropic provider, and a token cap that reads
+#' the total (`/auto`, `subagents.mcp_spend_cap_tokens`) would count a
+#' small part of what a session sent. A cached token counts as 1, as
+#' it did before there was a cache: a cap in tokens bounds the work,
+#' and the price is the cost cap's to weigh.
+#'
+#' Each usage passes through here once, where its provider is known
+#' and before it is added to another's: one model call's in
+#' .agent_with_fallback(), one request's in .audit_usage(). A usage
+#' with nothing cached comes back as it was.
+#' @noRd
+.usage_count_cached <- function(usage, provider) {
+    cached <- .usage_cached_input(usage, provider)
+    if (cached <= 0) {
+        return(usage)
+    }
+    input <- usage[["input_tokens"]]
+    output <- usage[["output_tokens"]]
+    known <- function(x) is.numeric(x) && length(x) == 1L && !is.na(x)
+    if (known(input) && known(output)) {
+        usage$total_tokens <- input + output + cached
+    }
+    usage
+}
+
+#' Input tokens of a usage list, cached or not.
+#'
+#' turn() returns a total that counts every token
+#' (.usage_count_cached()). Where that total is larger than input plus
+#' output, the rest is input a provider read from its prompt cache or
+#' wrote to it, and left out of `input_tokens`.
+#' @noRd
+.spend_input_tokens <- function(usage) {
+    input <- usage[["input_tokens"]]
+    output <- usage[["output_tokens"]]
+    total <- usage[["total_tokens"]]
+    known <- function(x) is.numeric(x) && length(x) == 1L && !is.na(x)
+    if (known(input) && known(output) && known(total) &&
+        total - output > input) {
+        return(total - output)
+    }
+    input
+}
+
 #' An empty per-conversation main-agent segment tally.
 #' @param id Optional session id stamped on the segment for display.
 #' @noRd
@@ -109,8 +181,20 @@ session_accumulate_spend <- function(session, usage) {
         sp$pending_new <- FALSE
     }
     i <- length(sp$segments)
-    seg <- sp$segments[[i]]
-    seg$input_tokens <- .spend_add_int(seg$input_tokens, usage$input_tokens)
+    seg <- .spend_segment_add(sp$segments[[i]], usage)
+    if (is.null(seg$id)) {
+        seg$id <- session$sessionId
+    }
+    sp$segments[[i]] <- seg
+    session$spend <- sp
+    invisible(session)
+}
+
+#' Add one turn's or one job's usage to a segment.
+#' @noRd
+.spend_segment_add <- function(seg, usage) {
+    seg$input_tokens <- .spend_add_int(seg$input_tokens,
+                                       .spend_input_tokens(usage))
     seg$output_tokens <- .spend_add_int(seg$output_tokens, usage$output_tokens)
     # Normalized, not the raw field: a provider that reports input and
     # output without a total would otherwise record a priced query as
@@ -127,10 +211,45 @@ session_accumulate_spend <- function(session, usage) {
         seg$cost <- seg$cost + as.numeric(usage$cost)
     }
     seg$turns <- seg$turns + 1L
-    if (is.null(seg$id)) {
-        seg$id <- session$sessionId
+    seg
+}
+
+#' Accumulate usage spent for an earlier conversation of this run.
+#'
+#' A job asked for before a /clear can settle after it. What it spent
+#' belongs to the conversation that asked for it: the last segment with
+#' that session id. A conversation with no segment yet gets one, placed
+#' before the open conversation's, so the open one stays last and the
+#' next turn's spend still reaches it.
+#'
+#' @param session Session environment or list.
+#' @param usage Usage list, as for `session_accumulate_spend()`.
+#' @param id The session id of the conversation that spent it.
+#' @return The session, invisibly (mutated in place for an env).
+#' @noRd
+spend_accumulate_for <- function(session, usage, id) {
+    if (is.null(usage)) {
+        return(invisible(session))
     }
-    sp$segments[[i]] <- seg
+    sp <- session$spend %||% list(segments = list())
+    ids <- vapply(sp$segments, function(s) {
+        s$id %||% NA_character_
+    }, character(1))
+    at <- which(ids %in% id)
+    if (length(at)) {
+        i <- max(at)
+        sp$segments[[i]] <- .spend_segment_add(sp$segments[[i]], usage)
+    } else {
+        seg <- .spend_segment_add(.spend_empty_segment(id = id), usage)
+        n <- length(sp$segments)
+        # With no segment pending, the last one is the open conversation's.
+        after <- if (n > 0L && !isTRUE(sp$pending_new)) {
+            n - 1L
+        } else {
+            n
+        }
+        sp$segments <- append(sp$segments, list(seg), after = after)
+    }
     session$spend <- sp
     invisible(session)
 }
